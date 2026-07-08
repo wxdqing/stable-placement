@@ -25,15 +25,24 @@ const (
 )
 
 type PlacementEvent struct {
-	Type             EventType
-	GrainKey         GrainKey
-	NodeIdentity     string
-	NodeType         string
-	NodeGroup        string
-	NodeName         string
+	// Type 是事件类型。
+	Type EventType
+	// GrainKey 是事件影响的 Grain；节点事件可以为空。
+	GrainKey GrainKey
+	// NodeIdentity 是事件影响的完整节点身份。
+	NodeIdentity string
+	// NodeType 是事件影响的节点类型。
+	NodeType string
+	// NodeGroup 是事件影响的节点分组。
+	NodeGroup string
+	// NodeName 是事件影响的节点实例名。
+	NodeName string
+	// PlacementVersion 是事件发生后的 Placement 版本。
 	PlacementVersion int64
-	LeaseVersion     int64
-	Time             time.Time
+	// LeaseVersion 是事件发生后的 Lease 版本。
+	LeaseVersion int64
+	// Time 是事件发生时间。
+	Time time.Time
 }
 
 type EventPublisher interface {
