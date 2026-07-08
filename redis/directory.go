@@ -3,7 +3,9 @@ package redis
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -13,6 +15,17 @@ import (
 type Directory struct {
 	client   goredis.UniversalClient
 	strategy sp.PlacementStrategy
+}
+
+type mutationArgs struct {
+	oldRaw        string
+	placement     sp.Placement
+	removeOldNode bool
+	oldNodeKey    string
+	addNewNode    bool
+	newNodeKey    string
+	leaseMode     string
+	eventType     sp.EventType
 }
 
 func NewDirectory(client goredis.UniversalClient, strategy sp.PlacementStrategy) *Directory {
@@ -66,6 +79,155 @@ func (d *Directory) MarkNodeInvalid(ctx context.Context, nodeType string, nodeGr
 		NodeName:     nodeName,
 		Time:         time.Now(),
 	})
+}
+
+func (d *Directory) RenewNode(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
+	node, err := d.getNode(ctx, nodeIdentity)
+	if err != nil {
+		return err
+	}
+	if node.NodeSessionID != nodeSessionID {
+		return sp.ErrInvalidNodeSession
+	}
+	node.LastHeartbeatAt = time.Now()
+	return d.setNode(ctx, *node)
+}
+
+func (d *Directory) UnregisterNode(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
+	node, err := d.getNode(ctx, nodeIdentity)
+	if err != nil {
+		return err
+	}
+	if node.NodeSessionID != nodeSessionID {
+		return sp.ErrInvalidNodeSession
+	}
+	if err := d.client.Del(ctx, NodeKey(nodeIdentity)).Err(); err != nil {
+		return err
+	}
+	if err := d.client.SRem(ctx, NodesKey(node.NodeType, node.NodeGroup), nodeIdentity).Err(); err != nil {
+		return err
+	}
+	return d.xadd(ctx, sp.PlacementEvent{
+		Type:         sp.EventNodeUnregistered,
+		NodeIdentity: nodeIdentity,
+		NodeType:     node.NodeType,
+		NodeGroup:    node.NodeGroup,
+		NodeName:     node.NodeName,
+		Time:         time.Now(),
+	})
+}
+
+func (d *Directory) ReplaceNodeSession(ctx context.Context, node sp.Node) (*sp.Node, error) {
+	if node.NodeIdentity == "" {
+		identity, err := sp.NewNodeIdentity(node.NodeType, node.NodeGroup, node.NodeName)
+		if err != nil {
+			return nil, err
+		}
+		node.NodeIdentity = identity.String()
+	}
+	if node.Status == "" {
+		node.Status = sp.NodeStatusActive
+	}
+	if node.LastHeartbeatAt.IsZero() {
+		node.LastHeartbeatAt = time.Now()
+	}
+	old, err := d.getNode(ctx, node.NodeIdentity)
+	if err != nil && err != sp.ErrNodeNotFound {
+		return nil, err
+	}
+	if err := d.setNode(ctx, node); err != nil {
+		return nil, err
+	}
+	if err := d.client.SAdd(ctx, NodesKey(node.NodeType, node.NodeGroup), node.NodeIdentity).Err(); err != nil {
+		return nil, err
+	}
+	if err := d.xadd(ctx, sp.PlacementEvent{
+		Type:         sp.EventNodeReplaced,
+		NodeIdentity: node.NodeIdentity,
+		NodeType:     node.NodeType,
+		NodeGroup:    node.NodeGroup,
+		NodeName:     node.NodeName,
+		Time:         time.Now(),
+	}); err != nil {
+		return nil, err
+	}
+	if old == nil {
+		old = &sp.Node{}
+	}
+	return old, nil
+}
+
+func (d *Directory) FindNodes(ctx context.Context, nodeType string, nodeGroup string) ([]sp.Node, error) {
+	identities, err := d.client.SMembers(ctx, NodesKey(nodeType, nodeGroup)).Result()
+	if err != nil {
+		return nil, err
+	}
+	var nodes []sp.Node
+	for _, identity := range identities {
+		node, err := d.getNode(ctx, identity)
+		if err != nil {
+			continue
+		}
+		nodes = append(nodes, *node)
+	}
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].NodeIdentity < nodes[j].NodeIdentity
+	})
+	return nodes, nil
+}
+
+func (d *Directory) DrainNode(ctx context.Context, nodeIdentity string) error {
+	node, err := d.getNode(ctx, nodeIdentity)
+	if err != nil {
+		return err
+	}
+	invalid, err := d.client.SIsMember(ctx, InvalidNodesKey(node.NodeType, node.NodeGroup), node.NodeName).Result()
+	if err != nil {
+		return err
+	}
+	if !invalid {
+		return sp.ErrNodeNotInvalid
+	}
+	node.Status = sp.NodeStatusDraining
+	if err := d.setNode(ctx, *node); err != nil {
+		return err
+	}
+	return d.xadd(ctx, sp.PlacementEvent{
+		Type:         sp.EventNodeDraining,
+		NodeIdentity: node.NodeIdentity,
+		NodeType:     node.NodeType,
+		NodeGroup:    node.NodeGroup,
+		NodeName:     node.NodeName,
+		Time:         time.Now(),
+	})
+}
+
+func (d *Directory) CompleteDrain(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
+	return d.UnregisterNode(ctx, nodeIdentity, nodeSessionID)
+}
+
+func (d *Directory) RestoreNode(ctx context.Context, nodeType string, nodeGroup string, nodeName string) error {
+	if err := d.client.SRem(ctx, InvalidNodesKey(nodeType, nodeGroup), nodeName).Err(); err != nil {
+		return err
+	}
+	identity, _ := sp.NewNodeIdentity(nodeType, nodeGroup, nodeName)
+	return d.xadd(ctx, sp.PlacementEvent{
+		Type:         sp.EventNodeRestored,
+		NodeIdentity: identity.String(),
+		NodeType:     nodeType,
+		NodeGroup:    nodeGroup,
+		NodeName:     nodeName,
+		Time:         time.Now(),
+	})
+}
+
+func (d *Directory) ListInvalidNodes(ctx context.Context, nodeType string, nodeGroup string) ([]string, error) {
+	names, err := d.client.SMembers(ctx, InvalidNodesKey(nodeType, nodeGroup)).Result()
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 func (d *Directory) Lookup(ctx context.Context, key sp.GrainKey) (*sp.Placement, error) {
@@ -128,27 +290,15 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 			ExpireAt:           now.Add(ttl),
 		},
 	}
-	if err := d.setPlacement(ctx, placement); err != nil {
-		return nil, err
-	}
-	score, err := d.client.Incr(ctx, SequenceKey()).Result()
+	stored, err := d.allocateWithLua(ctx, placement)
 	if err != nil {
 		return nil, err
 	}
-	if err := d.client.ZAdd(ctx, PlacementNodeKey(chosen.NodeIdentity), goredis.Z{Score: float64(score), Member: key.String()}).Err(); err != nil {
-		return nil, err
-	}
-	if err := d.client.ZAdd(ctx, LeaseExpireKey(), goredis.Z{Score: float64(placement.LeaseExpireAt.UnixMilli()), Member: key.String()}).Err(); err != nil {
-		return nil, err
-	}
-	if err := d.xadd(ctx, eventFromPlacement(sp.EventPlacementCreated, placement)); err != nil {
-		return nil, err
-	}
-	return &placement, nil
+	return stored, nil
 }
 
 func (d *Directory) Renew(ctx context.Context, cmd sp.RenewCommand) (*sp.Placement, error) {
-	placement, err := d.getPlacement(ctx, cmd.GrainKey)
+	oldRaw, placement, err := d.getPlacementRaw(ctx, cmd.GrainKey)
 	if err != nil {
 		return nil, err
 	}
@@ -177,17 +327,11 @@ func (d *Directory) Renew(ctx context.Context, cmd sp.RenewCommand) (*sp.Placeme
 	placement.Lease.Version++
 	placement.Lease.ExpireAt = now.Add(ttl)
 	placement.LeaseExpireAt = placement.Lease.ExpireAt
-	if err := d.setPlacement(ctx, *placement); err != nil {
-		return nil, err
-	}
-	if err := d.client.ZAdd(ctx, LeaseExpireKey(), goredis.Z{Score: float64(placement.LeaseExpireAt.UnixMilli()), Member: cmd.GrainKey.String()}).Err(); err != nil {
-		return nil, err
-	}
-	return placement, nil
+	return d.renewWithLua(ctx, string(oldRaw), *placement)
 }
 
 func (d *Directory) Release(ctx context.Context, cmd sp.ReleaseCommand) error {
-	placement, err := d.getPlacement(ctx, cmd.GrainKey)
+	oldRaw, placement, err := d.getPlacementRaw(ctx, cmd.GrainKey)
 	if err != nil {
 		return err
 	}
@@ -209,28 +353,133 @@ func (d *Directory) Release(ctx context.Context, cmd sp.ReleaseCommand) error {
 	}
 	placement.Status = sp.PlacementStatusReleased
 	placement.UpdateTime = time.Now()
-	if err := d.setPlacement(ctx, *placement); err != nil {
-		return err
-	}
-	if err := d.client.ZRem(ctx, PlacementNodeKey(placement.NodeIdentity), cmd.GrainKey.String()).Err(); err != nil {
-		return err
-	}
-	if err := d.client.ZRem(ctx, LeaseExpireKey(), cmd.GrainKey.String()).Err(); err != nil {
-		return err
-	}
-	return d.xadd(ctx, eventFromPlacement(sp.EventPlacementReleased, *placement))
+	_, err = d.mutateWithLua(ctx, mutationArgs{
+		oldRaw:        string(oldRaw),
+		placement:     *placement,
+		removeOldNode: true,
+		oldNodeKey:    PlacementNodeKey(placement.NodeIdentity),
+		leaseMode:     "remove",
+		eventType:     sp.EventPlacementReleased,
+	})
+	return err
 }
 
 func (d *Directory) Transfer(ctx context.Context, cmd sp.TransferCommand) (*sp.Placement, error) {
-	return nil, sp.ErrPlacementNotFound
+	oldRaw, placement, err := d.getPlacementRaw(ctx, cmd.GrainKey)
+	if err != nil {
+		return nil, err
+	}
+	if placement.Status != sp.PlacementStatusActive {
+		return nil, sp.ErrPlacementNotFound
+	}
+	if placement.Version != cmd.PlacementVersion {
+		return nil, sp.ErrVersionConflict
+	}
+	if cmd.FromNodeIdentity != "" && placement.NodeIdentity != cmd.FromNodeIdentity {
+		return nil, sp.ErrInvalidOwner
+	}
+	target, err := d.effectiveNode(ctx, cmd.ToNodeIdentity)
+	if err != nil {
+		return nil, err
+	}
+	oldNodeKey := PlacementNodeKey(placement.NodeIdentity)
+	ttl := cmd.LeaseTTL
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	now := time.Now()
+	placement.NodeIdentity = target.NodeIdentity
+	placement.Version++
+	placement.UpdateTime = now
+	placement.LeaseExpireAt = now.Add(ttl)
+	placement.Lease = sp.Lease{
+		OwnerNodeIdentity:  target.NodeIdentity,
+		OwnerNodeSessionID: target.NodeSessionID,
+		Version:            1,
+		ExpireAt:           now.Add(ttl),
+	}
+	return d.mutateWithLua(ctx, mutationArgs{
+		oldRaw:        string(oldRaw),
+		placement:     *placement,
+		removeOldNode: true,
+		oldNodeKey:    oldNodeKey,
+		addNewNode:    true,
+		newNodeKey:    PlacementNodeKey(placement.NodeIdentity),
+		leaseMode:     "add",
+		eventType:     sp.EventPlacementTransferred,
+	})
 }
 
 func (d *Directory) Recover(ctx context.Context, cmd sp.RecoverCommand) (*sp.Placement, error) {
-	return nil, sp.ErrPlacementNotFound
+	oldRaw, placement, err := d.getPlacementRaw(ctx, cmd.GrainKey)
+	if err != nil {
+		return nil, err
+	}
+	if placement.Version != cmd.PlacementVersion {
+		return nil, sp.ErrVersionConflict
+	}
+	target, err := d.effectiveNode(ctx, cmd.NewNodeIdentity)
+	if err != nil {
+		return nil, err
+	}
+	oldNodeKey := PlacementNodeKey(placement.NodeIdentity)
+	ttl := cmd.LeaseTTL
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	now := time.Now()
+	placement.NodeIdentity = target.NodeIdentity
+	placement.Version++
+	placement.Status = sp.PlacementStatusActive
+	placement.UpdateTime = now
+	placement.LeaseExpireAt = now.Add(ttl)
+	placement.Lease = sp.Lease{
+		OwnerNodeIdentity:  target.NodeIdentity,
+		OwnerNodeSessionID: target.NodeSessionID,
+		Version:            1,
+		ExpireAt:           now.Add(ttl),
+	}
+	return d.mutateWithLua(ctx, mutationArgs{
+		oldRaw:        string(oldRaw),
+		placement:     *placement,
+		removeOldNode: true,
+		oldNodeKey:    oldNodeKey,
+		addNewNode:    true,
+		newNodeKey:    PlacementNodeKey(placement.NodeIdentity),
+		leaseMode:     "add",
+		eventType:     sp.EventPlacementRecovered,
+	})
 }
 
 func (d *Directory) Expire(ctx context.Context, cmd sp.ExpireCommand) error {
-	return sp.ErrPlacementNotFound
+	now := cmd.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	oldRaw, placement, err := d.getPlacementRaw(ctx, cmd.GrainKey)
+	if err != nil {
+		return err
+	}
+	if placement.Status != sp.PlacementStatusActive {
+		return sp.ErrPlacementNotFound
+	}
+	if placement.Lease.Version != cmd.LeaseVersion {
+		return sp.ErrVersionConflict
+	}
+	if now.Before(placement.LeaseExpireAt) {
+		return sp.ErrLeaseNotExpired
+	}
+	placement.Status = sp.PlacementStatusExpired
+	placement.UpdateTime = now
+	_, err = d.mutateWithLua(ctx, mutationArgs{
+		oldRaw:        string(oldRaw),
+		placement:     *placement,
+		removeOldNode: true,
+		oldNodeKey:    PlacementNodeKey(placement.NodeIdentity),
+		leaseMode:     "remove",
+		eventType:     sp.EventLeaseExpired,
+	})
+	return err
 }
 
 func (d *Directory) Exists(ctx context.Context, key sp.GrainKey) (bool, error) {
@@ -243,15 +492,18 @@ func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (s
 	if limit <= 0 {
 		limit = 100
 	}
-	start := int64(0)
+	min := "-inf"
 	if query.Cursor != "" {
-		parsed, err := strconv.ParseInt(query.Cursor, 10, 64)
+		score, err := parseCursorScore(query.Cursor)
 		if err != nil {
 			return sp.PlacementPage{}, err
 		}
-		start = parsed
+		min = "(" + strconv.FormatInt(score, 10)
 	}
-	values, err := d.client.ZRange(ctx, PlacementNodeKey(query.NodeIdentity), start, start+int64(limit)-1).Result()
+	values, err := d.client.ZRangeByScoreWithScores(ctx, PlacementNodeKey(query.NodeIdentity), &goredis.ZRangeBy{
+		Min: min,
+		Max: "+inf",
+	}).Result()
 	if err != nil {
 		return sp.PlacementPage{}, err
 	}
@@ -260,18 +512,29 @@ func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (s
 		status = sp.PlacementStatusActive
 	}
 	var placements []sp.Placement
+	var lastScore int64
+	var lastKey string
 	for _, value := range values {
-		placement, err := d.getPlacement(ctx, sp.GrainKey(value))
+		key, ok := value.Member.(string)
+		if !ok {
+			continue
+		}
+		placement, err := d.getPlacement(ctx, sp.GrainKey(key))
 		if err != nil {
 			continue
 		}
 		if placement.Status == status {
 			placements = append(placements, *placement)
+			lastScore = int64(value.Score)
+			lastKey = key
+			if len(placements) == limit {
+				break
+			}
 		}
 	}
 	next := ""
-	if len(values) == limit {
-		next = strconv.FormatInt(start+int64(limit), 10)
+	if len(placements) == limit && hasPlacementAfterScore(values, lastScore) {
+		next = formatCursor(lastScore, lastKey)
 	}
 	return sp.PlacementPage{Placements: placements, NextCursor: next}, nil
 }
@@ -302,19 +565,42 @@ func (d *Directory) effectiveNodes(ctx context.Context, nodeType string, nodeGro
 	return nodes, nil
 }
 
-func (d *Directory) getPlacement(ctx context.Context, key sp.GrainKey) (*sp.Placement, error) {
-	value, err := d.client.Get(ctx, PlacementKey(key)).Bytes()
-	if err == goredis.Nil {
-		return nil, sp.ErrPlacementNotFound
-	}
+func (d *Directory) effectiveNode(ctx context.Context, nodeIdentity string) (*sp.Node, error) {
+	node, err := d.getNode(ctx, nodeIdentity)
 	if err != nil {
 		return nil, err
 	}
-	var placement sp.Placement
-	if err := json.Unmarshal(value, &placement); err != nil {
+	if node.Status != sp.NodeStatusActive {
+		return nil, sp.ErrNoAvailableNode
+	}
+	invalid, err := d.client.SIsMember(ctx, InvalidNodesKey(node.NodeType, node.NodeGroup), node.NodeName).Result()
+	if err != nil {
 		return nil, err
 	}
-	return &placement, nil
+	if invalid {
+		return nil, sp.ErrNoAvailableNode
+	}
+	return node, nil
+}
+
+func (d *Directory) getPlacement(ctx context.Context, key sp.GrainKey) (*sp.Placement, error) {
+	_, placement, err := d.getPlacementRaw(ctx, key)
+	return placement, err
+}
+
+func (d *Directory) getPlacementRaw(ctx context.Context, key sp.GrainKey) ([]byte, *sp.Placement, error) {
+	value, err := d.client.Get(ctx, PlacementKey(key)).Bytes()
+	if err == goredis.Nil {
+		return nil, nil, sp.ErrPlacementNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	var placement sp.Placement
+	if err := json.Unmarshal(value, &placement); err != nil {
+		return nil, nil, err
+	}
+	return value, &placement, nil
 }
 
 func (d *Directory) setPlacement(ctx context.Context, placement sp.Placement) error {
@@ -323,6 +609,134 @@ func (d *Directory) setPlacement(ctx context.Context, placement sp.Placement) er
 		return err
 	}
 	return d.client.Set(ctx, PlacementKey(placement.GrainKey), value, 0).Err()
+}
+
+func (d *Directory) addPlacementNodeIndex(ctx context.Context, nodeIdentity string, key sp.GrainKey) error {
+	score, err := d.client.Incr(ctx, SequenceKey()).Result()
+	if err != nil {
+		return err
+	}
+	return d.client.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: float64(score), Member: key.String()}).Err()
+}
+
+func (d *Directory) allocateWithLua(ctx context.Context, placement sp.Placement) (*sp.Placement, error) {
+	value, err := json.Marshal(placement)
+	if err != nil {
+		return nil, err
+	}
+	result, err := d.client.Eval(ctx, allocateLua, []string{
+		PlacementKey(placement.GrainKey),
+		PlacementNodeKey(placement.NodeIdentity),
+		LeaseExpireKey(),
+		SequenceKey(),
+		EventsStreamKey(),
+	},
+		string(value),
+		placement.GrainKey.String(),
+		strconv.FormatInt(placement.LeaseExpireAt.UnixMilli(), 10),
+		string(sp.EventPlacementCreated),
+		placement.NodeIdentity,
+		strconv.FormatInt(placement.Version, 10),
+		strconv.FormatInt(placement.Lease.Version, 10),
+	).Text()
+	if err != nil {
+		return nil, err
+	}
+	var stored sp.Placement
+	if err := json.Unmarshal([]byte(result), &stored); err != nil {
+		return nil, err
+	}
+	return &stored, nil
+}
+
+func (d *Directory) renewWithLua(ctx context.Context, oldRaw string, placement sp.Placement) (*sp.Placement, error) {
+	value, err := json.Marshal(placement)
+	if err != nil {
+		return nil, err
+	}
+	result, err := d.client.Eval(ctx, renewLua, []string{
+		PlacementKey(placement.GrainKey),
+		LeaseExpireKey(),
+		AuditStreamKey(),
+	},
+		oldRaw,
+		string(value),
+		strconv.FormatInt(placement.LeaseExpireAt.UnixMilli(), 10),
+		placement.GrainKey.String(),
+		string(sp.EventPlacementRenewed),
+		placement.NodeIdentity,
+		strconv.FormatInt(placement.Version, 10),
+		strconv.FormatInt(placement.Lease.Version, 10),
+	).Text()
+	if err != nil {
+		return nil, err
+	}
+	if result == "conflict" {
+		return nil, sp.ErrVersionConflict
+	}
+	var stored sp.Placement
+	if err := json.Unmarshal([]byte(result), &stored); err != nil {
+		return nil, err
+	}
+	return &stored, nil
+}
+
+func (d *Directory) mutateWithLua(ctx context.Context, args mutationArgs) (*sp.Placement, error) {
+	value, err := json.Marshal(args.placement)
+	if err != nil {
+		return nil, err
+	}
+	oldNodeKey := args.oldNodeKey
+	if oldNodeKey == "" {
+		oldNodeKey = PlacementNodeKey(args.placement.NodeIdentity)
+	}
+	newNodeKey := args.newNodeKey
+	if newNodeKey == "" {
+		newNodeKey = PlacementNodeKey(args.placement.NodeIdentity)
+	}
+	removeOldNode := "0"
+	if args.removeOldNode {
+		removeOldNode = "1"
+	}
+	addNewNode := "0"
+	if args.addNewNode {
+		addNewNode = "1"
+	}
+	leaseMode := args.leaseMode
+	if leaseMode == "" {
+		leaseMode = "keep"
+	}
+	result, err := d.client.Eval(ctx, mutationLua, []string{
+		PlacementKey(args.placement.GrainKey),
+		oldNodeKey,
+		newNodeKey,
+		LeaseExpireKey(),
+		SequenceKey(),
+		EventsStreamKey(),
+	},
+		args.oldRaw,
+		string(value),
+		removeOldNode,
+		addNewNode,
+		leaseMode,
+		args.placement.GrainKey.String(),
+		strconv.FormatInt(args.placement.LeaseExpireAt.UnixMilli(), 10),
+		string(args.eventType),
+		args.placement.NodeIdentity,
+		strconv.FormatInt(args.placement.Version, 10),
+		strconv.FormatInt(args.placement.Lease.Version, 10),
+	).Text()
+	if err != nil {
+		return nil, err
+	}
+	if result == "conflict" {
+		return nil, sp.ErrVersionConflict
+	}
+	var stored sp.Placement
+	if err := json.Unmarshal([]byte(result), &stored); err != nil {
+		return nil, err
+	}
+	return &stored, nil
 }
 
 func (d *Directory) getNode(ctx context.Context, nodeIdentity string) (*sp.Node, error) {
@@ -338,6 +752,14 @@ func (d *Directory) getNode(ctx context.Context, nodeIdentity string) (*sp.Node,
 		return nil, err
 	}
 	return &node, nil
+}
+
+func (d *Directory) setNode(ctx context.Context, node sp.Node) error {
+	value, err := json.Marshal(node)
+	if err != nil {
+		return err
+	}
+	return d.client.Set(ctx, NodeKey(node.NodeIdentity), value, 0).Err()
 }
 
 func (d *Directory) xadd(ctx context.Context, event sp.PlacementEvent) error {
@@ -365,4 +787,22 @@ func eventFromPlacement(eventType sp.EventType, placement sp.Placement) sp.Place
 		LeaseVersion:     placement.Lease.Version,
 		Time:             time.Now(),
 	}
+}
+
+func parseCursorScore(cursor string) (int64, error) {
+	score, _, _ := strings.Cut(cursor, ":")
+	return strconv.ParseInt(score, 10, 64)
+}
+
+func formatCursor(score int64, key string) string {
+	return strconv.FormatInt(score, 10) + ":" + key
+}
+
+func hasPlacementAfterScore(values []goredis.Z, score int64) bool {
+	for _, value := range values {
+		if int64(value.Score) > score {
+			return true
+		}
+	}
+	return false
 }
