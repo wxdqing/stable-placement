@@ -1,0 +1,31 @@
+# Project LF normalization.
+* text=auto eol=lf
+
+# Keep binary assets untouched.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.7z binary
+*.xlsx binary
+*.xls binary
+*.xlsm binary
+
+# Stable diffs and generated text.
+*.proto text eol=lf
+*.go text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.tmpl text eol=lf
+*.sh text eol=lf
+*.bat text eol=lf
+*.cmd text eol=lf
+testdata/golden/** text eol=lf
+templates/**/*.tmpl text eol=lf
