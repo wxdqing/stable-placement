@@ -9,6 +9,7 @@ type Directory interface {
 	Release(ctx context.Context, cmd ReleaseCommand) error
 	Transfer(ctx context.Context, cmd TransferCommand) (*Placement, error)
 	Recover(ctx context.Context, cmd RecoverCommand) (*Placement, error)
+	Expire(ctx context.Context, cmd ExpireCommand) error
 	Exists(ctx context.Context, key GrainKey) (bool, error)
 	FindByNode(ctx context.Context, query FindByNodeQuery) (PlacementPage, error)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	sp "github.com/wxdqing/stable-placement"
 )
@@ -56,5 +57,45 @@ func TestNodeRegistryPublishesMarkAndRestoreEvents(t *testing.T) {
 
 	if len(seen) != 2 || seen[0] != sp.EventNodeMarkedInvalid || seen[1] != sp.EventNodeRestored {
 		t.Fatalf("events = %+v", seen)
+	}
+}
+
+func TestNodeRegistryDrainRequiresInvalidNodeAndHeartbeatTimeout(t *testing.T) {
+	ctx := context.Background()
+	bus := NewEventBus()
+	registry := NewNodeRegistry(bus)
+	node := sp.Node{
+		NodeType:      "game",
+		NodeGroup:     "default",
+		NodeName:      "game-1",
+		NodeIdentity:  "game/default/game-1",
+		NodeSessionID: "session-a",
+		Status:        sp.NodeStatusActive,
+	}
+	if err := registry.RegisterNode(ctx, node); err != nil {
+		t.Fatalf("RegisterNode error: %v", err)
+	}
+	if err := registry.DrainNode(ctx, node.NodeIdentity); !errors.Is(err, sp.ErrNodeNotInvalid) {
+		t.Fatalf("DrainNode before invalid err = %v, want ErrNodeNotInvalid", err)
+	}
+	if err := registry.MarkNodeInvalid(ctx, "game", "default", "game-1"); err != nil {
+		t.Fatalf("MarkNodeInvalid error: %v", err)
+	}
+	if err := registry.DrainNode(ctx, node.NodeIdentity); err != nil {
+		t.Fatalf("DrainNode error: %v", err)
+	}
+	draining, ok := registry.Node(node.NodeIdentity)
+	if !ok || draining.Status != sp.NodeStatusDraining {
+		t.Fatalf("node after drain = %+v, ok=%v", draining, ok)
+	}
+
+	registry.SetHeartbeatTTL(time.Nanosecond)
+	time.Sleep(time.Millisecond)
+	if err := registry.ExpireHeartbeats(ctx, time.Now()); err != nil {
+		t.Fatalf("ExpireHeartbeats error: %v", err)
+	}
+	offline, ok := registry.Node(node.NodeIdentity)
+	if !ok || offline.Status != sp.NodeStatusOffline {
+		t.Fatalf("node after heartbeat timeout = %+v, ok=%v", offline, ok)
 	}
 }

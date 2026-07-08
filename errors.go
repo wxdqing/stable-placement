@@ -10,5 +10,7 @@ var (
 	ErrInvalidNodeSession = errors.New("invalid node session")
 	ErrVersionConflict    = errors.New("version conflict")
 	ErrLeaseExpired       = errors.New("lease expired")
+	ErrLeaseNotExpired    = errors.New("lease not expired")
 	ErrNodeNotFound       = errors.New("node not found")
+	ErrNodeNotInvalid     = errors.New("node is not marked invalid")
 )

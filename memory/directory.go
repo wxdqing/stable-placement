@@ -258,6 +258,35 @@ func (d *Directory) Recover(ctx context.Context, cmd sp.RecoverCommand) (*sp.Pla
 	return copyPlacement(placement), nil
 }
 
+func (d *Directory) Expire(ctx context.Context, cmd sp.ExpireCommand) error {
+	now := cmd.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	d.mu.Lock()
+	placement, ok := d.placements[cmd.GrainKey]
+	if !ok || placement.Status != sp.PlacementStatusActive {
+		d.mu.Unlock()
+		return sp.ErrPlacementNotFound
+	}
+	if placement.Lease.Version != cmd.LeaseVersion {
+		d.mu.Unlock()
+		return sp.ErrVersionConflict
+	}
+	if now.Before(placement.LeaseExpireAt) {
+		d.mu.Unlock()
+		return sp.ErrLeaseNotExpired
+	}
+	placement.Status = sp.PlacementStatusExpired
+	placement.UpdateTime = now
+	d.placements[cmd.GrainKey] = placement
+	d.deleteNodeIndexLocked(placement.NodeIdentity, cmd.GrainKey)
+	d.mu.Unlock()
+
+	return d.publish(ctx, placement, sp.EventLeaseExpired)
+}
+
 func (d *Directory) Exists(_ context.Context, key sp.GrainKey) (bool, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()

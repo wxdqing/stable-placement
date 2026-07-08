@@ -235,3 +235,45 @@ func TestDirectoryRecoverAndFindByNodePagination(t *testing.T) {
 		t.Fatalf("page2 = %+v", next)
 	}
 }
+
+func TestDirectoryExpireRemovesPlacementAndPublishesLeaseExpired(t *testing.T) {
+	ctx := context.Background()
+	dir, bus := newTestDirectory(t)
+	node := registerTestNode(t, dir, "game-1", "session-a")
+	var seen []sp.EventType
+	_ = bus.Subscribe(ctx, func(event sp.PlacementEvent) error {
+		seen = append(seen, event.Type)
+		return nil
+	})
+
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	if err := dir.Expire(ctx, sp.ExpireCommand{
+		GrainKey:     placement.GrainKey,
+		LeaseVersion: placement.Lease.Version,
+		Now:          time.Now().Add(time.Second),
+	}); err != nil {
+		t.Fatalf("Expire error: %v", err)
+	}
+	if _, err := dir.Lookup(ctx, placement.GrainKey); !errors.Is(err, sp.ErrPlacementNotFound) {
+		t.Fatalf("Lookup after expire err = %v", err)
+	}
+	page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: node.NodeIdentity, Limit: 10})
+	if err != nil {
+		t.Fatalf("FindByNode error: %v", err)
+	}
+	if len(page.Placements) != 0 {
+		t.Fatalf("FindByNode after expire = %+v", page)
+	}
+	if seen[len(seen)-1] != sp.EventLeaseExpired {
+		t.Fatalf("last event = %v", seen)
+	}
+}

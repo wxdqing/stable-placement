@@ -10,10 +10,11 @@ import (
 )
 
 type NodeRegistry struct {
-	mu        sync.RWMutex
-	nodes     map[string]sp.Node
-	invalid   map[string]map[string]struct{}
-	publisher sp.EventPublisher
+	mu           sync.RWMutex
+	nodes        map[string]sp.Node
+	invalid      map[string]map[string]struct{}
+	publisher    sp.EventPublisher
+	heartbeatTTL time.Duration
 }
 
 func NewNodeRegistry(publisher sp.EventPublisher) *NodeRegistry {
@@ -22,6 +23,12 @@ func NewNodeRegistry(publisher sp.EventPublisher) *NodeRegistry {
 		invalid:   make(map[string]map[string]struct{}),
 		publisher: publisher,
 	}
+}
+
+func (r *NodeRegistry) SetHeartbeatTTL(ttl time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.heartbeatTTL = ttl
 }
 
 func (r *NodeRegistry) RegisterNode(ctx context.Context, node sp.Node) error {
@@ -109,6 +116,69 @@ func (r *NodeRegistry) FindNodes(_ context.Context, nodeType string, nodeGroup s
 		return nodes[i].NodeIdentity < nodes[j].NodeIdentity
 	})
 	return nodes, nil
+}
+
+func (r *NodeRegistry) DrainNode(ctx context.Context, nodeIdentity string) error {
+	r.mu.Lock()
+	node, ok := r.nodes[nodeIdentity]
+	if !ok {
+		r.mu.Unlock()
+		return sp.ErrNodeNotFound
+	}
+	if _, invalid := r.invalid[groupKey(node.NodeType, node.NodeGroup)][node.NodeName]; !invalid {
+		r.mu.Unlock()
+		return sp.ErrNodeNotInvalid
+	}
+	node.Status = sp.NodeStatusDraining
+	r.nodes[nodeIdentity] = node
+	event := sp.PlacementEvent{
+		Type:         sp.EventNodeDraining,
+		NodeIdentity: nodeIdentity,
+		NodeType:     node.NodeType,
+		NodeGroup:    node.NodeGroup,
+		NodeName:     node.NodeName,
+		Time:         time.Now(),
+	}
+	r.mu.Unlock()
+	return r.publish(ctx, event)
+}
+
+func (r *NodeRegistry) CompleteDrain(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
+	return r.UnregisterNode(ctx, nodeIdentity, nodeSessionID)
+}
+
+func (r *NodeRegistry) ExpireHeartbeats(ctx context.Context, now time.Time) error {
+	r.mu.Lock()
+	if r.heartbeatTTL <= 0 {
+		r.mu.Unlock()
+		return nil
+	}
+	var events []sp.PlacementEvent
+	for identity, node := range r.nodes {
+		if node.Status == sp.NodeStatusOffline {
+			continue
+		}
+		if now.Sub(node.LastHeartbeatAt) <= r.heartbeatTTL {
+			continue
+		}
+		node.Status = sp.NodeStatusOffline
+		r.nodes[identity] = node
+		events = append(events, sp.PlacementEvent{
+			Type:         sp.EventNodeUnregistered,
+			NodeIdentity: identity,
+			NodeType:     node.NodeType,
+			NodeGroup:    node.NodeGroup,
+			NodeName:     node.NodeName,
+			Time:         now,
+		})
+	}
+	r.mu.Unlock()
+	for _, event := range events {
+		if err := r.publish(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *NodeRegistry) MarkNodeInvalid(ctx context.Context, nodeType string, nodeGroup string, nodeName string) error {

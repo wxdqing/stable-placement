@@ -67,6 +67,15 @@ type RecoverCommand struct {
 	LeaseTTL time.Duration
 }
 
+type ExpireCommand struct {
+	// GrainKey 唯一标识要过期清理的 Grain。
+	GrainKey GrainKey
+	// LeaseVersion 是调用方看到的 Lease 版本。
+	LeaseVersion int64
+	// Now 是执行过期判断的当前时间；为空时使用系统当前时间。
+	Now time.Time
+}
+
 type FindByNodeQuery struct {
 	// NodeIdentity 是要查询的完整节点身份。
 	NodeIdentity string
