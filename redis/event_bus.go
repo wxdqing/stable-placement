@@ -47,6 +47,10 @@ func (b *EventBus) Publish(ctx context.Context, event sp.PlacementEvent) error {
 }
 
 func (b *EventBus) EnsureConsumerGroup(ctx context.Context) error {
+	if b.consumer.Group != ConsumerGroupName(b.consumer.NodeIdentity, b.consumer.NodeSessionID) {
+		b.setDegraded()
+		return ErrSharedConsumerGroup
+	}
 	err := b.client.XGroupCreateMkStream(ctx, b.stream, b.consumer.Group, "$").Err()
 	if err == nil || stringsHasBusyGroup(err) {
 		return nil

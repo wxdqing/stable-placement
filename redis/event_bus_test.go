@@ -182,3 +182,23 @@ func TestRedisEventBusMalformedEventEntersDegraded(t *testing.T) {
 		t.Fatal("bus did not enter degraded mode")
 	}
 }
+
+func TestRedisEventBusRejectsMismatchedConsumerGroup(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer := StreamConsumer{
+		NodeIdentity:  "game/default/game-2",
+		NodeSessionID: "session-b",
+		Group:         ConsumerGroupName("game/default/game-1", "session-a"),
+	}
+	bus := NewEventBus(client, consumer)
+
+	err := bus.EnsureConsumerGroup(ctx)
+	if !errors.Is(err, ErrSharedConsumerGroup) {
+		t.Fatalf("EnsureConsumerGroup err = %v, want ErrSharedConsumerGroup", err)
+	}
+	if !bus.IsDegraded() {
+		t.Fatal("bus did not enter degraded mode")
+	}
+}
