@@ -13,6 +13,27 @@ import (
 	"github.com/wxdqing/stable-placement/strategies"
 )
 
+type evalHookClient struct {
+	goredis.UniversalClient
+	beforeEval func(script string)
+}
+
+func (c evalHookClient) Eval(ctx context.Context, script string, keys []string, args ...interface{}) *goredis.Cmd {
+	if c.beforeEval != nil {
+		c.beforeEval(script)
+	}
+	return c.UniversalClient.Eval(ctx, script, keys, args...)
+}
+
+type failXAddClient struct {
+	goredis.UniversalClient
+	err error
+}
+
+func (c failXAddClient) XAdd(ctx context.Context, a *goredis.XAddArgs) *goredis.StringCmd {
+	return goredis.NewStringResult("", c.err)
+}
+
 func newTestDirectory(t *testing.T) (*Directory, *goredis.Client) {
 	t.Helper()
 	server := miniredis.RunT(t)
@@ -21,33 +42,10 @@ func newTestDirectory(t *testing.T) (*Directory, *goredis.Client) {
 	return dir, client
 }
 
-type barrierStrategy struct {
-	want    int
-	ready   chan struct{}
-	release chan struct{}
+type failingStrategy struct{}
 
-	mu      sync.Mutex
-	entered int
-}
-
-func newBarrierStrategy(want int) *barrierStrategy {
-	return &barrierStrategy{
-		want:    want,
-		ready:   make(chan struct{}),
-		release: make(chan struct{}),
-	}
-}
-
-func (s *barrierStrategy) Choose(_ context.Context, input sp.StrategyInput) (sp.Node, error) {
-	s.mu.Lock()
-	s.entered++
-	if s.entered == s.want {
-		close(s.ready)
-	}
-	s.mu.Unlock()
-
-	<-s.release
-	return input.EffectiveNodes[0], nil
+func (failingStrategy) Choose(context.Context, sp.StrategyInput) (sp.Node, error) {
+	return sp.Node{}, errors.New("go strategy should not be called")
 }
 
 var (
@@ -408,16 +406,17 @@ func TestRedisDirectoryAllocateWritesOneOutboxEventUnderRace(t *testing.T) {
 	ctx := context.Background()
 	server := miniredis.RunT(t)
 	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
-	strategy := newBarrierStrategy(2)
-	dir := NewDirectory(client, strategy)
+	dir := NewDirectory(client, failingStrategy{})
 	registerTestNode(t, dir, "game-1", "session-a")
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
+	start := make(chan struct{})
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			<-start
 			_, err := dir.Allocate(ctx, sp.AllocateCommand{
 				GrainID:         "10001",
 				Kind:            "Player",
@@ -428,8 +427,7 @@ func TestRedisDirectoryAllocateWritesOneOutboxEventUnderRace(t *testing.T) {
 			errs <- err
 		}()
 	}
-	<-strategy.ready
-	close(strategy.release)
+	close(start)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
@@ -507,5 +505,287 @@ func TestRedisDirectoryRenewIsVersionedAndWritesAuditOnly(t *testing.T) {
 	audit := client.XRange(ctx, AuditStreamKey(), "-", "+").Val()
 	if len(audit) != 1 || audit[0].Values["type"] != string(sp.EventPlacementRenewed) {
 		t.Fatalf("audit stream = %+v", audit)
+	}
+}
+
+func TestRedisDirectoryAllocateLuaRejectsAllInvalidCandidates(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := newTestDirectory(t)
+	registerTestNode(t, dir, "game-1", "session-a")
+	if err := dir.MarkNodeInvalid(ctx, "game", "default", "game-1"); err != nil {
+		t.Fatalf("MarkNodeInvalid error: %v", err)
+	}
+
+	_, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if !errors.Is(err, sp.ErrNoAvailableNode) {
+		t.Fatalf("Allocate err = %v, want ErrNoAvailableNode", err)
+	}
+	key, _ := sp.NewGrainKey("Player", "10001")
+	if _, err := dir.Lookup(ctx, key); !errors.Is(err, sp.ErrPlacementNotFound) {
+		t.Fatalf("Lookup after rejected allocate err = %v", err)
+	}
+}
+
+func TestRedisDirectoryAllocateUsesLuaRoundRobinInsteadOfGoStrategy(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	dir := NewDirectory(client, failingStrategy{})
+	node1 := registerTestNode(t, dir, "game-1", "session-a")
+	node2 := registerTestNode(t, dir, "game-2", "session-b")
+
+	first, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("first Allocate error: %v", err)
+	}
+	second, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10002",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("second Allocate error: %v", err)
+	}
+	if first.NodeIdentity != node1.NodeIdentity {
+		t.Fatalf("first node = %q, want %q", first.NodeIdentity, node1.NodeIdentity)
+	}
+	if second.NodeIdentity != node2.NodeIdentity {
+		t.Fatalf("second node = %q, want %q", second.NodeIdentity, node2.NodeIdentity)
+	}
+}
+
+func TestRedisDirectoryRenewLuaRejectsSessionReplacedAfterGoValidation(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	var dir *Directory
+	var once sync.Once
+	client := evalHookClient{
+		UniversalClient: base,
+		beforeEval: func(script string) {
+			if script != renewLua {
+				return
+			}
+			once.Do(func() {
+				replacement := sp.Node{
+					NodeType:      "game",
+					NodeGroup:     "default",
+					NodeName:      "game-1",
+					NodeIdentity:  "game/default/game-1",
+					NodeSessionID: "session-b",
+					Status:        sp.NodeStatusActive,
+				}
+				if _, err := dir.ReplaceNodeSession(ctx, replacement); err != nil {
+					t.Fatalf("ReplaceNodeSession in hook error: %v", err)
+				}
+			})
+		},
+	}
+	dir = NewDirectory(client, strategies.NewRoundRobin())
+	node := registerTestNode(t, dir, "game-1", "session-a")
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+
+	_, err = dir.Renew(ctx, sp.RenewCommand{
+		GrainKey:         placement.GrainKey,
+		NodeIdentity:     node.NodeIdentity,
+		NodeSessionID:    node.NodeSessionID,
+		PlacementVersion: placement.Version,
+		LeaseVersion:     placement.Lease.Version,
+		ExtendTTL:        time.Minute,
+	})
+	if !errors.Is(err, sp.ErrInvalidNodeSession) {
+		t.Fatalf("Renew err = %v, want ErrInvalidNodeSession", err)
+	}
+}
+
+func TestRedisDirectoryReleaseLuaRejectsSessionReplacedAfterGoValidation(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	var dir *Directory
+	var once sync.Once
+	client := evalHookClient{
+		UniversalClient: base,
+		beforeEval: func(script string) {
+			if script != mutationLua {
+				return
+			}
+			once.Do(func() {
+				replacement := sp.Node{
+					NodeType:      "game",
+					NodeGroup:     "default",
+					NodeName:      "game-1",
+					NodeIdentity:  "game/default/game-1",
+					NodeSessionID: "session-b",
+					Status:        sp.NodeStatusActive,
+				}
+				if _, err := dir.ReplaceNodeSession(ctx, replacement); err != nil {
+					t.Fatalf("ReplaceNodeSession in hook error: %v", err)
+				}
+			})
+		},
+	}
+	dir = NewDirectory(client, strategies.NewRoundRobin())
+	node := registerTestNode(t, dir, "game-1", "session-a")
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+
+	err = dir.Release(ctx, sp.ReleaseCommand{
+		GrainKey:         placement.GrainKey,
+		NodeIdentity:     node.NodeIdentity,
+		NodeSessionID:    node.NodeSessionID,
+		PlacementVersion: placement.Version,
+		LeaseVersion:     placement.Lease.Version,
+	})
+	if !errors.Is(err, sp.ErrInvalidNodeSession) {
+		t.Fatalf("Release err = %v, want ErrInvalidNodeSession", err)
+	}
+	found, err := dir.Lookup(ctx, placement.GrainKey)
+	if err != nil {
+		t.Fatalf("Lookup after rejected release error: %v", err)
+	}
+	if found.Status != sp.PlacementStatusActive {
+		t.Fatalf("placement status = %s", found.Status)
+	}
+}
+
+func TestRedisDirectoryNodeRegistryWritesEventsThroughLua(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	client := failXAddClient{UniversalClient: base, err: errors.New("direct xadd disabled")}
+	dir := NewDirectory(client, strategies.NewRoundRobin())
+	node := sp.Node{
+		NodeType:      "game",
+		NodeGroup:     "default",
+		NodeName:      "game-1",
+		NodeIdentity:  "game/default/game-1",
+		NodeSessionID: "session-a",
+		Status:        sp.NodeStatusActive,
+	}
+
+	if err := dir.RegisterNode(ctx, node); err != nil {
+		t.Fatalf("RegisterNode error: %v", err)
+	}
+	replacement := node
+	replacement.NodeSessionID = "session-b"
+	old, err := dir.ReplaceNodeSession(ctx, replacement)
+	if err != nil {
+		t.Fatalf("ReplaceNodeSession error: %v", err)
+	}
+	if old.NodeSessionID != "session-a" {
+		t.Fatalf("old node = %+v", old)
+	}
+	if err := dir.MarkNodeInvalid(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
+		t.Fatalf("MarkNodeInvalid error: %v", err)
+	}
+	if err := dir.RestoreNode(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
+		t.Fatalf("RestoreNode error: %v", err)
+	}
+	if err := dir.MarkNodeInvalid(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
+		t.Fatalf("MarkNodeInvalid before drain error: %v", err)
+	}
+	if err := dir.DrainNode(ctx, node.NodeIdentity); err != nil {
+		t.Fatalf("DrainNode error: %v", err)
+	}
+	if err := dir.CompleteDrain(ctx, node.NodeIdentity, replacement.NodeSessionID); err != nil {
+		t.Fatalf("CompleteDrain error: %v", err)
+	}
+
+	events := base.XRange(ctx, EventsStreamKey(), "-", "+").Val()
+	want := []sp.EventType{
+		sp.EventNodeRegistered,
+		sp.EventNodeReplaced,
+		sp.EventNodeMarkedInvalid,
+		sp.EventNodeRestored,
+		sp.EventNodeMarkedInvalid,
+		sp.EventNodeDraining,
+		sp.EventNodeUnregistered,
+	}
+	if len(events) != len(want) {
+		t.Fatalf("events len = %d, want %d: %+v", len(events), len(want), events)
+	}
+	for i, eventType := range want {
+		if events[i].Values["type"] != string(eventType) {
+			t.Fatalf("event[%d] type = %v, want %s", i, events[i].Values["type"], eventType)
+		}
+	}
+}
+
+func TestRedisDirectoryAllocateAdvancesRoundRobinCursorOnlyWhenCreated(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	registerTestNode(t, dir, "game-1", "session-a")
+	registerTestNode(t, dir, "game-2", "session-b")
+	rrKey := StrategyRoundRobinKey("game", "default")
+
+	if _, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	}); err != nil {
+		t.Fatalf("first Allocate error: %v", err)
+	}
+	if got := client.Get(ctx, rrKey).Val(); got != "1" {
+		t.Fatalf("rr cursor after first allocate = %q, want 1", got)
+	}
+
+	if _, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	}); err != nil {
+		t.Fatalf("existing Allocate error: %v", err)
+	}
+	if got := client.Get(ctx, rrKey).Val(); got != "1" {
+		t.Fatalf("rr cursor after existing allocate = %q, want 1", got)
+	}
+
+	if _, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10002",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	}); err != nil {
+		t.Fatalf("second new Allocate error: %v", err)
+	}
+	if got := client.Get(ctx, rrKey).Val(); got != "2" {
+		t.Fatalf("rr cursor after second new allocate = %q, want 2", got)
 	}
 }
