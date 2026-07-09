@@ -33,6 +33,10 @@ func EventsStreamKey() string {
 	return "sp:" + hashTag + ":events:stream"
 }
 
+func EventsPubSubChannelKey() string {
+	return "sp:" + hashTag + ":events:pubsub"
+}
+
 func AuditStreamKey() string {
 	return "sp:" + hashTag + ":audit:stream"
 }

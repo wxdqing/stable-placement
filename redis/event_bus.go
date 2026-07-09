@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
@@ -46,6 +47,50 @@ func (b *EventBus) Publish(ctx context.Context, event sp.PlacementEvent) error {
 	}).Err()
 }
 
+// PublishHint sends an optional low-latency notification without writing the reliable Stream outbox.
+func (b *EventBus) PublishHint(ctx context.Context, event sp.PlacementEvent) error {
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	return b.client.Publish(ctx, EventsPubSubChannelKey(), payload).Err()
+}
+
+// SubscribeHint consumes optional Pub/Sub notifications; callers must still rely on Stream for durability.
+func (b *EventBus) SubscribeHint(ctx context.Context, handler func(sp.PlacementEvent) error) error {
+	pubsub := b.client.Subscribe(ctx, EventsPubSubChannelKey())
+	defer pubsub.Close()
+	if _, err := pubsub.Receive(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		b.setDegraded()
+		return err
+	}
+	for {
+		message, err := pubsub.ReceiveMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			b.setDegraded()
+			return err
+		}
+		var event sp.PlacementEvent
+		if err := json.Unmarshal([]byte(message.Payload), &event); err != nil {
+			b.setDegraded()
+			return err
+		}
+		if err := handler(event); err != nil {
+			b.setDegraded()
+			return err
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+	}
+}
+
 func (b *EventBus) EnsureConsumerGroup(ctx context.Context) error {
 	if b.consumer.Group != ConsumerGroupName(b.consumer.NodeIdentity, b.consumer.NodeSessionID) {
 		b.setDegraded()
@@ -64,6 +109,118 @@ func (b *EventBus) DeleteConsumerGroup(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+// CleanupConsumerGroup removes a previously valid node-session consumer group.
+func (b *EventBus) CleanupConsumerGroup(ctx context.Context, consumer StreamConsumer) error {
+	if consumer.Group != ConsumerGroupName(consumer.NodeIdentity, consumer.NodeSessionID) {
+		b.setDegraded()
+		return ErrSharedConsumerGroup
+	}
+	err := b.client.XGroupDestroy(ctx, b.stream, consumer.Group).Err()
+	if err == goredis.Nil {
+		return nil
+	}
+	return err
+}
+
+// CheckPending enters degraded mode when this consumer group has messages idle beyond threshold.
+func (b *EventBus) CheckPending(ctx context.Context, threshold time.Duration) error {
+	pending, err := b.client.XPendingExt(ctx, &goredis.XPendingExtArgs{
+		Stream: b.stream,
+		Group:  b.consumer.Group,
+		Idle:   threshold,
+		Start:  "-",
+		End:    "+",
+		Count:  1,
+	}).Result()
+	if err != nil {
+		b.setDegraded()
+		return err
+	}
+	if len(pending) > 0 {
+		b.setDegraded()
+		return ErrPendingMessages
+	}
+	return nil
+}
+
+// Trim shortens the Stream only when no consumer group has pending messages.
+func (b *EventBus) Trim(ctx context.Context, maxLen int64) error {
+	groups, err := b.client.XInfoGroups(ctx, b.stream).Result()
+	if err != nil {
+		if strings.Contains(err.Error(), "no such key") {
+			return nil
+		}
+		return err
+	}
+	for _, group := range groups {
+		if group.Pending > 0 {
+			return nil
+		}
+	}
+	return b.client.XTrimMaxLen(ctx, b.stream, maxLen).Err()
+}
+
+// RunTrimLoop periodically applies the same pending-safe trim policy as Trim.
+func (b *EventBus) RunTrimLoop(ctx context.Context, interval time.Duration, maxLen int64) error {
+	if interval <= 0 {
+		return b.Trim(ctx, maxLen)
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := b.Trim(ctx, maxLen); err != nil {
+				b.setDegraded()
+				return err
+			}
+		}
+	}
+}
+
+// CheckContinuity enters degraded mode when Redis reports that this group may have missed trimmed events.
+func (b *EventBus) CheckContinuity(ctx context.Context) error {
+	info, err := b.client.XInfoStream(ctx, b.stream).Result()
+	if err != nil {
+		if strings.Contains(err.Error(), "no such key") {
+			return nil
+		}
+		b.setDegraded()
+		return err
+	}
+	trimmed := info.MaxDeletedEntryID != "" && info.MaxDeletedEntryID != "0-0"
+	trimmed = trimmed || (info.EntriesAdded > info.Length && info.Length > 0)
+	trimmed = trimmed || (info.FirstEntry.ID == "" && info.Length > 0)
+	if !trimmed {
+		return nil
+	}
+	groups, err := b.client.XInfoGroups(ctx, b.stream).Result()
+	if err != nil {
+		b.setDegraded()
+		return err
+	}
+	for _, group := range groups {
+		if group.Name != b.consumer.Group {
+			continue
+		}
+		if info.FirstEntry.ID == "" && group.Lag > 0 && compareRedisStreamID(info.LastGeneratedID, group.LastDeliveredID) > 0 {
+			b.setDegraded()
+			return ErrStreamGap
+		}
+		gapID := info.MaxDeletedEntryID
+		if gapID == "" || gapID == "0-0" {
+			gapID = info.FirstEntry.ID
+		}
+		if compareRedisStreamID(gapID, group.LastDeliveredID) > 0 {
+			b.setDegraded()
+			return ErrStreamGap
+		}
+	}
+	return nil
 }
 
 func (b *EventBus) Subscribe(ctx context.Context, handler func(sp.PlacementEvent) error) error {
@@ -183,4 +340,32 @@ func stringValue(value any) string {
 
 func stringsHasBusyGroup(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "BUSYGROUP")
+}
+
+func compareRedisStreamID(a string, b string) int {
+	aTime, aSeq := splitRedisStreamID(a)
+	bTime, bSeq := splitRedisStreamID(b)
+	if aTime > bTime {
+		return 1
+	}
+	if aTime < bTime {
+		return -1
+	}
+	if aSeq > bSeq {
+		return 1
+	}
+	if aSeq < bSeq {
+		return -1
+	}
+	return 0
+}
+
+func splitRedisStreamID(id string) (int64, int64) {
+	first, second, ok := strings.Cut(id, "-")
+	if !ok {
+		return 0, 0
+	}
+	firstInt, _ := strconv.ParseInt(first, 10, 64)
+	secondInt, _ := strconv.ParseInt(second, 10, 64)
+	return firstInt, secondInt
 }
