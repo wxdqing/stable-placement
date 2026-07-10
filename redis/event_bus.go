@@ -174,7 +174,13 @@ func (b *EventBus) RunTrimLoop(ctx context.Context, interval time.Duration, maxL
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			if ctx.Err() != nil {
+				return nil
+			}
 			if err := b.Trim(ctx, maxLen); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil
+				}
 				b.setDegraded()
 				return err
 			}

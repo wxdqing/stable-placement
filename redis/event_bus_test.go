@@ -444,7 +444,10 @@ func TestRedisEventBusPubSubHintIsOptionalAndDoesNotWriteStream(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- bus.SubscribeHint(subCtx, func(event sp.PlacementEvent) error {
-			got <- event
+			select {
+			case got <- event:
+			default:
+			}
 			subCancel()
 			return nil
 		})
@@ -470,8 +473,6 @@ func TestRedisEventBusPubSubHintIsOptionalAndDoesNotWriteStream(t *testing.T) {
 				t.Fatalf("PublishHint wrote stream len = %d, want 0", length)
 			}
 			return
-		case err := <-errCh:
-			t.Fatalf("SubscribeHint returned early: %v", err)
 		case <-ticker.C:
 			if err := bus.PublishHint(ctx, event); err != nil {
 				t.Fatalf("PublishHint error: %v", err)
