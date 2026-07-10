@@ -86,6 +86,12 @@ type Placement struct {
 	Lease Lease
 }
 
+// PlacementRecoverable 判断 Placement 当前是否允许 Recover。
+// Released 表示业务主动结束，不允许 Recover；Active 与 Expired 属于故障恢复场景。
+func PlacementRecoverable(status PlacementStatus) bool {
+	return status == PlacementStatusActive || status == PlacementStatusExpired
+}
+
 type PlacementRoute struct {
 	// GrainKey 是缓存路由对应的 Grain。
 	GrainKey GrainKey

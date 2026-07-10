@@ -19,14 +19,17 @@ type Directory struct {
 	publisher  sp.EventPublisher
 }
 
-func NewDirectory(registry *NodeRegistry, strategy sp.PlacementStrategy, publisher sp.EventPublisher) *Directory {
+func NewDirectory(registry *NodeRegistry, mode sp.StrategyMode, strategy sp.PlacementStrategy, publisher sp.EventPublisher) (*Directory, error) {
+	if mode != sp.StrategyModeGo {
+		return nil, sp.ErrUnsupportedStrategyMode
+	}
 	return &Directory{
 		placements: make(map[sp.GrainKey]sp.Placement),
 		byNode:     make(map[string]map[sp.GrainKey]struct{}),
 		registry:   registry,
 		strategy:   strategy,
 		publisher:  publisher,
-	}
+	}, nil
 }
 
 func (d *Directory) NodeRegistry() *NodeRegistry {
@@ -227,6 +230,10 @@ func (d *Directory) Recover(ctx context.Context, cmd sp.RecoverCommand) (*sp.Pla
 	if placement.Version != cmd.PlacementVersion {
 		d.mu.Unlock()
 		return nil, sp.ErrVersionConflict
+	}
+	if !sp.PlacementRecoverable(placement.Status) {
+		d.mu.Unlock()
+		return nil, sp.ErrPlacementNotRecoverable
 	}
 	target, ok := d.registry.Node(cmd.NewNodeIdentity)
 	if !ok || target.Status != sp.NodeStatusActive || d.registry.IsInvalid(target.NodeType, target.NodeGroup, target.NodeName) {

@@ -13,7 +13,10 @@ import (
 func TestStablePlacementFirstPhaseFlow(t *testing.T) {
 	ctx := context.Background()
 	bus := memory.NewEventBus()
-	dir := memory.NewDirectory(memory.NewNodeRegistry(bus), strategies.NewRoundRobin(), bus)
+	dir, err := memory.NewDirectory(memory.NewNodeRegistry(bus), sp.StrategyModeGo, strategies.NewRoundRobin(), bus)
+	if err != nil {
+		t.Fatalf("NewDirectory error: %v", err)
+	}
 	cache := memory.NewPlacementCache()
 
 	_ = bus.Subscribe(ctx, func(event sp.PlacementEvent) error {

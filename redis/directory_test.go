@@ -10,7 +10,6 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	goredis "github.com/redis/go-redis/v9"
 	sp "github.com/wxdqing/stable-placement"
-	"github.com/wxdqing/stable-placement/strategies"
 )
 
 type evalHookClient struct {
@@ -38,14 +37,20 @@ func newTestDirectory(t *testing.T) (*Directory, *goredis.Client) {
 	t.Helper()
 	server := miniredis.RunT(t)
 	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
-	dir := NewDirectory(client, strategies.NewRoundRobin())
+	dir, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return dir, client
 }
 
-type failingStrategy struct{}
-
-func (failingStrategy) Choose(context.Context, sp.StrategyInput) (sp.Node, error) {
-	return sp.Node{}, errors.New("go strategy should not be called")
+func TestRedisDirectoryRejectsGoStrategyMode(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	_, err := NewDirectory(client, sp.StrategyModeGo)
+	if !errors.Is(err, sp.ErrUnsupportedStrategyMode) {
+		t.Fatalf("NewDirectory err = %v, want ErrUnsupportedStrategyMode", err)
+	}
 }
 
 var (
@@ -229,20 +234,16 @@ func TestRedisDirectoryTransferRecoverAndExpire(t *testing.T) {
 		PlacementVersion: transferred.Version,
 		LeaseVersion:     transferred.Lease.Version,
 	}); err != nil {
-		t.Fatalf("Release before recover error: %v", err)
+		t.Fatalf("Release error: %v", err)
 	}
-
-	recovered, err := dir.Recover(ctx, sp.RecoverCommand{
+	_, err = dir.Recover(ctx, sp.RecoverCommand{
 		GrainKey:         transferred.GrainKey,
 		NewNodeIdentity:  node1.NodeIdentity,
 		PlacementVersion: transferred.Version,
 		LeaseTTL:         time.Minute,
 	})
-	if err != nil {
-		t.Fatalf("Recover error: %v", err)
-	}
-	if recovered.Status != sp.PlacementStatusActive || recovered.NodeIdentity != node1.NodeIdentity {
-		t.Fatalf("recovered placement = %+v", recovered)
+	if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
+		t.Fatalf("Recover after release err = %v, want ErrPlacementNotRecoverable", err)
 	}
 
 	expiring, err := dir.Allocate(ctx, sp.AllocateCommand{
@@ -271,6 +272,36 @@ func TestRedisDirectoryTransferRecoverAndExpire(t *testing.T) {
 	}
 	if _, err := dir.Lookup(ctx, expiring.GrainKey); !errors.Is(err, sp.ErrPlacementNotFound) {
 		t.Fatalf("Lookup after expire err = %v", err)
+	}
+
+	faulty, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10003",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Allocate faulty error: %v", err)
+	}
+	if err := dir.Expire(ctx, sp.ExpireCommand{
+		GrainKey:     faulty.GrainKey,
+		LeaseVersion: faulty.Lease.Version,
+		Now:          faulty.LeaseExpireAt.Add(time.Millisecond),
+	}); err != nil {
+		t.Fatalf("Expire faulty error: %v", err)
+	}
+	recovered, err := dir.Recover(ctx, sp.RecoverCommand{
+		GrainKey:         faulty.GrainKey,
+		NewNodeIdentity:  node1.NodeIdentity,
+		PlacementVersion: faulty.Version,
+		LeaseTTL:         time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Recover after expire error: %v", err)
+	}
+	if recovered.Status != sp.PlacementStatusActive || recovered.NodeIdentity != node1.NodeIdentity {
+		t.Fatalf("recovered placement = %+v", recovered)
 	}
 
 	events := client.XRange(ctx, EventsStreamKey(), "-", "+").Val()
@@ -406,7 +437,10 @@ func TestRedisDirectoryAllocateWritesOneOutboxEventUnderRace(t *testing.T) {
 	ctx := context.Background()
 	server := miniredis.RunT(t)
 	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
-	dir := NewDirectory(client, failingStrategy{})
+	dir, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
 	registerTestNode(t, dir, "game-1", "session-a")
 
 	var wg sync.WaitGroup
@@ -536,7 +570,10 @@ func TestRedisDirectoryAllocateUsesLuaRoundRobinInsteadOfGoStrategy(t *testing.T
 	ctx := context.Background()
 	server := miniredis.RunT(t)
 	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
-	dir := NewDirectory(client, failingStrategy{})
+	dir, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
 	node1 := registerTestNode(t, dir, "game-1", "session-a")
 	node2 := registerTestNode(t, dir, "game-2", "session-b")
 
@@ -573,6 +610,7 @@ func TestRedisDirectoryRenewLuaRejectsSessionReplacedAfterGoValidation(t *testin
 	server := miniredis.RunT(t)
 	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
 	var dir *Directory
+	var err error
 	var once sync.Once
 	client := evalHookClient{
 		UniversalClient: base,
@@ -595,7 +633,10 @@ func TestRedisDirectoryRenewLuaRejectsSessionReplacedAfterGoValidation(t *testin
 			})
 		},
 	}
-	dir = NewDirectory(client, strategies.NewRoundRobin())
+	dir, err = NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
 	node := registerTestNode(t, dir, "game-1", "session-a")
 	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
 		GrainID:         "10001",
@@ -626,6 +667,7 @@ func TestRedisDirectoryReleaseLuaRejectsSessionReplacedAfterGoValidation(t *test
 	server := miniredis.RunT(t)
 	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
 	var dir *Directory
+	var err error
 	var once sync.Once
 	client := evalHookClient{
 		UniversalClient: base,
@@ -648,7 +690,10 @@ func TestRedisDirectoryReleaseLuaRejectsSessionReplacedAfterGoValidation(t *test
 			})
 		},
 	}
-	dir = NewDirectory(client, strategies.NewRoundRobin())
+	dir, err = NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
 	node := registerTestNode(t, dir, "game-1", "session-a")
 	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
 		GrainID:         "10001",
@@ -685,7 +730,10 @@ func TestRedisDirectoryNodeRegistryWritesEventsThroughLua(t *testing.T) {
 	server := miniredis.RunT(t)
 	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
 	client := failXAddClient{UniversalClient: base, err: errors.New("direct xadd disabled")}
-	dir := NewDirectory(client, strategies.NewRoundRobin())
+	dir, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
 	node := sp.Node{
 		NodeType:      "game",
 		NodeGroup:     "default",

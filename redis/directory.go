@@ -13,8 +13,8 @@ import (
 )
 
 type Directory struct {
-	client   goredis.UniversalClient
-	strategy sp.PlacementStrategy
+	client goredis.UniversalClient
+	mode   sp.StrategyMode
 }
 
 type mutationArgs struct {
@@ -36,8 +36,11 @@ type redisNode struct {
 	PlacementNodeKey string
 }
 
-func NewDirectory(client goredis.UniversalClient, strategy sp.PlacementStrategy) *Directory {
-	return &Directory{client: client, strategy: strategy}
+func NewDirectory(client goredis.UniversalClient, mode sp.StrategyMode) (*Directory, error) {
+	if mode != sp.StrategyModeRedisRoundRobin {
+		return nil, sp.ErrUnsupportedStrategyMode
+	}
+	return &Directory{client: client, mode: mode}, nil
 }
 
 func (d *Directory) RegisterNode(ctx context.Context, node sp.Node) error {
@@ -297,6 +300,9 @@ func (d *Directory) Recover(ctx context.Context, cmd sp.RecoverCommand) (*sp.Pla
 	}
 	if placement.Version != cmd.PlacementVersion {
 		return nil, sp.ErrVersionConflict
+	}
+	if !sp.PlacementRecoverable(placement.Status) {
+		return nil, sp.ErrPlacementNotRecoverable
 	}
 	target, err := d.effectiveNode(ctx, cmd.NewNodeIdentity)
 	if err != nil {
@@ -822,33 +828,6 @@ func (d *Directory) setNode(ctx context.Context, node sp.Node) error {
 		return err
 	}
 	return d.client.Set(ctx, NodeKey(node.NodeIdentity), value, 0).Err()
-}
-
-func (d *Directory) xadd(ctx context.Context, event sp.PlacementEvent) error {
-	return d.client.XAdd(ctx, &goredis.XAddArgs{
-		Stream: EventsStreamKey(),
-		Values: map[string]any{
-			"type":              string(event.Type),
-			"grain_key":         event.GrainKey.String(),
-			"node_identity":     event.NodeIdentity,
-			"node_type":         event.NodeType,
-			"node_group":        event.NodeGroup,
-			"node_name":         event.NodeName,
-			"placement_version": event.PlacementVersion,
-			"lease_version":     event.LeaseVersion,
-		},
-	}).Err()
-}
-
-func eventFromPlacement(eventType sp.EventType, placement sp.Placement) sp.PlacementEvent {
-	return sp.PlacementEvent{
-		Type:             eventType,
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     placement.NodeIdentity,
-		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
-		Time:             time.Now(),
-	}
 }
 
 func parseCursorScore(cursor string) (int64, error) {

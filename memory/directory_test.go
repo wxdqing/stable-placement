@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,7 +14,10 @@ import (
 func newTestDirectory(t *testing.T) (*Directory, *EventBus) {
 	t.Helper()
 	bus := NewEventBus()
-	dir := NewDirectory(NewNodeRegistry(bus), strategies.NewRoundRobin(), bus)
+	dir, err := NewDirectory(NewNodeRegistry(bus), sp.StrategyModeGo, strategies.NewRoundRobin(), bus)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return dir, bus
 }
 
@@ -275,5 +279,126 @@ func TestDirectoryExpireRemovesPlacementAndPublishesLeaseExpired(t *testing.T) {
 	}
 	if seen[len(seen)-1] != sp.EventLeaseExpired {
 		t.Fatalf("last event = %v", seen)
+	}
+}
+
+func TestDirectoryRecoverRejectsReleasedPlacement(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := newTestDirectory(t)
+	node := registerTestNode(t, dir, "game-1", "session-a")
+	registerTestNode(t, dir, "game-2", "session-b")
+
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	if err := dir.Release(ctx, sp.ReleaseCommand{
+		GrainKey:         placement.GrainKey,
+		NodeIdentity:     node.NodeIdentity,
+		NodeSessionID:    node.NodeSessionID,
+		PlacementVersion: placement.Version,
+		LeaseVersion:     placement.Lease.Version,
+	}); err != nil {
+		t.Fatalf("Release error: %v", err)
+	}
+	_, err = dir.Recover(ctx, sp.RecoverCommand{
+		GrainKey:         placement.GrainKey,
+		NewNodeIdentity:  "game/default/game-2",
+		PlacementVersion: placement.Version,
+		LeaseTTL:         time.Minute,
+	})
+	if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
+		t.Fatalf("Recover after release err = %v, want ErrPlacementNotRecoverable", err)
+	}
+}
+
+func TestDirectoryRecoverAfterExpire(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := newTestDirectory(t)
+	registerTestNode(t, dir, "game-1", "session-a")
+	node2 := registerTestNode(t, dir, "game-2", "session-b")
+
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	if err := dir.Expire(ctx, sp.ExpireCommand{
+		GrainKey:     placement.GrainKey,
+		LeaseVersion: placement.Lease.Version,
+		Now:          time.Now().Add(time.Second),
+	}); err != nil {
+		t.Fatalf("Expire error: %v", err)
+	}
+	recovered, err := dir.Recover(ctx, sp.RecoverCommand{
+		GrainKey:         placement.GrainKey,
+		NewNodeIdentity:  node2.NodeIdentity,
+		PlacementVersion: placement.Version,
+		LeaseTTL:         time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Recover after expire error: %v", err)
+	}
+	if recovered.Status != sp.PlacementStatusActive || recovered.NodeIdentity != node2.NodeIdentity {
+		t.Fatalf("recovered = %+v", recovered)
+	}
+}
+
+func TestDirectoryAllocateConcurrentSameGrain(t *testing.T) {
+	ctx := context.Background()
+	dir, bus := newTestDirectory(t)
+	registerTestNode(t, dir, "game-1", "session-a")
+
+	var created int
+	_ = bus.Subscribe(ctx, func(event sp.PlacementEvent) error {
+		if event.Type == sp.EventPlacementCreated {
+			created++
+		}
+		return nil
+	})
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	start := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := dir.Allocate(ctx, sp.AllocateCommand{
+				GrainID:         "10001",
+				Kind:            "Player",
+				TargetNodeType:  "game",
+				TargetNodeGroup: "default",
+				LeaseTTL:        time.Minute,
+			})
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Allocate error: %v", err)
+		}
+	}
+	key, _ := sp.NewGrainKey("Player", "10001")
+	if ok, err := dir.Exists(ctx, key); err != nil || !ok {
+		t.Fatalf("Exists after concurrent allocate = %v, err = %v", ok, err)
+	}
+	if created != 1 {
+		t.Fatalf("PlacementCreated events = %d, want 1", created)
 	}
 }
