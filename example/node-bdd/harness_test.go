@@ -38,7 +38,10 @@ func newHarness(t *testing.T) *harness {
 	if addr == "" {
 		addr = defaultRedisAddr
 	}
-	client := goredis.NewClient(&goredis.Options{Addr: addr})
+	client := goredis.NewClient(&goredis.Options{
+		Addr:     addr,
+		Password: os.Getenv("STABLE_PLACEMENT_REDIS_PASSWORD"),
+	})
 	ctx := context.Background()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("redis %s not available: %v", addr, err)
