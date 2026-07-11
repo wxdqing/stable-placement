@@ -12,11 +12,13 @@ const (
 
 const allocateLua = `
 local existing = redis.call("GET", KEYS[1])
+local next_version = 1
 if existing then
 	local existing_placement = cjson.decode(existing)
 	if existing_placement["Status"] == "active" then
 		return existing
 	end
+	next_version = tonumber(existing_placement["Version"] or 0) + 1
 end
 
 local candidate_keys = redis.call("SMEMBERS", KEYS[2])
@@ -42,7 +44,7 @@ local placement = {
 	Kind = ARGV[2],
 	GrainKey = ARGV[3],
 	NodeIdentity = chosen["NodeIdentity"],
-	Version = 1,
+	Version = next_version,
 	Status = "active",
 	CreateTime = ARGV[4],
 	UpdateTime = ARGV[4],
@@ -64,7 +66,7 @@ redis.call("XADD", KEYS[7], "*",
 	"type", ARGV[7],
 	"grain_key", ARGV[3],
 	"node_identity", chosen["NodeIdentity"],
-	"placement_version", "1",
+	"placement_version", tostring(next_version),
 	"lease_version", "1")
 return placement_raw
 `

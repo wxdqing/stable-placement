@@ -138,6 +138,75 @@ func TestDirectoryAllocateLookupRenewTransferRelease(t *testing.T) {
 	}
 }
 
+func TestDirectoryOldCommandCannotMutateReallocatedPlacement(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := newTestDirectory(t)
+	registerTestNode(t, dir, "game-1", "session-a")
+
+	first, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("first Allocate error: %v", err)
+	}
+	if err := dir.Release(ctx, sp.ReleaseCommand{
+		GrainKey:         first.GrainKey,
+		NodeIdentity:     first.NodeIdentity,
+		NodeSessionID:    first.Lease.OwnerNodeSessionID,
+		PlacementVersion: first.Version,
+		LeaseVersion:     first.Lease.Version,
+	}); err != nil {
+		t.Fatalf("first Release error: %v", err)
+	}
+
+	second, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         first.GrainID,
+		Kind:            first.Kind,
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("second Allocate error: %v", err)
+	}
+	if second.Version <= first.Version {
+		t.Fatalf("reallocated version = %d, first = %d", second.Version, first.Version)
+	}
+
+	_, err = dir.Renew(ctx, sp.RenewCommand{
+		GrainKey:         first.GrainKey,
+		NodeIdentity:     first.NodeIdentity,
+		NodeSessionID:    first.Lease.OwnerNodeSessionID,
+		PlacementVersion: first.Version,
+		LeaseVersion:     first.Lease.Version,
+		ExtendTTL:        time.Minute,
+	})
+	if !errors.Is(err, sp.ErrVersionConflict) {
+		t.Fatalf("old Renew err = %v", err)
+	}
+	err = dir.Release(ctx, sp.ReleaseCommand{
+		GrainKey:         first.GrainKey,
+		NodeIdentity:     first.NodeIdentity,
+		NodeSessionID:    first.Lease.OwnerNodeSessionID,
+		PlacementVersion: first.Version,
+		LeaseVersion:     first.Lease.Version,
+	})
+	if !errors.Is(err, sp.ErrVersionConflict) {
+		t.Fatalf("old Release err = %v", err)
+	}
+	active, err := dir.Lookup(ctx, second.GrainKey)
+	if err != nil {
+		t.Fatalf("Lookup second error: %v", err)
+	}
+	if active.Version != second.Version || active.Status != sp.PlacementStatusActive {
+		t.Fatalf("active placement = %+v, want second = %+v", active, second)
+	}
+}
+
 func TestDirectoryInvalidNodeGroupAndFindByNode(t *testing.T) {
 	ctx := context.Background()
 	dir, _ := newTestDirectory(t)
@@ -310,7 +379,7 @@ func TestDirectoryRecoverRejectsReleasedPlacement(t *testing.T) {
 	_, err = dir.Recover(ctx, sp.RecoverCommand{
 		GrainKey:         placement.GrainKey,
 		NewNodeIdentity:  "game/default/game-2",
-		PlacementVersion: placement.Version,
+		PlacementVersion: placement.Version + 1,
 		LeaseTTL:         time.Minute,
 	})
 	if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
@@ -344,7 +413,7 @@ func TestDirectoryRecoverAfterExpire(t *testing.T) {
 	recovered, err := dir.Recover(ctx, sp.RecoverCommand{
 		GrainKey:         placement.GrainKey,
 		NewNodeIdentity:  node2.NodeIdentity,
-		PlacementVersion: placement.Version,
+		PlacementVersion: placement.Version + 1,
 		LeaseTTL:         time.Minute,
 	})
 	if err != nil {

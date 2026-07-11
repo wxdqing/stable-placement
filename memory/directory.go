@@ -101,9 +101,12 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 	}
 
 	d.mu.Lock()
-	if existing, ok := d.placements[key]; ok && existing.Status == sp.PlacementStatusActive {
-		d.mu.Unlock()
-		return copyPlacement(existing), nil
+	if existing, ok := d.placements[key]; ok {
+		if existing.Status == sp.PlacementStatusActive {
+			d.mu.Unlock()
+			return copyPlacement(existing), nil
+		}
+		placement.Version = existing.Version + 1
 	}
 	d.placements[key] = placement
 	d.addNodeIndexLocked(chosen.NodeIdentity, key)
@@ -167,6 +170,7 @@ func (d *Directory) Release(ctx context.Context, cmd sp.ReleaseCommand) error {
 		d.mu.Unlock()
 		return sp.ErrVersionConflict
 	}
+	placement.Version++
 	placement.Status = sp.PlacementStatusReleased
 	placement.UpdateTime = time.Now()
 	d.placements[cmd.GrainKey] = placement
@@ -285,6 +289,7 @@ func (d *Directory) Expire(ctx context.Context, cmd sp.ExpireCommand) error {
 		d.mu.Unlock()
 		return sp.ErrLeaseNotExpired
 	}
+	placement.Version++
 	placement.Status = sp.PlacementStatusExpired
 	placement.UpdateTime = now
 	d.placements[cmd.GrainKey] = placement

@@ -160,7 +160,6 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 		GrainID:       cmd.GrainID,
 		Kind:          cmd.Kind,
 		GrainKey:      key,
-		Version:       1,
 		Status:        sp.PlacementStatusActive,
 		CreateTime:    now,
 		UpdateTime:    now,
@@ -231,6 +230,7 @@ func (d *Directory) Release(ctx context.Context, cmd sp.ReleaseCommand) error {
 	if placement.Version != cmd.PlacementVersion || placement.Lease.Version != cmd.LeaseVersion {
 		return sp.ErrVersionConflict
 	}
+	placement.Version++
 	placement.Status = sp.PlacementStatusReleased
 	placement.UpdateTime = time.Now()
 	_, err = d.mutateWithLua(ctx, mutationArgs{
@@ -355,6 +355,7 @@ func (d *Directory) Expire(ctx context.Context, cmd sp.ExpireCommand) error {
 	if now.Before(placement.LeaseExpireAt) {
 		return sp.ErrLeaseNotExpired
 	}
+	placement.Version++
 	placement.Status = sp.PlacementStatusExpired
 	placement.UpdateTime = now
 	_, err = d.mutateWithLua(ctx, mutationArgs{
