@@ -43,17 +43,18 @@ type continuityMetadataClient struct {
 
 type continuityRaceClient struct {
 	goredis.UniversalClient
-	mu          sync.Mutex
-	mutateEvery bool
-	mutate      func(context.Context) error
-	infoCalls   int
-	err         error
+	mu                 sync.Mutex
+	mutateEvery        bool
+	entriesAddedOffset int64
+	mutate             func(context.Context) error
+	infoCalls          int
+	err                error
 }
 
 func (c *continuityRaceClient) XInfoStream(ctx context.Context, stream string) *goredis.XInfoStreamCmd {
 	info, err := c.UniversalClient.XInfoStream(ctx, stream).Result()
 	if err == nil {
-		info.EntriesAdded = info.Length
+		info.EntriesAdded = info.Length + c.entriesAddedOffset
 		c.mu.Lock()
 		c.infoCalls++
 		if c.err == nil && (c.mutateEvery || c.infoCalls == 1) {
@@ -66,6 +67,37 @@ func (c *continuityRaceClient) XInfoStream(ctx context.Context, stream string) *
 	cmd.SetVal(info)
 	cmd.SetErr(err)
 	return cmd
+}
+
+type pendingPayloadPipelineClient struct {
+	goredis.UniversalClient
+	entries        []goredis.XPendingExt
+	pendingCounts  []int
+	pipelineCounts []int
+}
+
+func (c *pendingPayloadPipelineClient) XPendingExt(ctx context.Context, args *goredis.XPendingExtArgs) *goredis.XPendingExtCmd {
+	start := 0
+	if len(args.Start) > 1 && args.Start[0] == '(' {
+		for start < len(c.entries) && compareRedisStreamID(c.entries[start].ID, args.Start[1:]) <= 0 {
+			start++
+		}
+	}
+	end := start + int(args.Count)
+	if end > len(c.entries) {
+		end = len(c.entries)
+	}
+	page := append([]goredis.XPendingExt(nil), c.entries[start:end]...)
+	c.pendingCounts = append(c.pendingCounts, len(page))
+	cmd := goredis.NewXPendingExtCmd(ctx, "xpending", args.Stream, args.Group)
+	cmd.SetVal(page)
+	return cmd
+}
+
+func (c *pendingPayloadPipelineClient) Pipelined(ctx context.Context, fn func(goredis.Pipeliner) error) ([]goredis.Cmder, error) {
+	cmds, err := c.UniversalClient.Pipelined(ctx, fn)
+	c.pipelineCounts = append(c.pipelineCounts, len(cmds))
+	return cmds, err
 }
 
 func (c *continuityRaceClient) XInfoGroups(ctx context.Context, stream string) *goredis.XInfoGroupsCmd {
@@ -1028,14 +1060,108 @@ func TestRedisEventBusContinuityBoundsRetriesOnActiveStream(t *testing.T) {
 	}
 	bus.client = hooked
 
-	if err := bus.CheckContinuity(ctx); err != nil {
-		t.Fatalf("CheckContinuity error: %v", err)
+	if err := bus.CheckContinuity(ctx); !errors.Is(err, ErrStreamContinuityUnstable) {
+		t.Fatalf("CheckContinuity err = %v, want ErrStreamContinuityUnstable", err)
 	}
 	if ctx.Err() != nil {
 		t.Fatal("CheckContinuity retried until context timeout")
 	}
 	if bus.IsDegraded() {
 		t.Fatal("active stream put bus in degraded mode")
+	}
+}
+
+func TestRedisEventBusContinuityUnstableDoesNotHideGapOrConsume(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(base, consumer)
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	if err := bus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+		t.Fatalf("Publish error: %v", err)
+	}
+	hooked := &continuityRaceClient{
+		UniversalClient: base, mutateEvery: true, entriesAddedOffset: 1,
+	}
+	hooked.mutate = func(ctx context.Context) error {
+		return base.XAdd(ctx, &goredis.XAddArgs{
+			Stream: bus.StreamKey(), Values: eventValues(sp.PlacementEvent{Type: sp.EventManualCacheClear}),
+		}).Err()
+	}
+	bus.client = hooked
+
+	if err := bus.CheckContinuity(ctx); !errors.Is(err, ErrStreamContinuityUnstable) {
+		t.Fatalf("CheckContinuity err = %v, want ErrStreamContinuityUnstable", err)
+	}
+	handlerCalled := false
+	if err := bus.Subscribe(ctx, func(sp.PlacementEvent) error {
+		handlerCalled = true
+		return nil
+	}); !errors.Is(err, ErrStreamContinuityUnstable) {
+		t.Fatalf("Subscribe err = %v, want ErrStreamContinuityUnstable", err)
+	}
+	if handlerCalled {
+		t.Fatal("handler called while continuity was unstable")
+	}
+	if bus.IsDegraded() {
+		t.Fatal("unstable continuity put bus in degraded mode")
+	}
+}
+
+func TestRedisEventBusPendingPayloadValidationUsesBoundedPipelineBatches(t *testing.T) {
+	for _, missingSecondBatch := range []bool{false, true} {
+		name := "all present"
+		if missingSecondBatch {
+			name = "missing in second batch"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			server := miniredis.RunT(t)
+			base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+			consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+			if err != nil {
+				t.Fatalf("consumer error: %v", err)
+			}
+			bus := NewEventBus(base, consumer)
+			entries := make([]goredis.XPendingExt, 101)
+			for i := range entries {
+				id := strconv.Itoa(1000+i) + "-0"
+				entries[i] = goredis.XPendingExt{ID: id, Consumer: consumer.NodeSessionID}
+				if err := base.XAdd(ctx, &goredis.XAddArgs{
+					Stream: bus.StreamKey(), ID: id,
+					Values: eventValues(sp.PlacementEvent{Type: sp.EventManualCacheClear}),
+				}).Err(); err != nil {
+					t.Fatalf("XAdd %s error: %v", id, err)
+				}
+			}
+			if missingSecondBatch {
+				if err := base.XDel(ctx, bus.StreamKey(), entries[100].ID).Err(); err != nil {
+					t.Fatalf("XDel second batch error: %v", err)
+				}
+			}
+			hooked := &pendingPayloadPipelineClient{UniversalClient: base, entries: entries}
+			bus.client = hooked
+
+			missing, err := bus.pendingPayloadMissing(ctx, int64(len(entries)))
+			if err != nil {
+				t.Fatalf("pendingPayloadMissing error: %v", err)
+			}
+			if missing != missingSecondBatch {
+				t.Fatalf("missing = %v, want %v", missing, missingSecondBatch)
+			}
+			if fmt.Sprint(hooked.pendingCounts) != "[100 1]" {
+				t.Fatalf("pending batch sizes = %v, want [100 1]", hooked.pendingCounts)
+			}
+			if fmt.Sprint(hooked.pipelineCounts) != "[100 1]" {
+				t.Fatalf("pipeline batch sizes = %v, want [100 1]", hooked.pipelineCounts)
+			}
+		})
 	}
 }
 

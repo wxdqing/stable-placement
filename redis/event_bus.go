@@ -243,7 +243,7 @@ func (b *EventBus) CheckContinuity(ctx context.Context) error {
 		}
 		return nil
 	}
-	return nil
+	return ErrStreamContinuityUnstable
 }
 
 func (b *EventBus) checkContinuitySnapshot(ctx context.Context, info *goredis.XInfoStream) (bool, error) {
@@ -329,11 +329,22 @@ func (b *EventBus) pendingPayloadMissing(ctx context.Context, pendingCount int64
 		if len(entries) == 0 {
 			return false, nil
 		}
-		for _, entry := range entries {
-			messages, err := b.client.XRangeN(ctx, b.stream, entry.ID, entry.ID, 1).Result()
+		commands := make([]*goredis.XMessageSliceCmd, len(entries))
+		_, err = b.client.Pipelined(ctx, func(pipe goredis.Pipeliner) error {
+			for i, entry := range entries {
+				commands[i] = pipe.XRangeN(ctx, b.stream, entry.ID, entry.ID, 1)
+			}
+			return nil
+		})
+		if err != nil {
+			return false, err
+		}
+		for i, command := range commands {
+			messages, err := command.Result()
 			if err != nil {
 				return false, err
 			}
+			entry := entries[i]
 			if len(messages) != 1 || messages[0].ID != entry.ID {
 				return true, nil
 			}

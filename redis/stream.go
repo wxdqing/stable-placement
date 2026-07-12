@@ -9,6 +9,7 @@ import (
 var ErrSharedConsumerGroup = errors.New("redis stream consumer group must be unique per node session")
 var ErrPendingMessages = errors.New("redis stream has pending messages over threshold")
 var ErrStreamGap = errors.New("redis stream has a trim gap")
+var ErrStreamContinuityUnstable = errors.New("redis stream continuity snapshot is unstable")
 
 type StreamConsumer struct {
 	NodeIdentity  string
