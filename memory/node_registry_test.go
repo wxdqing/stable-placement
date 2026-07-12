@@ -74,7 +74,7 @@ func testNode(name, session string) sp.Node {
 	}
 }
 
-func TestNodeRegistryLeaseConfig(t *testing.T) {
+func TestMemoryNodeLeaseConfigRejectsNonPositiveTTLAndDefaultsToMinute(t *testing.T) {
 	if sp.DefaultNodeLeaseConfig().TTL != time.Minute {
 		t.Fatalf("default TTL = %v, want 1m", sp.DefaultNodeLeaseConfig().TTL)
 	}
@@ -161,12 +161,6 @@ func TestNodeRegistryRegisterLeaseRules(t *testing.T) {
 		t.Fatalf("idempotent register changed lease/events: lease=%+v events=%d", idempotent.Lease, len(publisher.Events()))
 	}
 
-	otherSession := node
-	otherSession.NodeSessionID = "session-b"
-	if err := registry.RegisterNode(ctx, otherSession); !errors.Is(err, sp.ErrInvalidNodeSession) {
-		t.Fatalf("different-session RegisterNode err = %v", err)
-	}
-
 	registry.mu.Lock()
 	offline := registry.nodes[node.NodeIdentity]
 	offline.Status = sp.NodeStatusOffline
@@ -187,7 +181,7 @@ func TestNodeRegistryRegisterLeaseRules(t *testing.T) {
 	}
 }
 
-func TestNodeRegistryRegisterIdentityValidationHasNoSideEffects(t *testing.T) {
+func TestNodeRegistryIdentityMismatchDoesNotWriteStateOrEvents(t *testing.T) {
 	clock := newFakeClock(time.Unix(100, 0))
 	publisher := &recordingPublisher{}
 	registry := newTestRegistry(t, clock, publisher, time.Second)
@@ -202,6 +196,23 @@ func TestNodeRegistryRegisterIdentityValidationHasNoSideEffects(t *testing.T) {
 	}
 	if len(registry.nodes) != 0 || len(publisher.Events()) != 0 {
 		t.Fatalf("invalid registrations changed state/events: nodes=%d events=%d", len(registry.nodes), len(publisher.Events()))
+	}
+
+	valid := testNode("game-1", "session-a")
+	if err := registry.RegisterNode(context.Background(), valid); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := registry.Node(valid.NodeIdentity)
+	eventsBefore := len(publisher.Events())
+	mismatch := valid
+	mismatch.NodeIdentity = "wrong"
+	mismatch.NodeSessionID = "session-b"
+	if _, err := registry.ReplaceNodeSession(context.Background(), mismatch); err == nil {
+		t.Fatal("identity-mismatch ReplaceNodeSession succeeded")
+	}
+	after, _ := registry.Node(valid.NodeIdentity)
+	if after != before || len(registry.nodes) != 1 || len(publisher.Events()) != eventsBefore {
+		t.Fatal("identity-mismatch replacement changed state or events")
 	}
 }
 
@@ -292,7 +303,7 @@ func TestNodeRegistryConcurrentRenewDoesNotMoveExpiryBackward(t *testing.T) {
 	}
 }
 
-func TestNodeRegistryReplaceSessionRules(t *testing.T) {
+func TestNodeRegistryRegisterCannotBypassReplaceSessionEvent(t *testing.T) {
 	ctx := context.Background()
 	clock := newFakeClock(time.Unix(500, 0))
 	publisher := &recordingPublisher{}
@@ -306,26 +317,24 @@ func TestNodeRegistryReplaceSessionRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventsBefore := len(publisher.Events())
+	otherSession := oldNode
+	otherSession.NodeSessionID = "session-b"
+	if err := registry.RegisterNode(ctx, otherSession); !errors.Is(err, sp.ErrInvalidNodeSession) {
+		t.Fatalf("different-session RegisterNode err = %v", err)
+	}
+	unchanged, _ := registry.Node(oldNode.NodeIdentity)
+	if unchanged.NodeSessionID != oldNode.NodeSessionID || len(publisher.Events()) != eventsBefore {
+		t.Fatal("different-session RegisterNode changed state or events")
+	}
 
 	same := oldNode
 	same.Address = "changed"
 	if _, err := registry.ReplaceNodeSession(ctx, same); !errors.Is(err, sp.ErrInvalidNodeSession) {
 		t.Fatalf("same-session ReplaceNodeSession err = %v", err)
 	}
-	unchanged, _ := registry.Node(oldNode.NodeIdentity)
+	unchanged, _ = registry.Node(oldNode.NodeIdentity)
 	if unchanged.Address != "old" || len(publisher.Events()) != eventsBefore {
 		t.Fatalf("same-session replacement changed state/events: node=%+v events=%d", unchanged, len(publisher.Events()))
-	}
-
-	bad := oldNode
-	bad.NodeSessionID = "session-b"
-	bad.NodeIdentity = "wrong"
-	if _, err := registry.ReplaceNodeSession(ctx, bad); err == nil {
-		t.Fatal("identity-mismatch ReplaceNodeSession succeeded")
-	}
-	unchanged, _ = registry.Node(oldNode.NodeIdentity)
-	if unchanged.NodeSessionID != oldNode.NodeSessionID || len(publisher.Events()) != eventsBefore {
-		t.Fatal("identity-mismatch replacement changed state/events")
 	}
 
 	clock.Advance(time.Second)

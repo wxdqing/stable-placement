@@ -20,13 +20,22 @@ type routeMutationSnapshot struct {
 	nodeMembers []string
 	indexes     map[string][]goredis.Z
 	sequence    string
-	events      int64
-	audit       int64
+	events      []goredis.XMessage
+	audit       []goredis.XMessage
 }
 
 func captureRouteMutationSnapshot(t *testing.T, ctx context.Context, client *goredis.Client, p sp.Placement, identities ...string) routeMutationSnapshot {
 	t.Helper()
-	s := routeMutationSnapshot{placement: client.Get(ctx, PlacementKey(p.GrainKey)).Val(), nodes: map[string]string{}, indexes: map[string][]goredis.Z{}, sequence: client.Get(ctx, SequenceKey()).Val(), events: client.XLen(ctx, EventsStreamKey()).Val(), audit: client.XLen(ctx, AuditStreamKey()).Val()}
+	s := routeMutationSnapshot{placement: client.Get(ctx, PlacementKey(p.GrainKey)).Val(), nodes: map[string]string{}, indexes: map[string][]goredis.Z{}, sequence: client.Get(ctx, SequenceKey()).Val()}
+	var err error
+	s.events, err = client.XRange(ctx, EventsStreamKey(), "-", "+").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.audit, err = client.XRange(ctx, AuditStreamKey(), "-", "+").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, identity := range identities {
 		s.nodes[identity] = client.Get(ctx, NodeKey(identity)).Val()
 		values, err := client.ZRangeWithScores(ctx, PlacementNodeKey(identity), 0, -1).Result()
@@ -132,6 +141,34 @@ func TestRedisDirectoryLookupRejectsExpiredOnArrival(t *testing.T) {
 	}
 	if _, err := slow.Lookup(ctx, p.GrainKey); !errors.Is(err, sp.ErrPlacementNotFound) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRedisDirectoryValidUntilConservativelyIncludesResponseDelay(t *testing.T) {
+	ctx := context.Background()
+	const ttl = 5 * time.Second
+	const delay = 100 * time.Millisecond
+	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: ttl})
+	server.SetTime(time.Unix(610, 0))
+	node := testNode("game-1", "session-a")
+	if err := dir.RegisterNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	p, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "delayed", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slow, err := NewDirectory(delayedEvalClient{UniversalClient: client, delay: delay}, sp.StrategyModeRedisRoundRobin, sp.NodeLeaseConfig{TTL: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, err := slow.Lookup(ctx, p.GrainKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := time.Until(route.ValidUntil)
+	if remaining <= 0 || remaining >= ttl-delay/2 {
+		t.Fatalf("remaining ValidUntil window = %v, want positive and shortened by response delay", remaining)
 	}
 }
 

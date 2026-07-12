@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"sort"
@@ -368,9 +369,14 @@ func TestRedisDirectoryRealRedisLuaAtomicityV2(t *testing.T) {
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Fatal(err)
 	}
-	tag := "{node-lease-v2-atomic}"
+	tag := fmt.Sprintf("{node-lease-v2-atomic-%d-%d}", os.Getpid(), time.Now().UnixNano())
 	key := func(s string) string { return "sp:" + tag + ":" + s }
 	keys := []string{key("placement"), key("owner"), key("target"), key("old-index"), key("new-index"), key("target-leases"), key("events"), key("owner-leases"), key("invalid"), key("sequence")}
+	for _, redisKey := range keys {
+		if !strings.Contains(redisKey, tag) {
+			t.Fatalf("key %q does not share hash tag %q", redisKey, tag)
+		}
+	}
 	t.Cleanup(func() { client.Del(context.Background(), keys...) })
 	client.Set(ctx, keys[0], `{"GrainKey":"Player/1","NodeIdentity":"old","OwnerNodeSessionID":"s1","Version":1,"Status":"active"}`, 0)
 	client.Set(ctx, keys[6], "wrongtype", 0)

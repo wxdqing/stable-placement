@@ -57,7 +57,7 @@ func TestRedisDirectoryImplementsContracts(t *testing.T) {
 	var _ sp.NodeRegistry = (*Directory)(nil)
 }
 
-func TestRedisDirectoryNodeLeaseConfig(t *testing.T) {
+func TestRedisNodeLeaseConfigRejectsNonPositiveTTLAndDefaultsToMinute(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
 	defer client.Close()

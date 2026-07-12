@@ -371,7 +371,7 @@ func TestDirectoryRecoverAllowsEveryUnavailableOwnerKind(t *testing.T) {
 	}
 }
 
-func TestDirectoryFindByNodeRejectsNegativeAndAllowsPastEndCursor(t *testing.T) {
+func TestMemoryFindByNodeRejectsNegativeAndAllowsPastEndCursor(t *testing.T) {
 	directory, _, _ := newTestDirectory(t)
 	node := registerTestNode(t, directory, "game-1", "session-a")
 	allocateTestPlacement(t, directory, "10001", node)

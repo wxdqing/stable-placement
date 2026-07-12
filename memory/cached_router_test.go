@@ -180,32 +180,6 @@ func TestCachedRouterHandleEventMappings(t *testing.T) {
 		})
 	}
 
-	nodeEvents := []sp.EventType{sp.EventNodeLeaseExpired, sp.EventNodeReplaced, sp.EventNodeDraining, sp.EventNodeMarkedInvalid, sp.EventNodeUnregistered}
-	for _, eventType := range nodeEvents {
-		t.Run(string(eventType), func(t *testing.T) {
-			router, cache, keys := seededCachedRouter(t)
-			if err := router.HandleEvent(sp.PlacementEvent{Type: eventType, NodeIdentity: "game/default/game-1"}); err != nil {
-				t.Fatal(err)
-			}
-			assertCached(t, cache, keys[0], false)
-			assertCached(t, cache, keys[1], true)
-		})
-	}
-
-	t.Run("renew audit ignored", func(t *testing.T) {
-		router, cache, keys := seededCachedRouter(t)
-		before := router.epoch
-		if err := router.HandleEvent(sp.PlacementEvent{Type: sp.EventPlacementRenewed}); err != nil {
-			t.Fatal(err)
-		}
-		if router.epoch != before {
-			t.Fatalf("epoch advanced from %d to %d", before, router.epoch)
-		}
-		for _, key := range keys {
-			assertCached(t, cache, key, true)
-		}
-	})
-
 	t.Run("restored group", func(t *testing.T) {
 		router, cache, keys := seededCachedRouter(t)
 		_ = router.HandleEvent(sp.PlacementEvent{Type: sp.EventNodeRestored, NodeType: "game", NodeGroup: "default"})
@@ -226,6 +200,31 @@ func TestCachedRouterHandleEventMappings(t *testing.T) {
 				assertCached(t, cache, key, false)
 			}
 		})
+	}
+}
+
+func TestCachedRouterUsesNodeLeaseInvalidationInsteadOfGrainRenew(t *testing.T) {
+	for _, eventType := range []sp.EventType{sp.EventNodeLeaseExpired, sp.EventNodeReplaced, sp.EventNodeDraining, sp.EventNodeMarkedInvalid, sp.EventNodeUnregistered} {
+		t.Run(string(eventType), func(t *testing.T) {
+			router, cache, keys := seededCachedRouter(t)
+			if err := router.HandleEvent(sp.PlacementEvent{Type: eventType, NodeIdentity: "game/default/game-1"}); err != nil {
+				t.Fatal(err)
+			}
+			assertCached(t, cache, keys[0], false)
+			assertCached(t, cache, keys[1], true)
+		})
+	}
+
+	router, cache, keys := seededCachedRouter(t)
+	before := router.epoch
+	if err := router.HandleEvent(sp.PlacementEvent{Type: sp.EventPlacementRenewed}); err != nil {
+		t.Fatal(err)
+	}
+	if router.epoch != before {
+		t.Fatalf("epoch advanced from %d to %d", before, router.epoch)
+	}
+	for _, key := range keys {
+		assertCached(t, cache, key, true)
 	}
 }
 
