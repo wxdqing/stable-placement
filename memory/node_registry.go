@@ -31,7 +31,8 @@ func newNodeRegistry(publisher sp.EventPublisher, config sp.NodeLeaseConfig, now
 		return nil, sp.ErrInvalidNodeLeaseTTL
 	}
 	ttlMillis := config.TTL.Milliseconds()
-	if config.TTL%time.Millisecond != 0 {
+	maxTTLMillis := time.Duration(1<<63 - 1).Milliseconds()
+	if config.TTL%time.Millisecond != 0 && ttlMillis < maxTTLMillis {
 		ttlMillis++
 	}
 	config.TTL = time.Duration(ttlMillis) * time.Millisecond

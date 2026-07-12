@@ -115,6 +115,26 @@ func TestNodeRegistryRoundsPositiveSubMillisecondTTLUp(t *testing.T) {
 	}
 }
 
+func TestNodeRegistryCapsTTLAtLargestWholeMillisecond(t *testing.T) {
+	start := time.Unix(0, 0)
+	clock := newFakeClock(start)
+	maxTTL := time.Duration(1<<63 - 1)
+	registry, err := newNodeRegistry(nil, sp.NodeLeaseConfig{TTL: maxTTL}, clock.Now)
+	if err != nil {
+		t.Fatalf("newNodeRegistry error: %v", err)
+	}
+	node := testNode("game-1", "session-a")
+
+	if err := registry.RegisterNode(context.Background(), node); err != nil {
+		t.Fatalf("RegisterNode error: %v", err)
+	}
+	got, ok := registry.Node(node.NodeIdentity)
+	wantTTLMillis := maxTTL.Truncate(time.Millisecond).Milliseconds()
+	if !ok || got.Lease.TTLMillis <= 0 || got.Lease.TTLMillis != wantTTLMillis || got.Lease.ExpireAtUnixMilli <= start.UnixMilli() {
+		t.Fatalf("registered node = %+v, ok=%v, want TTLMillis=%d and future expiry", got, ok, wantTTLMillis)
+	}
+}
+
 func TestNodeRegistryRegisterLeaseRules(t *testing.T) {
 	ctx := context.Background()
 	start := time.Unix(100, 0)
