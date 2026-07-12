@@ -84,7 +84,7 @@ func (d *Directory) UnregisterNode(ctx context.Context, nodeIdentity string, nod
 	if err != nil {
 		return err
 	}
-	return d.unregisterNodeWithLua(ctx, *node, nodeSessionID)
+	return d.unregisterNodeWithLua(ctx, *node, nodeSessionID, false)
 }
 
 func (d *Directory) ReplaceNodeSession(ctx context.Context, node sp.Node) (*sp.Node, error) {
@@ -126,7 +126,11 @@ func (d *Directory) DrainNode(ctx context.Context, nodeIdentity string) error {
 }
 
 func (d *Directory) CompleteDrain(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
-	return d.UnregisterNode(ctx, nodeIdentity, nodeSessionID)
+	node, err := d.getNode(ctx, nodeIdentity)
+	if err != nil {
+		return err
+	}
+	return d.unregisterNodeWithLua(ctx, *node, nodeSessionID, true)
 }
 
 func (d *Directory) RestoreNode(ctx context.Context, nodeType string, nodeGroup string, nodeName string) error {
@@ -789,14 +793,20 @@ func (d *Directory) drainNodeWithLua(ctx context.Context, node sp.Node) error {
 	}
 }
 
-func (d *Directory) unregisterNodeWithLua(ctx context.Context, node sp.Node, nodeSessionID string) error {
+func (d *Directory) unregisterNodeWithLua(ctx context.Context, node sp.Node, nodeSessionID string, guardPlacements bool) error {
+	guard := "0"
+	if guardPlacements {
+		guard = "1"
+	}
 	result, err := d.client.Eval(ctx, unregisterNodeLua, []string{
 		NodeKey(node.NodeIdentity),
 		NodesKey(node.NodeType, node.NodeGroup),
 		EventsStreamKey(),
+		PlacementNodeKey(node.NodeIdentity),
 	},
 		nodeSessionID,
 		string(sp.EventNodeUnregistered),
+		guard,
 	).Text()
 	if err != nil {
 		return err
@@ -806,6 +816,8 @@ func (d *Directory) unregisterNodeWithLua(ctx context.Context, node sp.Node, nod
 		return sp.ErrNodeNotFound
 	case "invalid_node_session":
 		return sp.ErrInvalidNodeSession
+	case "node_has_placements":
+		return sp.ErrNodeHasPlacements
 	default:
 		return nil
 	}

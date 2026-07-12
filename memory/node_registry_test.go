@@ -99,3 +99,41 @@ func TestNodeRegistryDrainRequiresInvalidNodeAndHeartbeatTimeout(t *testing.T) {
 		t.Fatalf("node after heartbeat timeout = %+v, ok=%v", offline, ok)
 	}
 }
+
+func TestCompleteDrainRejectsNodeWithPlacements(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := newTestDirectory(t)
+	node := registerTestNode(t, dir, "game-1", "session-a")
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  node.NodeType,
+		TargetNodeGroup: node.NodeGroup,
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	if err := dir.NodeRegistry().MarkNodeInvalid(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
+		t.Fatalf("MarkNodeInvalid error: %v", err)
+	}
+	if err := dir.NodeRegistry().DrainNode(ctx, node.NodeIdentity); err != nil {
+		t.Fatalf("DrainNode error: %v", err)
+	}
+
+	if err := dir.NodeRegistry().CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeHasPlacements) {
+		t.Fatalf("CompleteDrain with placement err = %v, want ErrNodeHasPlacements", err)
+	}
+	if err := dir.Release(ctx, sp.ReleaseCommand{
+		GrainKey:         placement.GrainKey,
+		NodeIdentity:     node.NodeIdentity,
+		NodeSessionID:    node.NodeSessionID,
+		PlacementVersion: placement.Version,
+		LeaseVersion:     placement.Lease.Version,
+	}); err != nil {
+		t.Fatalf("Release error: %v", err)
+	}
+	if err := dir.NodeRegistry().CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+		t.Fatalf("CompleteDrain after release error: %v", err)
+	}
+}

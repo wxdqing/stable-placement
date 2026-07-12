@@ -242,6 +242,9 @@ local node = cjson.decode(node_raw)
 if node["NodeSessionID"] ~= ARGV[1] then
 	return "invalid_node_session"
 end
+if ARGV[3] == "1" and redis.call("ZCARD", KEYS[4]) > 0 then
+	return "node_has_placements"
+end
 redis.call("DEL", KEYS[1])
 redis.call("SREM", KEYS[2], KEYS[1])
 redis.call("XADD", KEYS[3], "*",

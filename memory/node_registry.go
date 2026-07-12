@@ -10,11 +10,12 @@ import (
 )
 
 type NodeRegistry struct {
-	mu           sync.RWMutex
-	nodes        map[string]sp.Node
-	invalid      map[string]map[string]struct{}
-	publisher    sp.EventPublisher
-	heartbeatTTL time.Duration
+	mu                  sync.RWMutex
+	nodes               map[string]sp.Node
+	invalid             map[string]map[string]struct{}
+	publisher           sp.EventPublisher
+	heartbeatTTL        time.Duration
+	hasActivePlacements func(string) bool
 }
 
 func NewNodeRegistry(publisher sp.EventPublisher) *NodeRegistry {
@@ -144,6 +145,9 @@ func (r *NodeRegistry) DrainNode(ctx context.Context, nodeIdentity string) error
 }
 
 func (r *NodeRegistry) CompleteDrain(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
+	if r.hasActivePlacements != nil && r.hasActivePlacements(nodeIdentity) {
+		return sp.ErrNodeHasPlacements
+	}
 	return r.UnregisterNode(ctx, nodeIdentity, nodeSessionID)
 }
 

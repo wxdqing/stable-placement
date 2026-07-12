@@ -12,6 +12,7 @@ var (
 	ErrLeaseExpired       = errors.New("lease expired")
 	ErrLeaseNotExpired    = errors.New("lease not expired")
 	ErrNodeNotFound       = errors.New("node not found")
+	ErrNodeHasPlacements  = errors.New("node still has active placements")
 	ErrNodeNotInvalid        = errors.New("node is not marked invalid")
 	ErrUnsupportedStrategyMode = errors.New("unsupported strategy mode")
 )

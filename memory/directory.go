@@ -23,13 +23,19 @@ func NewDirectory(registry *NodeRegistry, mode sp.StrategyMode, strategy sp.Plac
 	if mode != sp.StrategyModeGo {
 		return nil, sp.ErrUnsupportedStrategyMode
 	}
-	return &Directory{
+	d := &Directory{
 		placements: make(map[sp.GrainKey]sp.Placement),
 		byNode:     make(map[string]map[sp.GrainKey]struct{}),
 		registry:   registry,
 		strategy:   strategy,
 		publisher:  publisher,
-	}, nil
+	}
+	registry.hasActivePlacements = func(nodeIdentity string) bool {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+		return len(d.byNode[nodeIdentity]) > 0
+	}
+	return d, nil
 }
 
 func (d *Directory) NodeRegistry() *NodeRegistry {
