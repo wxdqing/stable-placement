@@ -34,6 +34,36 @@ type consumerLifecycleErrorClient struct {
 	ensureErr  error
 }
 
+type consumerReplaceRaceClient struct {
+	goredis.UniversalClient
+	once   sync.Once
+	mutate func(context.Context) error
+	err    error
+}
+
+func (c *consumerReplaceRaceClient) trigger(ctx context.Context) error {
+	c.once.Do(func() { c.err = c.mutate(ctx) })
+	return c.err
+}
+
+func (c *consumerReplaceRaceClient) XPending(ctx context.Context, stream, group string) *goredis.XPendingCmd {
+	pending, err := c.UniversalClient.XPending(ctx, stream, group).Result()
+	if err == nil {
+		err = c.trigger(ctx)
+	}
+	cmd := goredis.NewXPendingCmd(ctx, "xpending", stream, group)
+	cmd.SetVal(pending)
+	cmd.SetErr(err)
+	return cmd
+}
+
+func (c *consumerReplaceRaceClient) Eval(ctx context.Context, script string, keys []string, args ...any) *goredis.Cmd {
+	if err := c.trigger(ctx); err != nil {
+		return goredis.NewCmdResult(nil, err)
+	}
+	return c.UniversalClient.Eval(ctx, script, keys, args...)
+}
+
 func (c consumerLifecycleErrorClient) XPending(ctx context.Context, stream, group string) *goredis.XPendingCmd {
 	if c.pendingErr == nil {
 		return c.UniversalClient.XPending(ctx, stream, group)
@@ -59,6 +89,15 @@ func (c consumerLifecycleErrorClient) XGroupCreateMkStream(ctx context.Context, 
 	cmd := goredis.NewStatusCmd(ctx, "xgroup", "create", stream, group, start, "mkstream")
 	cmd.SetErr(c.ensureErr)
 	return cmd
+}
+
+func (c consumerLifecycleErrorClient) Eval(ctx context.Context, script string, keys []string, args ...any) *goredis.Cmd {
+	for _, err := range []error{c.pendingErr, c.destroyErr, c.ensureErr} {
+		if err != nil {
+			return goredis.NewCmdResult(nil, err)
+		}
+	}
+	return c.UniversalClient.Eval(ctx, script, keys, args...)
 }
 
 type limitedPendingReadClient struct {
@@ -773,6 +812,179 @@ func TestRedisEventBusReplaceConsumerKeepsOldPendingGroup(t *testing.T) {
 	}
 }
 
+func TestRedisEventBusReplaceConsumerAtomicallyKeepsNewPendingMessage(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	oldConsumer, _ := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	newConsumer, _ := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-b"})
+	oldBus := NewEventBus(base, oldConsumer)
+	if err := oldBus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("old EnsureConsumerGroup error: %v", err)
+	}
+	if err := oldBus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+		t.Fatalf("Publish error: %v", err)
+	}
+	hooked := &consumerReplaceRaceClient{UniversalClient: base}
+	hooked.mutate = func(ctx context.Context) error {
+		return base.XReadGroup(ctx, &goredis.XReadGroupArgs{
+			Group: oldConsumer.Group, Consumer: oldConsumer.NodeSessionID,
+			Streams: []string{oldBus.StreamKey(), ">"}, Count: 1,
+		}).Err()
+	}
+	bus := NewEventBus(hooked, newConsumer)
+	if err := bus.ReplaceConsumer(ctx, oldConsumer); !errors.Is(err, ErrPendingMessages) {
+		t.Fatalf("ReplaceConsumer error = %v, want ErrPendingMessages", err)
+	}
+	groups, err := base.XInfoGroups(ctx, bus.StreamKey()).Result()
+	if err != nil {
+		t.Fatalf("XInfoGroups error: %v", err)
+	}
+	if len(groups) != 1 || groups[0].Name != oldConsumer.Group || groups[0].Pending != 1 {
+		t.Fatalf("groups after pending race = %+v, want pending old group only", groups)
+	}
+}
+
+func TestRedisEventBusReplaceConsumerKeepsLaggingOldGroup(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	oldConsumer, _ := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	newConsumer, _ := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-b"})
+	oldBus := NewEventBus(client, oldConsumer)
+	if err := oldBus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("old EnsureConsumerGroup error: %v", err)
+	}
+	if err := oldBus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+		t.Fatalf("Publish error: %v", err)
+	}
+	bus := NewEventBus(client, newConsumer)
+	if err := bus.ReplaceConsumer(ctx, oldConsumer); !errors.Is(err, ErrPendingMessages) {
+		t.Fatalf("ReplaceConsumer error = %v, want ErrPendingMessages", err)
+	}
+	groups, err := client.XInfoGroups(ctx, bus.StreamKey()).Result()
+	if err != nil {
+		t.Fatalf("XInfoGroups error: %v", err)
+	}
+	if len(groups) != 1 || groups[0].Name != oldConsumer.Group {
+		t.Fatalf("groups after lag rejection = %+v, want old group only", groups)
+	}
+}
+
+func TestRedisEventBusReplaceConsumerRejectsUnrelatedConsumers(t *testing.T) {
+	cases := []struct {
+		name string
+		old  sp.Node
+		new  sp.Node
+	}{
+		{
+			name: "same session",
+			old:  sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"},
+			new:  sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"},
+		},
+		{
+			name: "different identity",
+			old:  sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"},
+			new:  sp.Node{NodeIdentity: "game/default/game-2", NodeSessionID: "session-b"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			server := miniredis.RunT(t)
+			client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+			oldConsumer, _ := NewStreamConsumer(tc.old)
+			newConsumer, _ := NewStreamConsumer(tc.new)
+			oldBus := NewEventBus(client, oldConsumer)
+			if err := oldBus.EnsureConsumerGroup(ctx); err != nil {
+				t.Fatalf("old EnsureConsumerGroup error: %v", err)
+			}
+			if err := oldBus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+				t.Fatalf("Publish error: %v", err)
+			}
+			bus := NewEventBus(client, newConsumer)
+			if err := bus.ReplaceConsumer(ctx, oldConsumer); !errors.Is(err, ErrSharedConsumerGroup) {
+				t.Fatalf("ReplaceConsumer error = %v, want ErrSharedConsumerGroup", err)
+			}
+			groups, err := client.XInfoGroups(ctx, bus.StreamKey()).Result()
+			if err != nil {
+				t.Fatalf("XInfoGroups error: %v", err)
+			}
+			if len(groups) != 1 || groups[0].Name != oldConsumer.Group {
+				t.Fatalf("groups after rejected replace = %+v, want old group only", groups)
+			}
+		})
+	}
+}
+
+func TestRedisEventBusReplaceConsumerValidatesCurrentConsumer(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	oldConsumer, _ := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err := NewEventBus(client, oldConsumer).EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("old EnsureConsumerGroup error: %v", err)
+	}
+	bus := NewEventBus(client, StreamConsumer{
+		NodeIdentity: "game/default/game-1", NodeSessionID: "session-b", Group: "arbitrary-group",
+	})
+	if err := bus.ReplaceConsumer(ctx, oldConsumer); !errors.Is(err, ErrSharedConsumerGroup) {
+		t.Fatalf("ReplaceConsumer error = %v, want ErrSharedConsumerGroup", err)
+	}
+	groups, err := client.XInfoGroups(ctx, bus.StreamKey()).Result()
+	if err != nil {
+		t.Fatalf("XInfoGroups error: %v", err)
+	}
+	if len(groups) != 1 || groups[0].Name != oldConsumer.Group {
+		t.Fatalf("groups after invalid current consumer = %+v, want old group only", groups)
+	}
+}
+
+func TestRedisEventBusReplaceConsumerCreateFailureKeepsOldGroupAndRetries(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	oldConsumer, _ := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	newConsumer, _ := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-b"})
+	if err := NewEventBus(base, oldConsumer).EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("old EnsureConsumerGroup error: %v", err)
+	}
+	redisErr := errors.New("create group failure")
+	bus := NewEventBus(consumerLifecycleErrorClient{UniversalClient: base, ensureErr: redisErr}, newConsumer)
+	if err := bus.ReplaceConsumer(ctx, oldConsumer); !errors.Is(err, redisErr) {
+		t.Fatalf("ReplaceConsumer error = %v, want create error", err)
+	}
+	groups, err := base.XInfoGroups(ctx, bus.StreamKey()).Result()
+	if err != nil {
+		t.Fatalf("XInfoGroups after failure error: %v", err)
+	}
+	if len(groups) != 1 || groups[0].Name != oldConsumer.Group {
+		t.Fatalf("groups after create failure = %+v, want old group only", groups)
+	}
+	bus = NewEventBus(base, newConsumer)
+	if err := bus.ReplaceConsumer(ctx, oldConsumer); err != nil {
+		t.Fatalf("ReplaceConsumer retry error: %v", err)
+	}
+}
+
+func TestRedisEventBusReplaceConsumerRetryAfterCompletedMigration(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	oldConsumer, _ := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	newConsumer, _ := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-b"})
+	if err := NewEventBus(client, oldConsumer).EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("old EnsureConsumerGroup error: %v", err)
+	}
+	bus := NewEventBus(client, newConsumer)
+	if err := bus.ReplaceConsumer(ctx, oldConsumer); err != nil {
+		t.Fatalf("first ReplaceConsumer error: %v", err)
+	}
+	if err := bus.ReplaceConsumer(ctx, oldConsumer); err != nil {
+		t.Fatalf("retry ReplaceConsumer error: %v", err)
+	}
+}
+
 func TestRedisEventBusReplaceConsumerRedisErrorsDegrade(t *testing.T) {
 	stages := []struct {
 		name string
@@ -822,6 +1034,28 @@ func TestRedisEventBusCloseConsumerGroupRedisErrorDegrades(t *testing.T) {
 	}
 	if !bus.IsDegraded() {
 		t.Fatal("Close Redis error did not degrade bus")
+	}
+}
+
+func TestRedisEventBusCloseConsumerGroupRejectsInvalidCurrentConsumer(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	if err := client.XGroupCreateMkStream(ctx, EventsStreamKey(), "arbitrary-group", "$").Err(); err != nil {
+		t.Fatalf("XGroupCreateMkStream error: %v", err)
+	}
+	bus := NewEventBus(client, StreamConsumer{
+		NodeIdentity: "game/default/game-1", NodeSessionID: "session-a", Group: "arbitrary-group",
+	})
+	if err := bus.Close(ctx); !errors.Is(err, ErrSharedConsumerGroup) {
+		t.Fatalf("Close error = %v, want ErrSharedConsumerGroup", err)
+	}
+	groups, err := client.XInfoGroups(ctx, bus.StreamKey()).Result()
+	if err != nil {
+		t.Fatalf("XInfoGroups error: %v", err)
+	}
+	if len(groups) != 1 || groups[0].Name != "arbitrary-group" {
+		t.Fatalf("groups after rejected close = %+v, want arbitrary group preserved", groups)
 	}
 }
 
@@ -1389,6 +1623,81 @@ func TestRedisEventBusPendingPayloadValidationUsesBoundedPipelineBatches(t *test
 			}
 		})
 	}
+}
+
+func TestRedisEventBusRealRedisConsumerLifecycle(t *testing.T) {
+	addr := os.Getenv("STABLE_PLACEMENT_REAL_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("STABLE_PLACEMENT_REAL_REDIS_ADDR is not set")
+	}
+	client := goredis.NewClient(&goredis.Options{
+		Addr: addr, Password: os.Getenv("STABLE_PLACEMENT_REAL_REDIS_PASSWORD"),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("real Redis Ping error: %v", err)
+	}
+
+	newBuses := func(t *testing.T) (*EventBus, *EventBus, StreamConsumer) {
+		t.Helper()
+		oldConsumer, err := NewStreamConsumer(sp.Node{
+			NodeIdentity: "game/default/task9", NodeSessionID: t.Name() + "-old",
+		})
+		if err != nil {
+			t.Fatalf("old consumer error: %v", err)
+		}
+		newConsumer, err := NewStreamConsumer(sp.Node{
+			NodeIdentity: "game/default/task9", NodeSessionID: t.Name() + "-new",
+		})
+		if err != nil {
+			t.Fatalf("new consumer error: %v", err)
+		}
+		stream := fmt.Sprintf("sp:{stable-placement}:task9:%d", time.Now().UnixNano())
+		oldBus := NewEventBus(client, oldConsumer)
+		oldBus.stream = stream
+		newBus := NewEventBus(client, newConsumer)
+		newBus.stream = stream
+		t.Cleanup(func() {
+			if err := client.Del(context.Background(), stream).Err(); err != nil {
+				t.Errorf("cleanup isolated stream error: %v", err)
+			}
+		})
+		if err := oldBus.EnsureConsumerGroup(ctx); err != nil {
+			t.Fatalf("old EnsureConsumerGroup error: %v", err)
+		}
+		return oldBus, newBus, oldConsumer
+	}
+
+	t.Run("replace retry and close", func(t *testing.T) {
+		_, newBus, oldConsumer := newBuses(t)
+		if err := newBus.ReplaceConsumer(ctx, oldConsumer); err != nil {
+			t.Fatalf("ReplaceConsumer error: %v", err)
+		}
+		if err := newBus.ReplaceConsumer(ctx, oldConsumer); err != nil {
+			t.Fatalf("ReplaceConsumer retry error: %v", err)
+		}
+		if err := newBus.Close(ctx); err != nil {
+			t.Fatalf("Close error: %v", err)
+		}
+	})
+
+	t.Run("lag blocks replacement", func(t *testing.T) {
+		oldBus, newBus, oldConsumer := newBuses(t)
+		if err := oldBus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+			t.Fatalf("Publish error: %v", err)
+		}
+		if err := newBus.ReplaceConsumer(ctx, oldConsumer); !errors.Is(err, ErrPendingMessages) {
+			t.Fatalf("ReplaceConsumer error = %v, want ErrPendingMessages", err)
+		}
+		groups, err := client.XInfoGroups(ctx, oldBus.stream).Result()
+		if err != nil {
+			t.Fatalf("XInfoGroups error: %v", err)
+		}
+		if len(groups) != 1 || groups[0].Name != oldConsumer.Group {
+			t.Fatalf("groups after lag rejection = %+v, want old group only", groups)
+		}
+	})
 }
 
 func TestRedisEventBusRealRedisContinuityMetadata(t *testing.T) {

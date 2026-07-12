@@ -49,6 +49,51 @@ end
 return redis.call("XTRIM", KEYS[1], "MAXLEN", "=", ARGV[1])
 `
 
+const replaceConsumerLua = `
+local groups = redis.call("XINFO", "GROUPS", KEYS[1])
+local old_found = false
+local new_found = false
+
+for _, group in ipairs(groups) do
+	local name = nil
+	local pending = nil
+	local lag = nil
+	for index = 1, #group, 2 do
+		if group[index] == "name" then
+			name = group[index + 1]
+		elseif group[index] == "pending" then
+			pending = group[index + 1]
+		elseif group[index] == "lag" then
+			lag = group[index + 1]
+		end
+	end
+	if name == ARGV[1] then
+		old_found = true
+		if type(pending) ~= "number" or pending ~= 0 then
+			return 1
+		end
+		if type(lag) ~= "number" or lag ~= 0 then
+			return 1
+		end
+	elseif name == ARGV[2] then
+		new_found = true
+	end
+end
+
+if not old_found then
+	if new_found then
+		return 0
+	end
+	return redis.error_reply("NOGROUP old consumer group does not exist")
+end
+
+if not new_found then
+	redis.call("XGROUP", "CREATE", KEYS[1], ARGV[2], "$")
+end
+redis.call("XGROUP", "DESTROY", KEYS[1], ARGV[1])
+return 0
+`
+
 func NewEventBus(client goredis.UniversalClient, consumer StreamConsumer) *EventBus {
 	return &EventBus{
 		client:   client,
@@ -119,7 +164,7 @@ func (b *EventBus) SubscribeHint(ctx context.Context, handler func(sp.PlacementE
 }
 
 func (b *EventBus) EnsureConsumerGroup(ctx context.Context) error {
-	if b.consumer.Group != ConsumerGroupName(b.consumer.NodeIdentity, b.consumer.NodeSessionID) {
+	if !validStreamConsumer(b.consumer) {
 		b.setDegraded()
 		return ErrSharedConsumerGroup
 	}
@@ -131,6 +176,10 @@ func (b *EventBus) EnsureConsumerGroup(ctx context.Context) error {
 }
 
 func (b *EventBus) DeleteConsumerGroup(ctx context.Context) error {
+	if !validStreamConsumer(b.consumer) {
+		b.setDegraded()
+		return ErrSharedConsumerGroup
+	}
 	err := b.client.XGroupDestroy(ctx, b.stream, b.consumer.Group).Err()
 	if err == goredis.Nil {
 		return nil
@@ -140,7 +189,7 @@ func (b *EventBus) DeleteConsumerGroup(ctx context.Context) error {
 
 // CleanupConsumerGroup removes a previously valid node-session consumer group.
 func (b *EventBus) CleanupConsumerGroup(ctx context.Context, consumer StreamConsumer) error {
-	if consumer.Group != ConsumerGroupName(consumer.NodeIdentity, consumer.NodeSessionID) {
+	if !validStreamConsumer(consumer) {
 		b.setDegraded()
 		return ErrSharedConsumerGroup
 	}
@@ -153,32 +202,26 @@ func (b *EventBus) CleanupConsumerGroup(ctx context.Context, consumer StreamCons
 
 // ReplaceConsumer removes an idle previous session group before creating this bus's group.
 func (b *EventBus) ReplaceConsumer(ctx context.Context, old StreamConsumer) error {
-	if old.Group != ConsumerGroupName(old.NodeIdentity, old.NodeSessionID) {
+	if !validStreamConsumer(old) || !validStreamConsumer(b.consumer) ||
+		old.NodeIdentity != b.consumer.NodeIdentity ||
+		old.NodeSessionID == b.consumer.NodeSessionID || old.Group == b.consumer.Group {
 		b.setDegraded()
 		return ErrSharedConsumerGroup
 	}
-	pending, err := b.client.XPending(ctx, b.stream, old.Group).Result()
+	result, err := b.client.Eval(ctx, replaceConsumerLua, []string{b.stream}, old.Group, b.consumer.Group).Int64()
 	if err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			b.setDegraded()
 		}
 		return err
 	}
-	if pending.Count > 0 {
+	if result == 1 {
 		b.setDegraded()
 		return ErrPendingMessages
 	}
-	if err := b.CleanupConsumerGroup(ctx, old); err != nil {
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			b.setDegraded()
-		}
-		return err
-	}
-	if err := b.EnsureConsumerGroup(ctx); err != nil {
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			b.setDegraded()
-		}
-		return err
+	if result != 0 {
+		b.setDegraded()
+		return errors.New("redis consumer replacement returned an invalid result")
 	}
 	return nil
 }
@@ -491,6 +534,11 @@ func (b *EventBus) setDegraded() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.degraded = true
+}
+
+func validStreamConsumer(consumer StreamConsumer) bool {
+	return consumer.NodeIdentity != "" && consumer.NodeSessionID != "" &&
+		consumer.Group == ConsumerGroupName(consumer.NodeIdentity, consumer.NodeSessionID)
 }
 
 func eventValues(event sp.PlacementEvent) map[string]any {
