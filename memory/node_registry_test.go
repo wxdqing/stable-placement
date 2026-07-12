@@ -49,6 +49,30 @@ func TestNodeRegistryInvalidGroupSurvivesSessionReplacement(t *testing.T) {
 	}
 }
 
+func TestNodeRegistryRenewNodeRejectsOfflineNode(t *testing.T) {
+	ctx := context.Background()
+	registry := NewNodeRegistry(NewEventBus())
+	registry.SetHeartbeatTTL(time.Nanosecond)
+	node := sp.Node{
+		NodeType:      "game",
+		NodeGroup:     "default",
+		NodeName:      "game-1",
+		NodeIdentity:  "game/default/game-1",
+		NodeSessionID: "session-a",
+		Status:        sp.NodeStatusActive,
+	}
+	if err := registry.RegisterNode(ctx, node); err != nil {
+		t.Fatalf("RegisterNode error: %v", err)
+	}
+	if err := registry.ExpireHeartbeats(ctx, time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("ExpireHeartbeats error: %v", err)
+	}
+
+	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
+		t.Fatalf("RenewNode offline err = %v, want ErrNodeNotFound", err)
+	}
+}
+
 func TestNodeRegistryPublishesMarkAndRestoreEvents(t *testing.T) {
 	ctx := context.Background()
 	bus := NewEventBus()

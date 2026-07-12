@@ -52,7 +52,7 @@ func (r *NodeRegistry) RenewNode(_ context.Context, nodeIdentity string, nodeSes
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	node, ok := r.nodes[nodeIdentity]
-	if !ok {
+	if !ok || node.Status == sp.NodeStatusOffline {
 		return sp.ErrNodeNotFound
 	}
 	if node.NodeSessionID != nodeSessionID {
