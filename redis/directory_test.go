@@ -2,7 +2,9 @@ package redis
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -53,6 +55,36 @@ func (c failXAddClient) XAdd(ctx context.Context, a *goredis.XAddArgs) *goredis.
 	return goredis.NewStringResult("", c.err)
 }
 
+type directoryQueryHookClient struct {
+	goredis.UniversalClient
+	getErr    error
+	zRangeErr error
+	counts    []int64
+}
+
+func (c *directoryQueryHookClient) Get(ctx context.Context, key string) *goredis.StringCmd {
+	if c.getErr != nil {
+		return goredis.NewStringResult("", c.getErr)
+	}
+	return c.UniversalClient.Get(ctx, key)
+}
+
+func (c *directoryQueryHookClient) ZRangeByScoreWithScores(ctx context.Context, key string, opt *goredis.ZRangeBy) *goredis.ZSliceCmd {
+	c.counts = append(c.counts, opt.Count)
+	if c.zRangeErr != nil {
+		return goredis.NewZSliceCmdResult(nil, c.zRangeErr)
+	}
+	return c.UniversalClient.ZRangeByScoreWithScores(ctx, key, opt)
+}
+
+type invalidPlacementIndexClient struct {
+	goredis.UniversalClient
+}
+
+func (c invalidPlacementIndexClient) ZRangeByScoreWithScores(context.Context, string, *goredis.ZRangeBy) *goredis.ZSliceCmd {
+	return goredis.NewZSliceCmdResult([]goredis.Z{{Score: 1, Member: 42}}, nil)
+}
+
 func newTestDirectory(t *testing.T) (*Directory, *goredis.Client) {
 	t.Helper()
 	server := miniredis.RunT(t)
@@ -70,6 +102,178 @@ func TestRedisDirectoryRejectsGoStrategyMode(t *testing.T) {
 	_, err := NewDirectory(client, sp.StrategyModeGo)
 	if !errors.Is(err, sp.ErrUnsupportedStrategyMode) {
 		t.Fatalf("NewDirectory err = %v, want ErrUnsupportedStrategyMode", err)
+	}
+}
+
+func TestRedisDirectoryPropagatesRedisErrors(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	wantErr := errors.New("redis connection failed")
+	key, err := sp.NewGrainKey("Player", "10001")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("Exists GET", func(t *testing.T) {
+		dir, err := NewDirectory(&directoryQueryHookClient{UniversalClient: base, getErr: wantErr}, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exists, err := dir.Exists(ctx, key); exists || !errors.Is(err, wantErr) {
+			t.Fatalf("Exists = %v, err = %v, want false and injected error", exists, err)
+		}
+	})
+
+	t.Run("FindNodes GET", func(t *testing.T) {
+		member := NodeKey("game/default/game-1")
+		if err := base.SAdd(ctx, NodesKey("game", "default"), member).Err(); err != nil {
+			t.Fatal(err)
+		}
+		dir, err := NewDirectory(&directoryQueryHookClient{UniversalClient: base, getErr: wantErr}, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if nodes, err := dir.FindNodes(ctx, "game", "default"); nodes != nil || !errors.Is(err, wantErr) {
+			t.Fatalf("FindNodes = %+v, err = %v, want nil and injected error", nodes, err)
+		}
+	})
+
+	t.Run("FindByNode ZRANGE", func(t *testing.T) {
+		dir, err := NewDirectory(&directoryQueryHookClient{UniversalClient: base, zRangeErr: wantErr}, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: "game/default/game-1", Limit: 10}); len(page.Placements) != 0 || !errors.Is(err, wantErr) {
+			t.Fatalf("FindByNode = %+v, err = %v, want empty page and injected error", page, err)
+		}
+	})
+
+	t.Run("FindByNode GET", func(t *testing.T) {
+		if err := base.ZAdd(ctx, PlacementNodeKey("game/default/game-1"), goredis.Z{Score: 1, Member: key.String()}).Err(); err != nil {
+			t.Fatal(err)
+		}
+		dir, err := NewDirectory(&directoryQueryHookClient{UniversalClient: base, getErr: wantErr}, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: "game/default/game-1", Limit: 10}); len(page.Placements) != 0 || !errors.Is(err, wantErr) {
+			t.Fatalf("FindByNode = %+v, err = %v, want empty page and injected error", page, err)
+		}
+	})
+}
+
+func TestRedisDirectoryPropagatesMalformedQueryData(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+
+	t.Run("FindNodes JSON", func(t *testing.T) {
+		member := NodeKey("game/default/broken")
+		if err := base.SAdd(ctx, NodesKey("game", "broken"), member).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := base.Set(ctx, member, "{", 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		dir, err := NewDirectory(base, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if nodes, err := dir.FindNodes(ctx, "game", "broken"); nodes != nil || err == nil {
+			t.Fatalf("FindNodes = %+v, err = %v, want malformed JSON error", nodes, err)
+		}
+	})
+
+	t.Run("FindByNode JSON", func(t *testing.T) {
+		key, err := sp.NewGrainKey("Player", "broken")
+		if err != nil {
+			t.Fatal(err)
+		}
+		nodeIdentity := "game/default/broken"
+		if err := base.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: 1, Member: key.String()}).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := base.Set(ctx, PlacementKey(key), "{", 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		dir, err := NewDirectory(base, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: nodeIdentity, Limit: 10}); len(page.Placements) != 0 || err == nil {
+			t.Fatalf("FindByNode = %+v, err = %v, want malformed JSON error", page, err)
+		}
+	})
+
+	t.Run("FindByNode index member", func(t *testing.T) {
+		dir, err := NewDirectory(invalidPlacementIndexClient{UniversalClient: base}, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: "game/default/broken", Limit: 10}); len(page.Placements) != 0 || err == nil {
+			t.Fatalf("FindByNode = %+v, err = %v, want invalid member error", page, err)
+		}
+	})
+}
+
+func TestRedisDirectoryFindByNodeUsesBoundedReads(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	recording := &directoryQueryHookClient{UniversalClient: base}
+	dir, err := NewDirectory(recording, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeIdentity := "game/default/game-1"
+	for index := 0; index < 100; index++ {
+		key, err := sp.NewGrainKey("Player", "released-"+strconv.Itoa(index))
+		if err != nil {
+			t.Fatal(err)
+		}
+		placement := sp.Placement{GrainID: "released-" + strconv.Itoa(index), Kind: "Player", GrainKey: key, NodeIdentity: nodeIdentity, Status: sp.PlacementStatusReleased}
+		raw, err := json.Marshal(placement)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := base.Set(ctx, PlacementKey(key), raw, 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := base.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: float64(index + 1), Member: key.String()}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	activeKey, err := sp.NewGrainKey("Player", "active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := sp.Placement{GrainID: "active", Kind: "Player", GrainKey: activeKey, NodeIdentity: nodeIdentity, Status: sp.PlacementStatusActive}
+	raw, err := json.Marshal(active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Set(ctx, PlacementKey(activeKey), raw, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: 101, Member: activeKey.String()}).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: nodeIdentity, Limit: 10})
+	if err != nil {
+		t.Fatalf("FindByNode error: %v", err)
+	}
+	if len(page.Placements) != 1 || page.Placements[0].GrainKey != activeKey {
+		t.Fatalf("FindByNode page = %+v, want active placement after filtered batch", page)
+	}
+	if len(recording.counts) < 2 {
+		t.Fatalf("query counts = %v, want multiple batches", recording.counts)
+	}
+	for _, count := range recording.counts {
+		if count <= 0 || count > 100 {
+			t.Fatalf("query Count = %d, want 1..100; all counts = %v", count, recording.counts)
+		}
 	}
 }
 

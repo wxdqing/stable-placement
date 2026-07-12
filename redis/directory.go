@@ -122,8 +122,11 @@ func (d *Directory) FindNodes(ctx context.Context, nodeType string, nodeGroup st
 	var nodes []sp.Node
 	for _, member := range members {
 		node, err := d.getNodeFromMember(ctx, member)
-		if err != nil {
+		if errors.Is(err, sp.ErrNodeNotFound) {
 			continue
+		}
+		if err != nil {
+			return nil, err
 		}
 		nodes = append(nodes, *node)
 	}
@@ -429,7 +432,13 @@ func (d *Directory) Expire(ctx context.Context, cmd sp.ExpireCommand) error {
 
 func (d *Directory) Exists(ctx context.Context, key sp.GrainKey) (bool, error) {
 	placement, err := d.Lookup(ctx, key)
-	return err == nil && placement != nil, nil
+	if errors.Is(err, sp.ErrPlacementNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return placement != nil, nil
 }
 
 func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (sp.PlacementPage, error) {
@@ -437,6 +446,7 @@ func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (s
 	if limit <= 0 {
 		limit = 100
 	}
+	batchSize := int64(max(limit, 100))
 	min := "-inf"
 	if query.Cursor != "" {
 		score, err := parseCursorScore(query.Cursor)
@@ -445,43 +455,67 @@ func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (s
 		}
 		min = "(" + strconv.FormatInt(score, 10)
 	}
-	values, err := d.client.ZRangeByScoreWithScores(ctx, PlacementNodeKey(query.NodeIdentity), &goredis.ZRangeBy{
-		Min: min,
-		Max: "+inf",
-	}).Result()
-	if err != nil {
-		return sp.PlacementPage{}, err
-	}
 	status := query.Status
 	if status == "" {
 		status = sp.PlacementStatusActive
 	}
 	var placements []sp.Placement
-	var lastScore int64
-	var lastKey string
-	for _, value := range values {
-		key, ok := value.Member.(string)
-		if !ok {
-			continue
-		}
-		placement, err := d.getPlacement(ctx, sp.GrainKey(key))
+	indexKey := PlacementNodeKey(query.NodeIdentity)
+	for {
+		values, err := d.client.ZRangeByScoreWithScores(ctx, indexKey, &goredis.ZRangeBy{
+			Min:   min,
+			Max:   "+inf",
+			Count: batchSize,
+		}).Result()
 		if err != nil {
-			continue
+			return sp.PlacementPage{}, err
 		}
-		if placement.Status == status {
+		if len(values) == 0 {
+			break
+		}
+		for index, value := range values {
+			key, ok := value.Member.(string)
+			if !ok {
+				return sp.PlacementPage{}, fmt.Errorf("invalid placement index member type %T", value.Member)
+			}
+			placement, err := d.getPlacement(ctx, sp.GrainKey(key))
+			if errors.Is(err, sp.ErrPlacementNotFound) {
+				continue
+			}
+			if err != nil {
+				return sp.PlacementPage{}, err
+			}
+			if placement.Status != status {
+				continue
+			}
 			placements = append(placements, *placement)
-			lastScore = int64(value.Score)
-			lastKey = key
 			if len(placements) == limit {
-				break
+				hasMore := index+1 < len(values)
+				if !hasMore && int64(len(values)) == batchSize {
+					nextValues, err := d.client.ZRangeByScoreWithScores(ctx, indexKey, &goredis.ZRangeBy{
+						Min:   "(" + strconv.FormatInt(int64(value.Score), 10),
+						Max:   "+inf",
+						Count: batchSize,
+					}).Result()
+					if err != nil {
+						return sp.PlacementPage{}, err
+					}
+					hasMore = len(nextValues) > 0
+				}
+				next := ""
+				if hasMore {
+					next = formatCursor(int64(value.Score), key)
+				}
+				return sp.PlacementPage{Placements: placements, NextCursor: next}, nil
 			}
 		}
+		if int64(len(values)) < batchSize {
+			break
+		}
+		lastScore := int64(values[len(values)-1].Score)
+		min = "(" + strconv.FormatInt(lastScore, 10)
 	}
-	next := ""
-	if len(placements) == limit && hasPlacementAfterScore(values, lastScore) {
-		next = formatCursor(lastScore, lastKey)
-	}
-	return sp.PlacementPage{Placements: placements, NextCursor: next}, nil
+	return sp.PlacementPage{Placements: placements}, nil
 }
 
 func (d *Directory) effectiveNodes(ctx context.Context, nodeType string, nodeGroup string) ([]sp.Node, error) {
@@ -934,13 +968,4 @@ func parseCursorScore(cursor string) (int64, error) {
 
 func formatCursor(score int64, key string) string {
 	return strconv.FormatInt(score, 10) + ":" + key
-}
-
-func hasPlacementAfterScore(values []goredis.Z, score int64) bool {
-	for _, value := range values {
-		if int64(value.Score) > score {
-			return true
-		}
-	}
-	return false
 }
