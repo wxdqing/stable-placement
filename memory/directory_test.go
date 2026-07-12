@@ -11,547 +11,462 @@ import (
 	"github.com/wxdqing/stable-placement/strategies"
 )
 
-func newTestDirectory(t *testing.T) (*Directory, *EventBus) {
-	t.Helper()
-	bus := NewEventBus()
-	dir, err := NewDirectory(NewNodeRegistry(bus), sp.StrategyModeGo, strategies.NewRoundRobin(), bus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return dir, bus
+type blockingStrategy struct {
+	started chan struct{}
+	release chan struct{}
 }
 
-func registerTestNode(t *testing.T, dir *Directory, name string, session string) sp.Node {
+func (s blockingStrategy) Choose(_ context.Context, input sp.StrategyInput) (sp.Node, error) {
+	close(s.started)
+	<-s.release
+	return input.EffectiveNodes[0], nil
+}
+
+func newTestDirectory(t *testing.T) (*Directory, *fakeClock, *recordingPublisher) {
 	t.Helper()
-	id, err := sp.NewNodeIdentity("game", "default", name)
+	clock := newFakeClock(time.Unix(1_000, 0))
+	publisher := &recordingPublisher{}
+	registry := newTestRegistry(t, clock, publisher, time.Minute)
+	directory, err := NewDirectory(registry, sp.StrategyModeGo, strategies.NewRoundRobin(), publisher)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewDirectory error: %v", err)
 	}
-	node := sp.Node{
-		NodeType:      "game",
-		NodeGroup:     "default",
-		NodeName:      name,
-		NodeIdentity:  id.String(),
-		NodeSessionID: session,
-		Status:        sp.NodeStatusActive,
-	}
-	if err := dir.NodeRegistry().RegisterNode(context.Background(), node); err != nil {
+	return directory, clock, publisher
+}
+
+func registerTestNode(t *testing.T, directory *Directory, name, session string) sp.Node {
+	t.Helper()
+	node := testNode(name, session)
+	if err := directory.NodeRegistry().RegisterNode(context.Background(), node); err != nil {
 		t.Fatalf("RegisterNode error: %v", err)
 	}
 	return node
 }
 
-func TestDirectoryLookupRejectsExpiredLease(t *testing.T) {
-	ctx := context.Background()
-	dir, _ := newTestDirectory(t)
-	registerTestNode(t, dir, "game-1", "session-a")
-
-	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         "expired-lookup",
-		Kind:            "Player",
-		TargetNodeType:  "game",
-		TargetNodeGroup: "default",
-		LeaseTTL:        time.Millisecond,
+func allocateTestPlacement(t *testing.T, directory *Directory, grainID string, node sp.Node) *sp.Placement {
+	t.Helper()
+	placement, err := directory.Allocate(context.Background(), sp.AllocateCommand{
+		GrainID: grainID, Kind: "Player", TargetNodeType: node.NodeType, TargetNodeGroup: node.NodeGroup,
 	})
 	if err != nil {
 		t.Fatalf("Allocate error: %v", err)
 	}
-	time.Sleep(2 * time.Millisecond)
-
-	if _, err := dir.Lookup(ctx, placement.GrainKey); !errors.Is(err, sp.ErrPlacementNotFound) {
-		t.Fatalf("Lookup expired lease err = %v, want ErrPlacementNotFound", err)
-	}
+	return placement
 }
 
-func TestDirectoryAllocateReplacesExpiredActivePlacement(t *testing.T) {
-	ctx := context.Background()
-	dir, _ := newTestDirectory(t)
-	node1 := registerTestNode(t, dir, "game-1", "session-a")
-	node2 := registerTestNode(t, dir, "game-2", "session-b")
-
-	first, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID: "expired-active", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default",
-		LeaseTTL: time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("first Allocate error: %v", err)
-	}
-	time.Sleep(2 * time.Millisecond)
-	if exists, err := dir.Exists(ctx, first.GrainKey); err != nil || exists {
-		t.Fatalf("Exists expired active = (%v, %v), want (false, nil)", exists, err)
-	}
-
-	second, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID: first.GrainID, Kind: first.Kind, TargetNodeType: "game", TargetNodeGroup: "default",
-		LeaseTTL: time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("second Allocate error: %v", err)
-	}
-	if second.Version <= first.Version {
-		t.Fatalf("replacement version = %d, want > %d", second.Version, first.Version)
-	}
-	if second.NodeIdentity != node2.NodeIdentity {
-		t.Fatalf("replacement node = %q, want %q", second.NodeIdentity, node2.NodeIdentity)
-	}
-	page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: node1.NodeIdentity})
-	if err != nil {
-		t.Fatalf("FindByNode old owner error: %v", err)
-	}
-	if len(page.Placements) != 0 {
-		t.Fatalf("old owner placements = %+v, want none", page.Placements)
-	}
-}
-
-func TestDirectoryRenewAndReleaseAcceptEscapedNodeSessionID(t *testing.T) {
-	for _, operation := range []string{"renew", "release"} {
-		t.Run(operation, func(t *testing.T) {
-			ctx := context.Background()
-			dir, _ := newTestDirectory(t)
-			node := registerTestNode(t, dir, "game-1", `session\"with\\escapes`)
-			placement, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: operation, Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default", LeaseTTL: time.Minute})
-			if err != nil {
-				t.Fatal(err)
+func TestDirectoryLookupAndExistsRequireUsableOwnerLease(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mutate  func(*Directory, sp.Node, *fakeClock)
+		wantErr error
+	}{
+		{name: "active"},
+		{name: "draining", mutate: func(d *Directory, n sp.Node, _ *fakeClock) {
+			setNodeStatus(d.registry, n.NodeIdentity, sp.NodeStatusDraining)
+		}},
+		{name: "missing", mutate: func(d *Directory, n sp.Node, _ *fakeClock) { deleteNode(d.registry, n.NodeIdentity) }, wantErr: sp.ErrPlacementNotFound},
+		{name: "offline", mutate: func(d *Directory, n sp.Node, _ *fakeClock) {
+			setNodeStatus(d.registry, n.NodeIdentity, sp.NodeStatusOffline)
+		}, wantErr: sp.ErrPlacementNotFound},
+		{name: "session mismatch", mutate: func(d *Directory, n sp.Node, _ *fakeClock) { setNodeSession(d.registry, n.NodeIdentity, "session-b") }, wantErr: sp.ErrPlacementNotFound},
+		{name: "expiry boundary", mutate: func(_ *Directory, _ sp.Node, c *fakeClock) { c.Advance(time.Minute) }, wantErr: sp.ErrPlacementNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory, clock, _ := newTestDirectory(t)
+			node := registerTestNode(t, directory, "game-1", "session-a")
+			placement := allocateTestPlacement(t, directory, "10001", node)
+			if test.mutate != nil {
+				test.mutate(directory, node, clock)
 			}
-			if operation == "renew" {
-				_, err = dir.Renew(ctx, sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version, LeaseVersion: placement.Lease.Version, ExtendTTL: time.Minute})
-			} else {
-				err = dir.Release(ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version, LeaseVersion: placement.Lease.Version})
+			route, err := directory.Lookup(context.Background(), placement.GrainKey)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("Lookup err = %v, want %v", err, test.wantErr)
 			}
-			if err != nil {
-				t.Fatalf("%s error: %v", operation, err)
+			exists, err := directory.Exists(context.Background(), placement.GrainKey)
+			if err != nil || exists != (test.wantErr == nil) {
+				t.Fatalf("Exists = %v, %v", exists, err)
+			}
+			if test.wantErr == nil {
+				nodeState, _ := directory.registry.Node(node.NodeIdentity)
+				if route.GrainKey != placement.GrainKey || route.OwnerNodeSessionID != node.NodeSessionID || route.NodeLeaseVersion != nodeState.Lease.Version || !route.ValidUntil.Equal(time.UnixMilli(nodeState.Lease.ExpireAtUnixMilli)) {
+					t.Fatalf("route = %+v, node = %+v", route, nodeState)
+				}
+			} else if _, ok := directory.placements[placement.GrainKey]; !ok {
+				t.Fatal("logical expiry removed placement")
 			}
 		})
 	}
 }
 
-func TestDirectoryAllocateLookupRenewTransferRelease(t *testing.T) {
-	ctx := context.Background()
-	dir, _ := newTestDirectory(t)
-	node1 := registerTestNode(t, dir, "game-1", "session-a")
-	node2 := registerTestNode(t, dir, "game-2", "session-b")
+func TestDirectoryLookupRejectsReleasedPlacement(t *testing.T) {
+	directory, _, _ := newTestDirectory(t)
+	node := registerTestNode(t, directory, "game-1", "session-a")
+	placement := allocateTestPlacement(t, directory, "10001", node)
+	if err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := directory.Lookup(context.Background(), placement.GrainKey); !errors.Is(err, sp.ErrPlacementNotFound) {
+		t.Fatalf("Lookup released err = %v", err)
+	}
+}
 
-	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         "10001",
-		Kind:            "Player",
-		TargetNodeType:  "game",
-		TargetNodeGroup: "default",
-		LeaseTTL:        time.Minute,
-	})
+func TestDirectoryAllocateFiltersNodeLeaseAndInvalidState(t *testing.T) {
+	directory, clock, _ := newTestDirectory(t)
+	active := registerTestNode(t, directory, "active", "s")
+	offline := registerTestNode(t, directory, "offline", "s")
+	expired := registerTestNode(t, directory, "expired", "s")
+	invalid := registerTestNode(t, directory, "invalid", "s")
+	setNodeStatus(directory.registry, offline.NodeIdentity, sp.NodeStatusOffline)
+	setNodeExpiry(directory.registry, expired.NodeIdentity, clock.Now().UnixMilli())
+	if err := directory.registry.MarkNodeInvalid(context.Background(), invalid.NodeType, invalid.NodeGroup, invalid.NodeName); err != nil {
+		t.Fatal(err)
+	}
+
+	placement, err := directory.Allocate(context.Background(), sp.AllocateCommand{GrainID: "10001", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
 	if err != nil {
 		t.Fatalf("Allocate error: %v", err)
 	}
-	if placement.NodeIdentity != node1.NodeIdentity {
-		t.Fatalf("allocated node = %q, want %q", placement.NodeIdentity, node1.NodeIdentity)
+	if placement.NodeIdentity != active.NodeIdentity || placement.OwnerNodeSessionID != active.NodeSessionID {
+		t.Fatalf("placement = %+v", placement)
 	}
+}
 
-	found, err := dir.Lookup(ctx, placement.GrainKey)
-	if err != nil {
-		t.Fatalf("Lookup error: %v", err)
+func TestDirectoryAllocateExistingPlacementRules(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mutate  func(*Directory, sp.Node, *fakeClock)
+		wantErr error
+	}{
+		{name: "healthy"},
+		{name: "missing", mutate: func(d *Directory, n sp.Node, _ *fakeClock) { deleteNode(d.registry, n.NodeIdentity) }, wantErr: sp.ErrPlacementOwnerUnavailable},
+		{name: "offline", mutate: func(d *Directory, n sp.Node, _ *fakeClock) {
+			setNodeStatus(d.registry, n.NodeIdentity, sp.NodeStatusOffline)
+		}, wantErr: sp.ErrPlacementOwnerUnavailable},
+		{name: "expired", mutate: func(d *Directory, n sp.Node, c *fakeClock) {
+			setNodeExpiry(d.registry, n.NodeIdentity, c.Now().UnixMilli())
+		}, wantErr: sp.ErrPlacementOwnerUnavailable},
+		{name: "session mismatch", mutate: func(d *Directory, n sp.Node, _ *fakeClock) { setNodeSession(d.registry, n.NodeIdentity, "new") }, wantErr: sp.ErrPlacementOwnerUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory, clock, _ := newTestDirectory(t)
+			node := registerTestNode(t, directory, "game-1", "session-a")
+			first := allocateTestPlacement(t, directory, "10001", node)
+			before := *first
+			if test.mutate != nil {
+				test.mutate(directory, node, clock)
+			}
+			got, err := directory.Allocate(context.Background(), sp.AllocateCommand{GrainID: "10001", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("Allocate err = %v, want %v", err, test.wantErr)
+			}
+			if test.wantErr == nil && *got != before {
+				t.Fatalf("idempotent placement = %+v, want %+v", got, before)
+			}
+			if directory.placements[first.GrainKey] != before || len(directory.byNode[node.NodeIdentity]) != 1 {
+				t.Fatal("failed Allocate changed placement or index")
+			}
+		})
 	}
-	if found.NodeIdentity != placement.NodeIdentity {
-		t.Fatalf("lookup node = %q", found.NodeIdentity)
-	}
+}
 
-	renewed, err := dir.Renew(ctx, sp.RenewCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node1.NodeIdentity,
-		NodeSessionID:    node1.NodeSessionID,
-		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
-		ExtendTTL:        time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("Renew error: %v", err)
+func TestDirectoryAllocateReleasedPlacementAdvancesHistory(t *testing.T) {
+	directory, _, _ := newTestDirectory(t)
+	node := registerTestNode(t, directory, "game-1", "session-a")
+	first := allocateTestPlacement(t, directory, "10001", node)
+	if err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: first.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: first.Version}); err != nil {
+		t.Fatal(err)
 	}
-	if renewed.Lease.Version != placement.Lease.Version+1 {
-		t.Fatalf("lease version = %d", renewed.Lease.Version)
+	second := allocateTestPlacement(t, directory, "10001", node)
+	if second.Version != first.Version+2 || second.Status != sp.PlacementStatusActive {
+		t.Fatalf("reallocated placement = %+v, first = %+v", second, first)
 	}
+}
 
-	transferred, err := dir.Transfer(ctx, sp.TransferCommand{
-		GrainKey:         placement.GrainKey,
-		FromNodeIdentity: node1.NodeIdentity,
-		ToNodeIdentity:   node2.NodeIdentity,
-		PlacementVersion: renewed.Version,
-		LeaseTTL:         time.Minute,
-	})
+func TestDirectoryRenewValidatesOwnerLeaseAndOnlyAudits(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mutate  func(*Directory, sp.Node, *fakeClock)
+		command func(*sp.Placement, sp.Node) sp.RenewCommand
+		wantErr error
+	}{
+		{name: "active"},
+		{name: "draining", mutate: func(d *Directory, n sp.Node, _ *fakeClock) {
+			setNodeStatus(d.registry, n.NodeIdentity, sp.NodeStatusDraining)
+		}},
+		{name: "missing", mutate: func(d *Directory, n sp.Node, _ *fakeClock) { deleteNode(d.registry, n.NodeIdentity) }, wantErr: sp.ErrPlacementOwnerUnavailable},
+		{name: "offline", mutate: func(d *Directory, n sp.Node, _ *fakeClock) {
+			setNodeStatus(d.registry, n.NodeIdentity, sp.NodeStatusOffline)
+		}, wantErr: sp.ErrPlacementOwnerUnavailable},
+		{name: "expired", mutate: func(d *Directory, n sp.Node, c *fakeClock) {
+			setNodeExpiry(d.registry, n.NodeIdentity, c.Now().UnixMilli())
+		}, wantErr: sp.ErrNodeLeaseExpired},
+		{name: "session mismatch", mutate: func(d *Directory, n sp.Node, _ *fakeClock) { setNodeSession(d.registry, n.NodeIdentity, "new") }, wantErr: sp.ErrInvalidNodeSession},
+		{name: "version", command: func(p *sp.Placement, n sp.Node) sp.RenewCommand {
+			return sp.RenewCommand{GrainKey: p.GrainKey, NodeIdentity: n.NodeIdentity, NodeSessionID: n.NodeSessionID, PlacementVersion: p.Version + 1}
+		}, wantErr: sp.ErrVersionConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory, clock, publisher := newTestDirectory(t)
+			node := registerTestNode(t, directory, "game-1", "session-a")
+			placement := allocateTestPlacement(t, directory, "10001", node)
+			beforePlacement := directory.placements[placement.GrainKey]
+			beforeNode, _ := directory.registry.Node(node.NodeIdentity)
+			if test.mutate != nil {
+				test.mutate(directory, node, clock)
+				beforeNode, _ = directory.registry.Node(node.NodeIdentity)
+			}
+			cmd := sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version}
+			if test.command != nil {
+				cmd = test.command(placement, node)
+			}
+			eventsBefore := len(publisher.Events())
+			got, err := directory.Renew(context.Background(), cmd)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("Renew err = %v, want %v", err, test.wantErr)
+			}
+			if directory.placements[placement.GrainKey] != beforePlacement {
+				t.Fatal("Renew changed placement")
+			}
+			afterNode, _ := directory.registry.Node(node.NodeIdentity)
+			if afterNode != beforeNode {
+				t.Fatal("Renew changed node lease")
+			}
+			if test.wantErr == nil {
+				if *got != beforePlacement || len(publisher.Events()) != eventsBefore+1 || publisher.Events()[eventsBefore].Type != sp.EventPlacementRenewed {
+					t.Fatalf("Renew result/events = %+v / %+v", got, publisher.Events()[eventsBefore:])
+				}
+			}
+		})
+	}
+}
+
+func TestDirectoryRenewReturnsAuditFailureWithoutStateChange(t *testing.T) {
+	directory, _, publisher := newTestDirectory(t)
+	node := registerTestNode(t, directory, "game-1", "session-a")
+	placement := allocateTestPlacement(t, directory, "10001", node)
+	beforePlacement := directory.placements[placement.GrainKey]
+	beforeNode, _ := directory.registry.Node(node.NodeIdentity)
+	wantErr := errors.New("audit failed")
+	publisher.err = wantErr
+	_, err := directory.Renew(context.Background(), sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version})
+	if !errors.Is(err, wantErr) || directory.placements[placement.GrainKey] != beforePlacement {
+		t.Fatalf("Renew err=%v placement=%+v", err, directory.placements[placement.GrainKey])
+	}
+	afterNode, _ := directory.registry.Node(node.NodeIdentity)
+	if afterNode != beforeNode {
+		t.Fatal("failed audit changed node")
+	}
+}
+
+func TestDirectoryReleaseOwnerRules(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mutate  func(*Directory, sp.Node, *fakeClock)
+		wantErr error
+	}{
+		{name: "active"},
+		{name: "offline", mutate: func(d *Directory, n sp.Node, _ *fakeClock) {
+			setNodeStatus(d.registry, n.NodeIdentity, sp.NodeStatusOffline)
+		}},
+		{name: "expired", mutate: func(d *Directory, n sp.Node, c *fakeClock) {
+			setNodeExpiry(d.registry, n.NodeIdentity, c.Now().UnixMilli())
+		}},
+		{name: "replaced session", mutate: func(d *Directory, n sp.Node, _ *fakeClock) { setNodeSession(d.registry, n.NodeIdentity, "new") }, wantErr: sp.ErrInvalidNodeSession},
+		{name: "missing", mutate: func(d *Directory, n sp.Node, _ *fakeClock) { deleteNode(d.registry, n.NodeIdentity) }, wantErr: sp.ErrPlacementOwnerUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory, clock, _ := newTestDirectory(t)
+			node := registerTestNode(t, directory, "game-1", "session-a")
+			placement := allocateTestPlacement(t, directory, "10001", node)
+			if test.mutate != nil {
+				test.mutate(directory, node, clock)
+			}
+			err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version})
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("Release err = %v, want %v", err, test.wantErr)
+			}
+			got := directory.placements[placement.GrainKey]
+			if test.wantErr == nil && (got.Status != sp.PlacementStatusReleased || got.Version != placement.Version+1 || len(directory.byNode[node.NodeIdentity]) != 0) {
+				t.Fatalf("released placement/index = %+v / %+v", got, directory.byNode)
+			}
+			if test.wantErr != nil && got != *placement {
+				t.Fatal("failed Release changed placement")
+			}
+		})
+	}
+}
+
+func TestDirectoryTransferAndRecoverUseHealthyTargetSession(t *testing.T) {
+	directory, clock, _ := newTestDirectory(t)
+	owner := registerTestNode(t, directory, "owner", "owner-session")
+	target := registerTestNode(t, directory, "target", "target-session")
+	badTarget := registerTestNode(t, directory, "bad", "bad-session")
+	setNodeExpiry(directory.registry, badTarget.NodeIdentity, clock.Now().UnixMilli())
+	placement := allocateTestPlacement(t, directory, "10001", owner)
+
+	if _, err := directory.Transfer(context.Background(), sp.TransferCommand{GrainKey: placement.GrainKey, ToNodeIdentity: badTarget.NodeIdentity, PlacementVersion: placement.Version}); !errors.Is(err, sp.ErrNoAvailableNode) {
+		t.Fatalf("Transfer unhealthy target err = %v", err)
+	}
+	transferred, err := directory.Transfer(context.Background(), sp.TransferCommand{GrainKey: placement.GrainKey, FromNodeIdentity: owner.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
 	if err != nil {
 		t.Fatalf("Transfer error: %v", err)
 	}
-	if transferred.NodeIdentity != node2.NodeIdentity {
-		t.Fatalf("transferred node = %q", transferred.NodeIdentity)
+	if transferred.NodeIdentity != target.NodeIdentity || transferred.OwnerNodeSessionID != target.NodeSessionID || transferred.Version != placement.Version+1 {
+		t.Fatalf("transferred = %+v", transferred)
 	}
-
-	_, err = dir.Renew(ctx, sp.RenewCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node1.NodeIdentity,
-		NodeSessionID:    node1.NodeSessionID,
-		PlacementVersion: transferred.Version,
-		LeaseVersion:     transferred.Lease.Version,
-		ExtendTTL:        time.Minute,
-	})
-	if !errors.Is(err, sp.ErrInvalidOwner) {
-		t.Fatalf("old owner renew err = %v, want ErrInvalidOwner", err)
+	if _, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: transferred.GrainKey, NewNodeIdentity: owner.NodeIdentity, PlacementVersion: transferred.Version}); !errors.Is(err, sp.ErrPlacementNotRecoverable) {
+		t.Fatalf("Recover healthy owner err = %v", err)
 	}
-
-	if err := dir.Release(ctx, sp.ReleaseCommand{
-		GrainKey:         transferred.GrainKey,
-		NodeIdentity:     node2.NodeIdentity,
-		NodeSessionID:    node2.NodeSessionID,
-		PlacementVersion: transferred.Version,
-		LeaseVersion:     transferred.Lease.Version,
-	}); err != nil {
-		t.Fatalf("Release error: %v", err)
-	}
-	if _, err := dir.Lookup(ctx, transferred.GrainKey); !errors.Is(err, sp.ErrPlacementNotFound) {
-		t.Fatalf("Lookup after release err = %v", err)
-	}
-
-	reallocated, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         "10001",
-		Kind:            "Player",
-		TargetNodeType:  "game",
-		TargetNodeGroup: "default",
-		LeaseTTL:        time.Minute,
-	})
+	setNodeSession(directory.registry, target.NodeIdentity, "replacement")
+	recovered, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: transferred.GrainKey, NewNodeIdentity: owner.NodeIdentity, PlacementVersion: transferred.Version})
 	if err != nil {
-		t.Fatalf("Allocate after release error: %v", err)
+		t.Fatalf("Recover unavailable owner error: %v", err)
 	}
-	if reallocated.Status != sp.PlacementStatusActive {
-		t.Fatalf("reallocated status = %s", reallocated.Status)
-	}
-}
-
-func TestDirectoryOldCommandCannotMutateReallocatedPlacement(t *testing.T) {
-	ctx := context.Background()
-	dir, _ := newTestDirectory(t)
-	registerTestNode(t, dir, "game-1", "session-a")
-
-	first, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         "10001",
-		Kind:            "Player",
-		TargetNodeType:  "game",
-		TargetNodeGroup: "default",
-		LeaseTTL:        time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("first Allocate error: %v", err)
-	}
-	if err := dir.Release(ctx, sp.ReleaseCommand{
-		GrainKey:         first.GrainKey,
-		NodeIdentity:     first.NodeIdentity,
-		NodeSessionID:    first.Lease.OwnerNodeSessionID,
-		PlacementVersion: first.Version,
-		LeaseVersion:     first.Lease.Version,
-	}); err != nil {
-		t.Fatalf("first Release error: %v", err)
-	}
-
-	second, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         first.GrainID,
-		Kind:            first.Kind,
-		TargetNodeType:  "game",
-		TargetNodeGroup: "default",
-		LeaseTTL:        time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("second Allocate error: %v", err)
-	}
-	if second.Version <= first.Version {
-		t.Fatalf("reallocated version = %d, first = %d", second.Version, first.Version)
-	}
-
-	_, err = dir.Renew(ctx, sp.RenewCommand{
-		GrainKey:         first.GrainKey,
-		NodeIdentity:     first.NodeIdentity,
-		NodeSessionID:    first.Lease.OwnerNodeSessionID,
-		PlacementVersion: first.Version,
-		LeaseVersion:     first.Lease.Version,
-		ExtendTTL:        time.Minute,
-	})
-	if !errors.Is(err, sp.ErrVersionConflict) {
-		t.Fatalf("old Renew err = %v", err)
-	}
-	err = dir.Release(ctx, sp.ReleaseCommand{
-		GrainKey:         first.GrainKey,
-		NodeIdentity:     first.NodeIdentity,
-		NodeSessionID:    first.Lease.OwnerNodeSessionID,
-		PlacementVersion: first.Version,
-		LeaseVersion:     first.Lease.Version,
-	})
-	if !errors.Is(err, sp.ErrVersionConflict) {
-		t.Fatalf("old Release err = %v", err)
-	}
-	active, err := dir.Lookup(ctx, second.GrainKey)
-	if err != nil {
-		t.Fatalf("Lookup second error: %v", err)
-	}
-	if active.Version != second.Version || active.Status != sp.PlacementStatusActive {
-		t.Fatalf("active placement = %+v, want second = %+v", active, second)
-	}
-}
-
-func TestDirectoryInvalidNodeGroupAndFindByNode(t *testing.T) {
-	ctx := context.Background()
-	dir, _ := newTestDirectory(t)
-	node1 := registerTestNode(t, dir, "game-1", "session-a")
-	node2 := registerTestNode(t, dir, "game-2", "session-b")
-
-	if err := dir.NodeRegistry().MarkNodeInvalid(ctx, "game", "default", "game-1"); err != nil {
-		t.Fatalf("MarkNodeInvalid error: %v", err)
-	}
-	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         "10001",
-		Kind:            "Player",
-		TargetNodeType:  "game",
-		TargetNodeGroup: "default",
-		LeaseTTL:        time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("Allocate error: %v", err)
-	}
-	if placement.NodeIdentity != node2.NodeIdentity {
-		t.Fatalf("allocated invalid node %q, want %q", placement.NodeIdentity, node2.NodeIdentity)
-	}
-
-	replacement := node1
-	replacement.NodeSessionID = "session-new"
-	if _, err := dir.NodeRegistry().ReplaceNodeSession(ctx, replacement); err != nil {
-		t.Fatalf("ReplaceNodeSession error: %v", err)
-	}
-	if nodes, err := dir.effectiveNodes(ctx, "game", "default"); err != nil || len(nodes) != 1 || nodes[0].NodeIdentity != node2.NodeIdentity {
-		t.Fatalf("effective nodes = %+v, err = %v", nodes, err)
-	}
-
-	page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: node2.NodeIdentity, Limit: 10})
-	if err != nil {
-		t.Fatalf("FindByNode error: %v", err)
-	}
-	if len(page.Placements) != 1 || page.Placements[0].GrainKey != placement.GrainKey {
-		t.Fatalf("FindByNode page = %+v", page)
-	}
-}
-
-func TestDirectoryRecoverAndFindByNodePagination(t *testing.T) {
-	ctx := context.Background()
-	dir, _ := newTestDirectory(t)
-	node1 := registerTestNode(t, dir, "game-1", "session-a")
-	node2 := registerTestNode(t, dir, "game-2", "session-b")
-
-	first, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         "10001",
-		Kind:            "Player",
-		TargetNodeType:  "game",
-		TargetNodeGroup: "default",
-		LeaseTTL:        time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("Allocate first error: %v", err)
-	}
-	recovered, err := dir.Recover(ctx, sp.RecoverCommand{
-		GrainKey:         first.GrainKey,
-		NewNodeIdentity:  node2.NodeIdentity,
-		PlacementVersion: first.Version,
-		LeaseTTL:         time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("Recover error: %v", err)
-	}
-	if recovered.NodeIdentity != node2.NodeIdentity || recovered.Version != first.Version+1 {
+	if recovered.NodeIdentity != owner.NodeIdentity || recovered.OwnerNodeSessionID != owner.NodeSessionID || recovered.Version != transferred.Version+1 {
 		t.Fatalf("recovered = %+v", recovered)
 	}
-	if err := dir.NodeRegistry().MarkNodeInvalid(ctx, "game", "default", "game-2"); err != nil {
-		t.Fatalf("MarkNodeInvalid game-2 error: %v", err)
-	}
+}
 
-	for _, id := range []string{"10002", "10003", "10004"} {
-		_, err := dir.Allocate(ctx, sp.AllocateCommand{
-			GrainID:         id,
-			Kind:            "Player",
-			TargetNodeType:  "game",
-			TargetNodeGroup: "default",
-			LeaseTTL:        time.Minute,
+func TestDirectoryRecoverAllowsEveryUnavailableOwnerKind(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Directory, sp.Node, *fakeClock)
+	}{
+		{name: "missing", mutate: func(d *Directory, n sp.Node, _ *fakeClock) { deleteNode(d.registry, n.NodeIdentity) }},
+		{name: "offline", mutate: func(d *Directory, n sp.Node, _ *fakeClock) {
+			setNodeStatus(d.registry, n.NodeIdentity, sp.NodeStatusOffline)
+		}},
+		{name: "expired", mutate: func(d *Directory, n sp.Node, c *fakeClock) {
+			setNodeExpiry(d.registry, n.NodeIdentity, c.Now().UnixMilli())
+		}},
+		{name: "session mismatch", mutate: func(d *Directory, n sp.Node, _ *fakeClock) { setNodeSession(d.registry, n.NodeIdentity, "new") }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory, clock, _ := newTestDirectory(t)
+			owner := registerTestNode(t, directory, "owner", "old")
+			target := registerTestNode(t, directory, "target", "target")
+			placement := allocateTestPlacement(t, directory, "10001", owner)
+			test.mutate(directory, owner, clock)
+			if _, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: placement.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version}); err != nil {
+				t.Fatalf("Recover error: %v", err)
+			}
 		})
-		if err != nil {
-			t.Fatalf("Allocate %s error: %v", id, err)
-		}
-	}
-
-	page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: node1.NodeIdentity, Limit: 1})
-	if err != nil {
-		t.Fatalf("FindByNode page1 error: %v", err)
-	}
-	if len(page.Placements) != 1 || page.NextCursor == "" {
-		t.Fatalf("page1 = %+v", page)
-	}
-	next, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: node1.NodeIdentity, Cursor: page.NextCursor, Limit: 10})
-	if err != nil {
-		t.Fatalf("FindByNode page2 error: %v", err)
-	}
-	if len(next.Placements) == 0 {
-		t.Fatalf("page2 = %+v", next)
 	}
 }
 
-func TestDirectoryExpireRemovesPlacementAndPublishesLeaseExpired(t *testing.T) {
-	ctx := context.Background()
-	dir, bus := newTestDirectory(t)
-	node := registerTestNode(t, dir, "game-1", "session-a")
-	var seen []sp.EventType
-	_ = bus.Subscribe(ctx, func(event sp.PlacementEvent) error {
-		seen = append(seen, event.Type)
-		return nil
-	})
-
-	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         "10001",
-		Kind:            "Player",
-		TargetNodeType:  "game",
-		TargetNodeGroup: "default",
-		LeaseTTL:        time.Nanosecond,
-	})
-	if err != nil {
-		t.Fatalf("Allocate error: %v", err)
+func TestDirectoryFindByNodeRejectsNegativeAndAllowsPastEndCursor(t *testing.T) {
+	directory, _, _ := newTestDirectory(t)
+	node := registerTestNode(t, directory, "game-1", "session-a")
+	allocateTestPlacement(t, directory, "10001", node)
+	if _, err := directory.FindByNode(context.Background(), sp.FindByNodeQuery{NodeIdentity: node.NodeIdentity, Cursor: "-1"}); err == nil {
+		t.Fatal("negative cursor succeeded")
 	}
-	if err := dir.Expire(ctx, sp.ExpireCommand{
-		GrainKey:     placement.GrainKey,
-		LeaseVersion: placement.Lease.Version,
-		Now:          time.Now().Add(time.Second),
-	}); err != nil {
-		t.Fatalf("Expire error: %v", err)
-	}
-	if _, err := dir.Lookup(ctx, placement.GrainKey); !errors.Is(err, sp.ErrPlacementNotFound) {
-		t.Fatalf("Lookup after expire err = %v", err)
-	}
-	page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: node.NodeIdentity, Limit: 10})
-	if err != nil {
-		t.Fatalf("FindByNode error: %v", err)
-	}
-	if len(page.Placements) != 0 {
-		t.Fatalf("FindByNode after expire = %+v", page)
-	}
-	if seen[len(seen)-1] != sp.EventLeaseExpired {
-		t.Fatalf("last event = %v", seen)
+	page, err := directory.FindByNode(context.Background(), sp.FindByNodeQuery{NodeIdentity: node.NodeIdentity, Cursor: "10"})
+	if err != nil || len(page.Placements) != 0 || page.NextCursor != "" {
+		t.Fatalf("past-end page = %+v, %v", page, err)
 	}
 }
 
-func TestDirectoryRecoverRejectsReleasedPlacement(t *testing.T) {
-	ctx := context.Background()
-	dir, _ := newTestDirectory(t)
-	node := registerTestNode(t, dir, "game-1", "session-a")
-	registerTestNode(t, dir, "game-2", "session-b")
-
-	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         "10001",
-		Kind:            "Player",
-		TargetNodeType:  "game",
-		TargetNodeGroup: "default",
-		LeaseTTL:        time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("Allocate error: %v", err)
+func TestDirectoryCompleteDrainRejectsNodeWithPlacements(t *testing.T) {
+	directory, _, _ := newTestDirectory(t)
+	node := registerTestNode(t, directory, "game-1", "session-a")
+	placement := allocateTestPlacement(t, directory, "10001", node)
+	if err := directory.registry.MarkNodeInvalid(context.Background(), node.NodeType, node.NodeGroup, node.NodeName); err != nil {
+		t.Fatal(err)
 	}
-	if err := dir.Release(ctx, sp.ReleaseCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node.NodeIdentity,
-		NodeSessionID:    node.NodeSessionID,
-		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
-	}); err != nil {
-		t.Fatalf("Release error: %v", err)
+	if err := directory.registry.DrainNode(context.Background(), node.NodeIdentity); err != nil {
+		t.Fatal(err)
 	}
-	_, err = dir.Recover(ctx, sp.RecoverCommand{
-		GrainKey:         placement.GrainKey,
-		NewNodeIdentity:  "game/default/game-2",
-		PlacementVersion: placement.Version + 1,
-		LeaseTTL:         time.Minute,
-	})
-	if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
-		t.Fatalf("Recover after release err = %v, want ErrPlacementNotRecoverable", err)
+	if err := directory.registry.CompleteDrain(context.Background(), node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeHasPlacements) {
+		t.Fatalf("CompleteDrain err = %v", err)
+	}
+	if err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version}); err != nil {
+		t.Fatal(err)
+	}
+	if err := directory.registry.CompleteDrain(context.Background(), node.NodeIdentity, node.NodeSessionID); err != nil {
+		t.Fatalf("CompleteDrain after release: %v", err)
 	}
 }
 
-func TestDirectoryRecoverAfterExpire(t *testing.T) {
-	ctx := context.Background()
-	dir, _ := newTestDirectory(t)
-	registerTestNode(t, dir, "game-1", "session-a")
-	node2 := registerTestNode(t, dir, "game-2", "session-b")
-
-	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         "10001",
-		Kind:            "Player",
-		TargetNodeType:  "game",
-		TargetNodeGroup: "default",
-		LeaseTTL:        time.Nanosecond,
-	})
+func TestDirectoryCompleteDrainPreventsConcurrentAllocateCommit(t *testing.T) {
+	clock := newFakeClock(time.Unix(2_000, 0))
+	registry := newTestRegistry(t, clock, nil, time.Minute)
+	strategy := blockingStrategy{started: make(chan struct{}), release: make(chan struct{})}
+	directory, err := NewDirectory(registry, sp.StrategyModeGo, strategy, nil)
 	if err != nil {
-		t.Fatalf("Allocate error: %v", err)
+		t.Fatal(err)
 	}
-	if err := dir.Expire(ctx, sp.ExpireCommand{
-		GrainKey:     placement.GrainKey,
-		LeaseVersion: placement.Lease.Version,
-		Now:          time.Now().Add(time.Second),
-	}); err != nil {
-		t.Fatalf("Expire error: %v", err)
+	node := registerTestNode(t, directory, "game-1", "session-a")
+	done := make(chan error, 1)
+	go func() {
+		_, err := directory.Allocate(context.Background(), sp.AllocateCommand{GrainID: "10001", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
+		done <- err
+	}()
+	<-strategy.started
+	if err := registry.MarkNodeInvalid(context.Background(), node.NodeType, node.NodeGroup, node.NodeName); err != nil {
+		t.Fatal(err)
 	}
-	recovered, err := dir.Recover(ctx, sp.RecoverCommand{
-		GrainKey:         placement.GrainKey,
-		NewNodeIdentity:  node2.NodeIdentity,
-		PlacementVersion: placement.Version + 1,
-		LeaseTTL:         time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("Recover after expire error: %v", err)
+	if err := registry.DrainNode(context.Background(), node.NodeIdentity); err != nil {
+		t.Fatal(err)
 	}
-	if recovered.Status != sp.PlacementStatusActive || recovered.NodeIdentity != node2.NodeIdentity {
-		t.Fatalf("recovered = %+v", recovered)
+	if err := registry.CompleteDrain(context.Background(), node.NodeIdentity, node.NodeSessionID); err != nil {
+		t.Fatal(err)
+	}
+	close(strategy.release)
+	if err := <-done; !errors.Is(err, sp.ErrNoAvailableNode) {
+		t.Fatalf("Allocate err = %v", err)
 	}
 }
 
-func TestDirectoryAllocateConcurrentSameGrain(t *testing.T) {
-	ctx := context.Background()
-	dir, bus := newTestDirectory(t)
-	registerTestNode(t, dir, "game-1", "session-a")
-
-	var created int
-	_ = bus.Subscribe(ctx, func(event sp.PlacementEvent) error {
-		if event.Type == sp.EventPlacementCreated {
-			created++
-		}
-		return nil
-	})
-
+func TestDirectoryConcurrentOperationsFollowDirectoryThenRegistryLockOrder(t *testing.T) {
+	directory, _, _ := newTestDirectory(t)
+	node := registerTestNode(t, directory, "game-1", "session-a")
+	placement := allocateTestPlacement(t, directory, "10001", node)
 	var wg sync.WaitGroup
-	errs := make(chan error, 2)
-	start := make(chan struct{})
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			<-start
-			_, err := dir.Allocate(ctx, sp.AllocateCommand{
-				GrainID:         "10001",
-				Kind:            "Player",
-				TargetNodeType:  "game",
-				TargetNodeGroup: "default",
-				LeaseTTL:        time.Minute,
-			})
-			errs <- err
+			_, _ = directory.Lookup(context.Background(), placement.GrainKey)
+		}()
+		go func() {
+			defer wg.Done()
+			_ = registryRenew(directory.registry, node)
 		}()
 	}
-	close(start)
 	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("Allocate error: %v", err)
-		}
-	}
-	key, _ := sp.NewGrainKey("Player", "10001")
-	if ok, err := dir.Exists(ctx, key); err != nil || !ok {
-		t.Fatalf("Exists after concurrent allocate = %v, err = %v", ok, err)
-	}
-	if created != 1 {
-		t.Fatalf("PlacementCreated events = %d, want 1", created)
-	}
+}
+
+func registryRenew(registry *NodeRegistry, node sp.Node) error {
+	return registry.RenewNode(context.Background(), node.NodeIdentity, node.NodeSessionID)
+}
+
+func setNodeStatus(registry *NodeRegistry, identity string, status sp.NodeStatus) {
+	registry.mu.Lock()
+	node := registry.nodes[identity]
+	node.Status = status
+	registry.nodes[identity] = node
+	registry.mu.Unlock()
+}
+
+func setNodeSession(registry *NodeRegistry, identity, session string) {
+	registry.mu.Lock()
+	node := registry.nodes[identity]
+	node.NodeSessionID = session
+	registry.nodes[identity] = node
+	registry.mu.Unlock()
+}
+
+func setNodeExpiry(registry *NodeRegistry, identity string, expiry int64) {
+	registry.mu.Lock()
+	node := registry.nodes[identity]
+	node.Lease.ExpireAtUnixMilli = expiry
+	registry.nodes[identity] = node
+	registry.mu.Unlock()
+}
+
+func deleteNode(registry *NodeRegistry, identity string) {
+	registry.mu.Lock()
+	delete(registry.nodes, identity)
+	registry.mu.Unlock()
 }

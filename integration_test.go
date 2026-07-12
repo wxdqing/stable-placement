@@ -16,7 +16,11 @@ import (
 func TestStablePlacementFirstPhaseFlow(t *testing.T) {
 	ctx := context.Background()
 	bus := memory.NewEventBus()
-	dir, err := memory.NewDirectory(memory.NewNodeRegistry(bus), sp.StrategyModeGo, strategies.NewRoundRobin(), bus)
+	registry, err := memory.NewNodeRegistry(bus, sp.DefaultNodeLeaseConfig())
+	if err != nil {
+		t.Fatalf("NewNodeRegistry error: %v", err)
+	}
+	dir, err := memory.NewDirectory(registry, sp.StrategyModeGo, strategies.NewRoundRobin(), bus)
 	if err != nil {
 		t.Fatalf("NewDirectory error: %v", err)
 	}
@@ -45,7 +49,6 @@ func TestStablePlacementFirstPhaseFlow(t *testing.T) {
 		Kind:            "Player",
 		TargetNodeType:  "game",
 		TargetNodeGroup: "default",
-		LeaseTTL:        time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("Allocate error: %v", err)
@@ -83,8 +86,12 @@ func TestRedisEventConsumerControlsCachedRouterHealth(t *testing.T) {
 		t.Fatalf("NewStreamConsumer error: %v", err)
 	}
 	eventBus := spredis.NewEventBus(client, consumer)
+	registry, err := memory.NewNodeRegistry(nil, sp.DefaultNodeLeaseConfig())
+	if err != nil {
+		t.Fatalf("NewNodeRegistry error: %v", err)
+	}
 	directory, err := memory.NewDirectory(
-		memory.NewNodeRegistry(nil),
+		registry,
 		sp.StrategyModeGo,
 		strategies.NewRoundRobin(),
 		nil,

@@ -3,245 +3,388 @@ package memory
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	sp "github.com/wxdqing/stable-placement"
 )
 
-type blockingStrategy struct {
-	started chan struct{}
-	release chan struct{}
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
 }
 
-func (s blockingStrategy) Choose(_ context.Context, input sp.StrategyInput) (sp.Node, error) {
-	close(s.started)
-	<-s.release
-	return input.EffectiveNodes[0], nil
+func newFakeClock(now time.Time) *fakeClock { return &fakeClock{now: now} }
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
 }
 
-func TestNodeRegistryInvalidGroupSurvivesSessionReplacement(t *testing.T) {
-	ctx := context.Background()
-	registry := NewNodeRegistry(NewEventBus())
-	node := sp.Node{
+func (c *fakeClock) Set(now time.Time) {
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+type recordingPublisher struct {
+	mu     sync.Mutex
+	events []sp.PlacementEvent
+	err    error
+}
+
+func (p *recordingPublisher) Publish(_ context.Context, event sp.PlacementEvent) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.events = append(p.events, event)
+	return p.err
+}
+
+func (p *recordingPublisher) Events() []sp.PlacementEvent {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]sp.PlacementEvent(nil), p.events...)
+}
+
+func newTestRegistry(t *testing.T, clock *fakeClock, publisher sp.EventPublisher, ttl time.Duration) *NodeRegistry {
+	t.Helper()
+	registry, err := newNodeRegistry(publisher, sp.NodeLeaseConfig{TTL: ttl}, clock.Now)
+	if err != nil {
+		t.Fatalf("newNodeRegistry error: %v", err)
+	}
+	return registry
+}
+
+func testNode(name, session string) sp.Node {
+	return sp.Node{
 		NodeType:      "game",
 		NodeGroup:     "default",
-		NodeName:      "game-1",
-		NodeIdentity:  "game/default/game-1",
-		NodeSessionID: "session-a",
+		NodeName:      name,
+		NodeIdentity:  "game/default/" + name,
+		NodeSessionID: session,
 		Status:        sp.NodeStatusActive,
 	}
+}
+
+func TestNodeRegistryLeaseConfig(t *testing.T) {
+	if sp.DefaultNodeLeaseConfig().TTL != time.Minute {
+		t.Fatalf("default TTL = %v, want 1m", sp.DefaultNodeLeaseConfig().TTL)
+	}
+	for _, test := range []struct {
+		name    string
+		config  sp.NodeLeaseConfig
+		wantErr error
+	}{
+		{name: "default", config: sp.DefaultNodeLeaseConfig()},
+		{name: "positive", config: sp.NodeLeaseConfig{TTL: time.Second}},
+		{name: "zero", config: sp.NodeLeaseConfig{}, wantErr: sp.ErrInvalidNodeLeaseTTL},
+		{name: "negative", config: sp.NodeLeaseConfig{TTL: -time.Second}, wantErr: sp.ErrInvalidNodeLeaseTTL},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry, err := NewNodeRegistry(nil, test.config)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("NewNodeRegistry err = %v, want %v", err, test.wantErr)
+			}
+			if test.wantErr == nil && registry == nil {
+				t.Fatal("NewNodeRegistry returned nil registry")
+			}
+		})
+	}
+}
+
+func TestNodeRegistryRegisterLeaseRules(t *testing.T) {
+	ctx := context.Background()
+	start := time.Unix(100, 0)
+	clock := newFakeClock(start)
+	publisher := &recordingPublisher{}
+	registry := newTestRegistry(t, clock, publisher, 10*time.Second)
+	node := testNode("game-1", "session-a")
+	node.Status = sp.NodeStatusDraining
+
 	if err := registry.RegisterNode(ctx, node); err != nil {
 		t.Fatalf("RegisterNode error: %v", err)
 	}
-	if err := registry.MarkNodeInvalid(ctx, "game", "default", "game-1"); err != nil {
-		t.Fatalf("MarkNodeInvalid error: %v", err)
+	got, ok := registry.Node(node.NodeIdentity)
+	if !ok || got.Status != sp.NodeStatusActive || got.Lease.Version != 1 || got.Lease.TTLMillis != 10_000 || got.Lease.ExpireAtUnixMilli != start.Add(10*time.Second).UnixMilli() {
+		t.Fatalf("registered node = %+v, ok=%v", got, ok)
 	}
-	node.NodeSessionID = "session-b"
-	if _, err := registry.ReplaceNodeSession(ctx, node); err != nil {
+
+	clock.Advance(time.Second)
+	if err := registry.RegisterNode(ctx, node); err != nil {
+		t.Fatalf("idempotent RegisterNode error: %v", err)
+	}
+	idempotent, _ := registry.Node(node.NodeIdentity)
+	if idempotent.Lease != got.Lease || len(publisher.Events()) != 1 {
+		t.Fatalf("idempotent register changed lease/events: lease=%+v events=%d", idempotent.Lease, len(publisher.Events()))
+	}
+
+	otherSession := node
+	otherSession.NodeSessionID = "session-b"
+	if err := registry.RegisterNode(ctx, otherSession); !errors.Is(err, sp.ErrInvalidNodeSession) {
+		t.Fatalf("different-session RegisterNode err = %v", err)
+	}
+
+	registry.mu.Lock()
+	offline := registry.nodes[node.NodeIdentity]
+	offline.Status = sp.NodeStatusOffline
+	registry.nodes[node.NodeIdentity] = offline
+	registry.mu.Unlock()
+	if err := registry.RegisterNode(ctx, node); !errors.Is(err, sp.ErrNodeLeaseExpired) {
+		t.Fatalf("offline RegisterNode err = %v", err)
+	}
+
+	registry.mu.Lock()
+	expired := registry.nodes[node.NodeIdentity]
+	expired.Status = sp.NodeStatusActive
+	expired.Lease.ExpireAtUnixMilli = clock.Now().UnixMilli()
+	registry.nodes[node.NodeIdentity] = expired
+	registry.mu.Unlock()
+	if err := registry.RegisterNode(ctx, node); !errors.Is(err, sp.ErrNodeLeaseExpired) {
+		t.Fatalf("expired RegisterNode err = %v", err)
+	}
+}
+
+func TestNodeRegistryRegisterIdentityValidationHasNoSideEffects(t *testing.T) {
+	clock := newFakeClock(time.Unix(100, 0))
+	publisher := &recordingPublisher{}
+	registry := newTestRegistry(t, clock, publisher, time.Second)
+	for _, node := range []sp.Node{
+		{NodeGroup: "default", NodeName: "game-1", NodeIdentity: "game/default/game-1", NodeSessionID: "s"},
+		{NodeType: "game", NodeGroup: "default", NodeName: "game-1", NodeSessionID: "s"},
+		{NodeType: "game", NodeGroup: "default", NodeName: "game-1", NodeIdentity: "wrong", NodeSessionID: "s"},
+	} {
+		if err := registry.RegisterNode(context.Background(), node); err == nil {
+			t.Fatalf("RegisterNode(%+v) succeeded", node)
+		}
+	}
+	if len(registry.nodes) != 0 || len(publisher.Events()) != 0 {
+		t.Fatalf("invalid registrations changed state/events: nodes=%d events=%d", len(registry.nodes), len(publisher.Events()))
+	}
+}
+
+func TestNodeRegistryRenewLeaseRules(t *testing.T) {
+	ctx := context.Background()
+	start := time.Unix(200, 0)
+	clock := newFakeClock(start)
+	registry := newTestRegistry(t, clock, nil, 10*time.Second)
+	node := testNode("game-1", "session-a")
+	if err := registry.RegisterNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+
+	clock.Advance(2 * time.Second)
+	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+		t.Fatalf("active RenewNode error: %v", err)
+	}
+	renewed, _ := registry.Node(node.NodeIdentity)
+	if renewed.Lease.Version != 2 || renewed.Lease.ExpireAtUnixMilli != clock.Now().Add(10*time.Second).UnixMilli() {
+		t.Fatalf("renewed lease = %+v", renewed.Lease)
+	}
+
+	registry.mu.Lock()
+	draining := registry.nodes[node.NodeIdentity]
+	draining.Status = sp.NodeStatusDraining
+	draining.Lease.TTLMillis = 20_000
+	registry.nodes[node.NodeIdentity] = draining
+	registry.mu.Unlock()
+	clock.Advance(time.Second)
+	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+		t.Fatalf("draining RenewNode error: %v", err)
+	}
+	renewed, _ = registry.Node(node.NodeIdentity)
+	if renewed.Lease.Version != 3 || renewed.Lease.ExpireAtUnixMilli != clock.Now().Add(20*time.Second).UnixMilli() {
+		t.Fatalf("draining renewed lease = %+v", renewed.Lease)
+	}
+
+	if err := registry.RenewNode(ctx, node.NodeIdentity, "old-session"); !errors.Is(err, sp.ErrInvalidNodeSession) {
+		t.Fatalf("old session err = %v", err)
+	}
+	registry.mu.Lock()
+	offline := registry.nodes[node.NodeIdentity]
+	offline.Status = sp.NodeStatusOffline
+	registry.nodes[node.NodeIdentity] = offline
+	registry.mu.Unlock()
+	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
+		t.Fatalf("offline err = %v", err)
+	}
+	registry.mu.Lock()
+	expired := registry.nodes[node.NodeIdentity]
+	expired.Status = sp.NodeStatusActive
+	expired.Lease.ExpireAtUnixMilli = clock.Now().UnixMilli()
+	registry.nodes[node.NodeIdentity] = expired
+	registry.mu.Unlock()
+	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeLeaseExpired) {
+		t.Fatalf("expired err = %v", err)
+	}
+}
+
+func TestNodeRegistryConcurrentRenewDoesNotMoveExpiryBackward(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeClock(time.Unix(300, 0))
+	registry := newTestRegistry(t, clock, nil, time.Minute)
+	node := testNode("game-1", "session-a")
+	if err := registry.RegisterNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	clock.Set(time.Unix(350, 0))
+	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+		t.Fatal(err)
+	}
+	wantExpiry, _ := registry.Node(node.NodeIdentity)
+	clock.Set(time.Unix(340, 0))
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+				t.Errorf("RenewNode error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	got, _ := registry.Node(node.NodeIdentity)
+	if got.Lease.ExpireAtUnixMilli < wantExpiry.Lease.ExpireAtUnixMilli {
+		t.Fatalf("expiry moved backward: got %d want >= %d", got.Lease.ExpireAtUnixMilli, wantExpiry.Lease.ExpireAtUnixMilli)
+	}
+}
+
+func TestNodeRegistryReplaceSessionRules(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeClock(time.Unix(500, 0))
+	publisher := &recordingPublisher{}
+	registry := newTestRegistry(t, clock, publisher, 15*time.Second)
+	oldNode := testNode("game-1", "session-a")
+	oldNode.Address = "old"
+	if err := registry.RegisterNode(ctx, oldNode); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.MarkNodeInvalid(ctx, oldNode.NodeType, oldNode.NodeGroup, oldNode.NodeName); err != nil {
+		t.Fatal(err)
+	}
+	eventsBefore := len(publisher.Events())
+
+	same := oldNode
+	same.Address = "changed"
+	if _, err := registry.ReplaceNodeSession(ctx, same); !errors.Is(err, sp.ErrInvalidNodeSession) {
+		t.Fatalf("same-session ReplaceNodeSession err = %v", err)
+	}
+	unchanged, _ := registry.Node(oldNode.NodeIdentity)
+	if unchanged.Address != "old" || len(publisher.Events()) != eventsBefore {
+		t.Fatalf("same-session replacement changed state/events: node=%+v events=%d", unchanged, len(publisher.Events()))
+	}
+
+	bad := oldNode
+	bad.NodeSessionID = "session-b"
+	bad.NodeIdentity = "wrong"
+	if _, err := registry.ReplaceNodeSession(ctx, bad); err == nil {
+		t.Fatal("identity-mismatch ReplaceNodeSession succeeded")
+	}
+	unchanged, _ = registry.Node(oldNode.NodeIdentity)
+	if unchanged.NodeSessionID != oldNode.NodeSessionID || len(publisher.Events()) != eventsBefore {
+		t.Fatal("identity-mismatch replacement changed state/events")
+	}
+
+	clock.Advance(time.Second)
+	replacement := oldNode
+	replacement.NodeSessionID = "session-b"
+	replacement.Status = sp.NodeStatusDraining
+	returnedOld, err := registry.ReplaceNodeSession(ctx, replacement)
+	if err != nil {
 		t.Fatalf("ReplaceNodeSession error: %v", err)
 	}
-	if !registry.IsInvalid("game", "default", "game-1") {
-		t.Fatal("invalid node group did not survive session replacement")
+	got, _ := registry.Node(oldNode.NodeIdentity)
+	if returnedOld.NodeSessionID != "session-a" || got.NodeSessionID != "session-b" || got.Status != sp.NodeStatusActive || got.Lease.Version != 1 || got.Lease.TTLMillis != 15_000 || got.Lease.ExpireAtUnixMilli != clock.Now().Add(15*time.Second).UnixMilli() {
+		t.Fatalf("old=%+v replacement=%+v", returnedOld, got)
 	}
-	if err := registry.RenewNode(ctx, node.NodeIdentity, "session-a"); !errors.Is(err, sp.ErrInvalidNodeSession) {
-		t.Fatalf("old session renew err = %v, want ErrInvalidNodeSession", err)
+	if !registry.IsInvalid(oldNode.NodeType, oldNode.NodeGroup, oldNode.NodeName) {
+		t.Fatal("invalid group did not survive replacement")
+	}
+	events := publisher.Events()
+	if len(events) != eventsBefore+1 || events[len(events)-1].Type != sp.EventNodeReplaced {
+		t.Fatalf("replacement events = %+v", events)
 	}
 }
 
-func TestNodeRegistryRenewNodeRejectsOfflineNode(t *testing.T) {
+func TestNodeRegistryExpireLeasesIsBoundedAndIdempotent(t *testing.T) {
 	ctx := context.Background()
-	registry := NewNodeRegistry(NewEventBus())
-	registry.SetHeartbeatTTL(time.Nanosecond)
-	node := sp.Node{
-		NodeType:      "game",
-		NodeGroup:     "default",
-		NodeName:      "game-1",
-		NodeIdentity:  "game/default/game-1",
-		NodeSessionID: "session-a",
-		Status:        sp.NodeStatusActive,
+	clock := newFakeClock(time.Unix(600, 0))
+	publisher := &recordingPublisher{}
+	registry := newTestRegistry(t, clock, publisher, time.Second)
+	for i, name := range []string{"game-1", "game-2", "game-3"} {
+		node := testNode(name, "session-a")
+		if err := registry.RegisterNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+		if i == 1 {
+			registry.mu.Lock()
+			n := registry.nodes[node.NodeIdentity]
+			n.Status = sp.NodeStatusDraining
+			registry.nodes[node.NodeIdentity] = n
+			registry.mu.Unlock()
+		}
 	}
+	registeredEvents := len(publisher.Events())
+	clock.Advance(time.Second)
+
+	expired, err := registry.ExpireNodeLeases(ctx, "game", "default", 2)
+	if err != nil || expired != 2 {
+		t.Fatalf("first ExpireNodeLeases = %d, %v", expired, err)
+	}
+	offline := 0
+	for _, node := range registry.nodes {
+		if node.Status == sp.NodeStatusOffline {
+			offline++
+		}
+	}
+	if offline != 2 || len(registry.nodes) != 3 {
+		t.Fatalf("offline=%d tombstones=%d", offline, len(registry.nodes))
+	}
+	expired, err = registry.ExpireNodeLeases(ctx, "game", "default", 10)
+	if err != nil || expired != 1 {
+		t.Fatalf("second ExpireNodeLeases = %d, %v", expired, err)
+	}
+	expired, err = registry.ExpireNodeLeases(ctx, "game", "default", 10)
+	if err != nil || expired != 0 {
+		t.Fatalf("idempotent ExpireNodeLeases = %d, %v", expired, err)
+	}
+	events := publisher.Events()[registeredEvents:]
+	if len(events) != 3 {
+		t.Fatalf("expiry event count = %d, want 3", len(events))
+	}
+	for _, event := range events {
+		if event.Type != sp.EventNodeLeaseExpired || event.NodeSessionID != "session-a" || event.NodeLeaseVersion != 1 {
+			t.Fatalf("expiry event = %+v", event)
+		}
+	}
+}
+
+func TestNodeRegistryRenewedLeaseIsNotExpiredByOldDeadline(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeClock(time.Unix(700, 0))
+	registry := newTestRegistry(t, clock, nil, 10*time.Second)
+	node := testNode("game-1", "session-a")
 	if err := registry.RegisterNode(ctx, node); err != nil {
-		t.Fatalf("RegisterNode error: %v", err)
-	}
-	if err := registry.ExpireHeartbeats(ctx, time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("ExpireHeartbeats error: %v", err)
-	}
-
-	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
-		t.Fatalf("RenewNode offline err = %v, want ErrNodeNotFound", err)
-	}
-}
-
-func TestNodeRegistryPublishesMarkAndRestoreEvents(t *testing.T) {
-	ctx := context.Background()
-	bus := NewEventBus()
-	registry := NewNodeRegistry(bus)
-	var seen []sp.EventType
-	_ = bus.Subscribe(ctx, func(event sp.PlacementEvent) error {
-		seen = append(seen, event.Type)
-		return nil
-	})
-
-	if err := registry.MarkNodeInvalid(ctx, "game", "default", "game-1"); err != nil {
-		t.Fatalf("MarkNodeInvalid error: %v", err)
-	}
-	if err := registry.RestoreNode(ctx, "game", "default", "game-1"); err != nil {
-		t.Fatalf("RestoreNode error: %v", err)
-	}
-
-	if len(seen) != 2 || seen[0] != sp.EventNodeMarkedInvalid || seen[1] != sp.EventNodeRestored {
-		t.Fatalf("events = %+v", seen)
-	}
-}
-
-func TestNodeRegistryDrainRequiresInvalidNodeAndHeartbeatTimeout(t *testing.T) {
-	ctx := context.Background()
-	bus := NewEventBus()
-	registry := NewNodeRegistry(bus)
-	node := sp.Node{
-		NodeType:      "game",
-		NodeGroup:     "default",
-		NodeName:      "game-1",
-		NodeIdentity:  "game/default/game-1",
-		NodeSessionID: "session-a",
-		Status:        sp.NodeStatusActive,
-	}
-	if err := registry.RegisterNode(ctx, node); err != nil {
-		t.Fatalf("RegisterNode error: %v", err)
-	}
-	if err := registry.DrainNode(ctx, node.NodeIdentity); !errors.Is(err, sp.ErrNodeNotInvalid) {
-		t.Fatalf("DrainNode before invalid err = %v, want ErrNodeNotInvalid", err)
-	}
-	if err := registry.MarkNodeInvalid(ctx, "game", "default", "game-1"); err != nil {
-		t.Fatalf("MarkNodeInvalid error: %v", err)
-	}
-	if err := registry.DrainNode(ctx, node.NodeIdentity); err != nil {
-		t.Fatalf("DrainNode error: %v", err)
-	}
-	draining, ok := registry.Node(node.NodeIdentity)
-	if !ok || draining.Status != sp.NodeStatusDraining {
-		t.Fatalf("node after drain = %+v, ok=%v", draining, ok)
-	}
-
-	registry.SetHeartbeatTTL(time.Nanosecond)
-	time.Sleep(time.Millisecond)
-	if err := registry.ExpireHeartbeats(ctx, time.Now()); err != nil {
-		t.Fatalf("ExpireHeartbeats error: %v", err)
-	}
-	offline, ok := registry.Node(node.NodeIdentity)
-	if !ok || offline.Status != sp.NodeStatusOffline {
-		t.Fatalf("node after heartbeat timeout = %+v, ok=%v", offline, ok)
-	}
-}
-
-func TestCompleteDrainRejectsNodeWithPlacements(t *testing.T) {
-	ctx := context.Background()
-	dir, _ := newTestDirectory(t)
-	node := registerTestNode(t, dir, "game-1", "session-a")
-	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         "10001",
-		Kind:            "Player",
-		TargetNodeType:  node.NodeType,
-		TargetNodeGroup: node.NodeGroup,
-		LeaseTTL:        time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("Allocate error: %v", err)
-	}
-	if err := dir.NodeRegistry().MarkNodeInvalid(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
-		t.Fatalf("MarkNodeInvalid error: %v", err)
-	}
-	if err := dir.NodeRegistry().DrainNode(ctx, node.NodeIdentity); err != nil {
-		t.Fatalf("DrainNode error: %v", err)
-	}
-
-	if err := dir.NodeRegistry().CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeHasPlacements) {
-		t.Fatalf("CompleteDrain with placement err = %v, want ErrNodeHasPlacements", err)
-	}
-	if err := dir.Release(ctx, sp.ReleaseCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node.NodeIdentity,
-		NodeSessionID:    node.NodeSessionID,
-		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
-	}); err != nil {
-		t.Fatalf("Release error: %v", err)
-	}
-	if err := dir.NodeRegistry().CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
-		t.Fatalf("CompleteDrain after release error: %v", err)
-	}
-}
-
-func TestCompleteDrainPreventsConcurrentAllocateCommit(t *testing.T) {
-	ctx := context.Background()
-	bus := NewEventBus()
-	strategy := blockingStrategy{
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	dir, err := NewDirectory(NewNodeRegistry(bus), sp.StrategyModeGo, strategy, bus)
-	if err != nil {
 		t.Fatal(err)
 	}
-	node := registerTestNode(t, dir, "game-1", "session-a")
-	allocateDone := make(chan error, 1)
-	go func() {
-		_, err := dir.Allocate(ctx, sp.AllocateCommand{
-			GrainID:         "10001",
-			Kind:            "Player",
-			TargetNodeType:  node.NodeType,
-			TargetNodeGroup: node.NodeGroup,
-			LeaseTTL:        time.Minute,
-		})
-		allocateDone <- err
-	}()
-	<-strategy.started
-
-	if err := dir.NodeRegistry().MarkNodeInvalid(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
-		t.Fatalf("MarkNodeInvalid error: %v", err)
-	}
-	if err := dir.NodeRegistry().DrainNode(ctx, node.NodeIdentity); err != nil {
-		t.Fatalf("DrainNode error: %v", err)
-	}
-	if err := dir.NodeRegistry().CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
-		t.Fatalf("CompleteDrain error: %v", err)
-	}
-	close(strategy.release)
-
-	if err := <-allocateDone; !errors.Is(err, sp.ErrNoAvailableNode) {
-		t.Fatalf("concurrent Allocate err = %v, want ErrNoAvailableNode", err)
-	}
-	key, err := sp.NewGrainKey("Player", "10001")
-	if err != nil {
+	clock.Advance(9 * time.Second)
+	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dir.Lookup(ctx, key); !errors.Is(err, sp.ErrPlacementNotFound) {
-		t.Fatalf("Lookup after rejected Allocate err = %v, want ErrPlacementNotFound", err)
+	clock.Advance(time.Second)
+	if count, err := registry.ExpireNodeLeases(ctx, "game", "default", 10); err != nil || count != 0 {
+		t.Fatalf("ExpireNodeLeases after renewal = %d, %v", count, err)
 	}
-}
-
-func TestCompleteDrainValidatesSessionBeforePlacements(t *testing.T) {
-	ctx := context.Background()
-	dir, _ := newTestDirectory(t)
-	node := registerTestNode(t, dir, "game-1", "session-a")
-	if _, err := dir.Allocate(ctx, sp.AllocateCommand{
-		GrainID:         "10001",
-		Kind:            "Player",
-		TargetNodeType:  node.NodeType,
-		TargetNodeGroup: node.NodeGroup,
-		LeaseTTL:        time.Minute,
-	}); err != nil {
-		t.Fatalf("Allocate error: %v", err)
-	}
-
-	if err := dir.NodeRegistry().CompleteDrain(ctx, node.NodeIdentity, "wrong-session"); !errors.Is(err, sp.ErrInvalidNodeSession) {
-		t.Fatalf("CompleteDrain wrong session err = %v, want ErrInvalidNodeSession", err)
-	}
-	if err := dir.NodeRegistry().UnregisterNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
-		t.Fatalf("UnregisterNode error: %v", err)
-	}
-	if err := dir.NodeRegistry().CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
-		t.Fatalf("CompleteDrain missing node err = %v, want ErrNodeNotFound", err)
+	got, _ := registry.Node(node.NodeIdentity)
+	if got.Status != sp.NodeStatusActive {
+		t.Fatalf("renewed node status = %s", got.Status)
 	}
 }

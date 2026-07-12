@@ -10,7 +10,11 @@ import (
 
 func TestNewDirectoryRejectsRedisStrategyMode(t *testing.T) {
 	bus := NewEventBus()
-	_, err := NewDirectory(NewNodeRegistry(bus), sp.StrategyModeRedisRoundRobin, strategies.NewRoundRobin(), bus)
+	registry, err := NewNodeRegistry(bus, sp.DefaultNodeLeaseConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewDirectory(registry, sp.StrategyModeRedisRoundRobin, strategies.NewRoundRobin(), bus)
 	if err == nil {
 		t.Fatal("NewDirectory accepted redis strategy mode")
 	}

@@ -26,7 +26,7 @@ func (r *CachedRouter) Lookup(ctx context.Context, key sp.GrainKey) (*sp.Placeme
 	r.mu.Lock()
 	epoch := r.epoch
 	if route, ok := r.cache.GetCachedPlacement(key); ok {
-		if route.Status == sp.PlacementStatusActive && time.Now().Before(route.LeaseExpireAt) {
+		if route.Status == sp.PlacementStatusActive && time.Now().Before(route.ValidUntil) {
 			r.mu.Unlock()
 			return route, nil
 		}
@@ -34,17 +34,19 @@ func (r *CachedRouter) Lookup(ctx context.Context, key sp.GrainKey) (*sp.Placeme
 	}
 	r.mu.Unlock()
 
-	placement, err := r.directory.Lookup(ctx, key)
+	route, err := r.directory.Lookup(ctx, key)
 	if err != nil {
 		return nil, err
 	}
-	route := placementRoute(*placement)
+	if route.Status != sp.PlacementStatusActive || !time.Now().Before(route.ValidUntil) {
+		return nil, sp.ErrPlacementNotFound
+	}
 	r.mu.Lock()
 	if r.epoch == epoch {
-		r.cache.SetCachedPlacement(key, route)
+		r.cache.SetCachedPlacement(key, *route)
 	}
 	r.mu.Unlock()
-	return &route, nil
+	return route, nil
 }
 
 func (r *CachedRouter) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.Placement, error) {
@@ -55,9 +57,13 @@ func (r *CachedRouter) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*s
 	if err != nil {
 		return nil, err
 	}
+	route, lookupErr := r.directory.Lookup(ctx, placement.GrainKey)
+	if lookupErr != nil || route.Status != sp.PlacementStatusActive || !time.Now().Before(route.ValidUntil) {
+		return placement, nil
+	}
 	r.mu.Lock()
 	if r.epoch == epoch || r.matchesSynchronousCreatedLocked(epoch, *placement) {
-		r.cache.SetCachedPlacement(placement.GrainKey, placementRoute(*placement))
+		r.cache.SetCachedPlacement(placement.GrainKey, *route)
 	}
 	r.mu.Unlock()
 	return placement, nil
@@ -69,11 +75,9 @@ func (r *CachedRouter) HandleEvent(event sp.PlacementEvent) error {
 
 	switch event.Type {
 	case sp.EventPlacementCreated,
-		sp.EventPlacementRenewed,
 		sp.EventPlacementReleased,
 		sp.EventPlacementTransferred,
 		sp.EventPlacementRecovered,
-		sp.EventLeaseExpired,
 		sp.EventPlacementCacheInvalidated:
 		r.advanceEventLocked(event)
 		if event.GrainKey == "" {
@@ -82,6 +86,7 @@ func (r *CachedRouter) HandleEvent(event sp.PlacementEvent) error {
 		}
 		r.cache.DeleteCachedPlacement(event.GrainKey)
 	case sp.EventNodeReplaced,
+		sp.EventNodeLeaseExpired,
 		sp.EventNodeDraining,
 		sp.EventNodeMarkedInvalid,
 		sp.EventNodeUnregistered:
@@ -100,6 +105,8 @@ func (r *CachedRouter) HandleEvent(event sp.PlacementEvent) error {
 		r.cache.DeleteCachedPlacementsByGroup(event.NodeType, event.NodeGroup)
 	case sp.EventNodeRegistered:
 		// A newly registered node cannot invalidate an existing placement route.
+	case sp.EventPlacementRenewed:
+		// Renew is an audit event and does not change route authorization.
 	case sp.EventManualCacheClear:
 		r.advanceEventLocked(event)
 		r.cache.ClearPlacementCache()
@@ -144,14 +151,4 @@ func (r *CachedRouter) matchesSynchronousCreatedLocked(epoch uint64, placement s
 		r.lastEvent.GrainKey == placement.GrainKey &&
 		r.lastEvent.PlacementVersion > 0 &&
 		r.lastEvent.PlacementVersion == placement.Version
-}
-
-func placementRoute(placement sp.Placement) sp.PlacementRoute {
-	return sp.PlacementRoute{
-		GrainKey:      placement.GrainKey,
-		NodeIdentity:  placement.NodeIdentity,
-		Version:       placement.Version,
-		Status:        placement.Status,
-		LeaseExpireAt: placement.LeaseExpireAt,
-	}
 }
