@@ -2,6 +2,7 @@ package protoactor
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -118,6 +119,78 @@ func TestResolverRemoveClearsActivatorPIDWithoutReleasingPlacement(t *testing.T)
 	if _, ok := resolver.cache["player/acct-1"]; ok {
 		t.Fatal("resolver cache retained stopped PID")
 	}
+}
+
+func TestResolverFenceClearsCacheAndRejectsFutureResolution(t *testing.T) {
+	resolver := NewResolver(&resolverDirectory{}, map[string]sp.KindRouteConfig{
+		"player": {NodeType: "game", NodeGroupPrefix: "server-", GroupIDLabel: "server_id"},
+	}, &recordingActivator{pid: actor.NewPID("local", "player")})
+	resolver.cache["player/acct-1"] = PIDRoute{PID: actor.NewPID("local", "player")}
+
+	resolver.Fence()
+
+	if len(resolver.cache) != 0 {
+		t.Fatal("Fence retained PID route cache")
+	}
+	_, err := resolver.ResolvePID(context.Background(), &cluster.PlacementContext{
+		Labels: map[string]string{"server_id": "1"},
+	}, cluster.NewClusterIdentity("acct-1", "player"))
+	if !errors.Is(err, sp.ErrInvalidNodeSession) {
+		t.Fatalf("ResolvePID after Fence error = %v", err)
+	}
+}
+
+func TestResolverFenceWaitsForInFlightResolutionThenClearsItsRoute(t *testing.T) {
+	now := time.Now()
+	directory := &blockingResolverDirectory{
+		entered: make(chan struct{}), release: make(chan struct{}),
+		route: sp.PlacementRoute{
+			GrainKey: "player/acct-1", NodeIdentity: "game/server-1/game-1", OwnerNodeSessionID: "session-1",
+			Version: 1, ValidUntil: now.Add(time.Minute),
+		},
+	}
+	resolver := NewResolver(directory, map[string]sp.KindRouteConfig{
+		"player": {NodeType: "game", NodeGroupPrefix: "server-", GroupIDLabel: "server_id"},
+	}, &recordingActivator{pid: actor.NewPID("local", "player")})
+	resolved := make(chan error, 1)
+	go func() {
+		_, err := resolver.ResolvePID(context.Background(), &cluster.PlacementContext{Labels: map[string]string{"server_id": "1"}}, cluster.NewClusterIdentity("acct-1", "player"))
+		resolved <- err
+	}()
+	<-directory.entered
+	fenced := make(chan struct{})
+	go func() { resolver.Fence(); close(fenced) }()
+	select {
+	case <-fenced:
+		t.Fatal("Fence completed while a resolution was in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(directory.release)
+	if err := <-resolved; err != nil {
+		t.Fatal(err)
+	}
+	<-fenced
+	if len(resolver.cache) != 0 {
+		t.Fatal("Fence retained route created by in-flight resolution")
+	}
+}
+
+type blockingResolverDirectory struct {
+	entered chan struct{}
+	release chan struct{}
+	route   sp.PlacementRoute
+}
+
+func (d *blockingResolverDirectory) ResolveRoute(context.Context, sp.ResolveRouteCommand) (*sp.PlacementRoute, error) {
+	close(d.entered)
+	<-d.release
+	route := d.route
+	return &route, nil
+}
+
+func (d *blockingResolverDirectory) Lookup(context.Context, sp.GrainKey) (*sp.PlacementRoute, error) {
+	route := d.route
+	return &route, nil
 }
 
 type removableActivator struct {

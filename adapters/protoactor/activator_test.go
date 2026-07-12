@@ -2,6 +2,7 @@ package protoactor
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +11,31 @@ import (
 	"github.com/asynkron/protoactor-go/service/cluster"
 	sp "github.com/wxdqing/stable-placement"
 )
+
+func TestSerialActivatorFenceStopsActivePIDsAndRejectsActivation(t *testing.T) {
+	activator := NewSerialActivator(&resolverDirectory{}, "game/server-1/game-1", "session-1", "local", func(context.Context, *cluster.ClusterIdentity) (*actor.PID, error) {
+		return actor.NewPID("local", "unused"), nil
+	})
+	first := actor.NewPID("local", "player-1")
+	second := actor.NewPID("local", "player-2")
+	activator.active["player/acct-1"] = PIDRoute{PID: first}
+	activator.active["player/acct-2"] = PIDRoute{PID: second}
+	var stopped []*actor.PID
+
+	err := activator.Fence(context.Background(), func(_ context.Context, pid *actor.PID) error {
+		stopped = append(stopped, pid)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stopped) != 2 || len(activator.active) != 0 {
+		t.Fatalf("stopped=%v active=%v", stopped, activator.active)
+	}
+	if _, err := activator.Activate(context.Background(), cluster.NewClusterIdentity("acct-3", "player"), sp.PlacementRoute{}); !errors.Is(err, sp.ErrInvalidNodeSession) {
+		t.Fatalf("Activate after Fence error = %v", err)
+	}
+}
 
 func TestSerialActivatorCreatesOnePIDForConcurrentRequests(t *testing.T) {
 	lookup := &resolverDirectory{route: sp.PlacementRoute{GrainKey: "player/acct-1", NodeIdentity: "game/server-1/game-1", OwnerNodeSessionID: "s", Version: 1, Status: sp.PlacementStatusActive, ValidUntil: time.Now().Add(time.Minute)}}

@@ -2,6 +2,7 @@ package protoactor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ type SerialActivator struct {
 	spawn                       SpawnFunc
 	mu                          sync.Mutex
 	active                      map[sp.GrainKey]PIDRoute
+	fenced                      bool
 }
 
 func NewSerialActivator(directory RouteDirectory, nodeIdentity, nodeSessionID, localAddress string, spawn SpawnFunc) *SerialActivator {
@@ -43,6 +45,9 @@ func (a *SerialActivator) Activate(ctx context.Context, identity *cluster.Cluste
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.fenced {
+		return nil, sp.ErrInvalidNodeSession
+	}
 	current, err := a.directory.Lookup(ctx, key)
 	if err != nil {
 		return nil, err
@@ -62,6 +67,32 @@ func (a *SerialActivator) Activate(ctx context.Context, identity *cluster.Cluste
 	}
 	a.active[key] = pidRoute(pid, current)
 	return pid, nil
+}
+
+// Fence irreversibly rejects new activations and waits for every PID created
+// by this node session to stop.
+func (a *SerialActivator) Fence(ctx context.Context, stop func(context.Context, *actor.PID) error) error {
+	if a == nil || stop == nil {
+		return fmt.Errorf("serial activator fence is not configured")
+	}
+	a.mu.Lock()
+	a.fenced = true
+	pids := make([]*actor.PID, 0, len(a.active))
+	for _, route := range a.active {
+		if route.PID != nil {
+			pids = append(pids, route.PID)
+		}
+	}
+	clear(a.active)
+	a.mu.Unlock()
+
+	var result error
+	for _, pid := range pids {
+		if err := stop(ctx, pid); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
 }
 
 func (a *SerialActivator) Remove(identity *cluster.ClusterIdentity, pid *actor.PID) {

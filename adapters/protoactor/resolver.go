@@ -16,6 +16,8 @@ type Resolver struct {
 	routes    map[string]sp.KindRouteConfig
 	activator PIDActivator
 
+	gate     sync.RWMutex
+	fenced   bool
 	mu       sync.RWMutex
 	cache    map[sp.GrainKey]PIDRoute
 	degraded bool
@@ -34,6 +36,12 @@ func (r *Resolver) ResolvePID(ctx context.Context, placementContext *cluster.Pla
 	if r == nil || r.directory == nil || r.activator == nil || identity == nil {
 		return PIDRoute{}, fmt.Errorf("stable placement protoactor resolver is not configured")
 	}
+	r.gate.RLock()
+	if r.fenced {
+		r.gate.RUnlock()
+		return PIDRoute{}, sp.ErrInvalidNodeSession
+	}
+	defer r.gate.RUnlock()
 	labels := map[string]string(nil)
 	if placementContext != nil {
 		labels = placementContext.Labels
@@ -125,6 +133,14 @@ func (r *Resolver) HandleEvent(event sp.PlacementEvent) {
 
 func (r *Resolver) Degrade() { r.mu.Lock(); r.degraded = true; clear(r.cache); r.mu.Unlock() }
 func (r *Resolver) Recover() { r.mu.Lock(); clear(r.cache); r.degraded = false; r.mu.Unlock() }
+func (r *Resolver) Fence() {
+	r.gate.Lock()
+	defer r.gate.Unlock()
+	r.fenced = true
+	r.mu.Lock()
+	clear(r.cache)
+	r.mu.Unlock()
+}
 
 func (r *Resolver) store(route PIDRoute) { r.mu.Lock(); r.cache[route.GrainKey] = route; r.mu.Unlock() }
 
