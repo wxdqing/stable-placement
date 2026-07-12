@@ -15,7 +15,7 @@ import (
 	"github.com/wxdqing/stable-placement/redis"
 )
 
-const defaultRedisAddr = "127.0.0.1:16379"
+const defaultRedisAddr = "127.0.0.1:6379"
 
 type suite struct {
 	t      *testing.T

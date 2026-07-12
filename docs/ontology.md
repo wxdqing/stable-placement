@@ -1,5 +1,7 @@
 # Stable Placement Ontology
 
+当前版本使用 Node Lease v2：Lease 只属于 NodeSession。旧 Grain Lease、heartbeat、Expire 和 Placement Expired 语义已被取代，不是当前能力。
+
 Stable Placement 不应该先被定义成 Redis 结构、Hash 结构、Lease 实现或 protoactor-go 的内部模块。
 
 它首先是一个领域模型：
@@ -88,7 +90,7 @@ Grain
 Node
 Placement
 Directory
-Lease
+NodeLease
 PlacementStrategy
 LocalPlacementCache
 InvalidNodeGroup
@@ -164,7 +166,7 @@ Address
 Weight
 Load
 Status
-LastHeartbeatAt
+Lease
 ```
 
 说明：
@@ -173,6 +175,8 @@ LastHeartbeatAt
 - NodeSessionID 表示一次具体运行实例。
 - 同一个 NodeIdentity 可以因为进程重启产生新的 NodeSessionID。
 - 同名节点新 session 注册后，旧 session 的 Renew / Release 必须失败。
+- RegisterNode 对相同 session 幂等但不续约；不同 session 必须显式 ReplaceNodeSession。
+- Node Lease 是唯一 TTL 所有者，绑定当前 NodeSession。
 - 节点注册成功只表示在线，不等于一定可以参与 Allocate。
 
 ### 3. Placement
@@ -197,11 +201,11 @@ Player10001 -> game/default/game-2
 GrainID
 Kind
 NodeIdentity
+OwnerNodeSessionID
 Version
 Status
 CreateTime
 UpdateTime
-LeaseExpireAt
 ```
 
 说明：
@@ -210,6 +214,8 @@ LeaseExpireAt
 - Placement 不是一次消息路由。
 - Placement 是 Grain 到 Node 的稳定归属关系。
 - Placement 保存完整 NodeIdentity，而不是只保存 NodeName 或临时地址。
+- Placement 保存分配时的 OwnerNodeSessionID 快照，但不保存 TTL。
+- Node Lease 到期只让 Placement 逻辑不可路由，记录和 Active 状态继续保留。
 - Lookup 只能查询 Placement，不能隐式创建、迁移或恢复 Placement。
 
 ### 4. Directory
@@ -248,25 +254,24 @@ FindByGroup
 - FindByNode 默认返回 Active Placement。
 - FindByNode 必须支持分页或游标，不能依赖全量扫描。
 
-### 5. Lease
+### 5. NodeLease 与 PlacementRoute
 
-Lease 保护唯一 Owner。
+NodeLease 保护一个 NodeSession 承载的全部 Grain，是唯一 TTL 所有者。
 
 属性：
 
 ```text
-LeaseOwnerNodeIdentity
-LeaseOwnerNodeSessionID
-LeaseVersion
-LeaseExpireAt
+Version
+TTLMillis
+ExpireAtUnixMilli
 ```
 
 说明：
 
-- Renew / Release 必须校验 NodeIdentity。
-- Renew / Release 也必须校验 NodeSessionID。
-- 只校验 NodeIdentity 不够，因为同名节点可能已经换了新的运行实例。
-- 旧 session 续约失败，是 NodeReplaced 能够安全生效的关键。
+- TTL 在构造 Memory/Redis 实例时不可变，默认一分钟，非正数配置被拒绝。
+- RegisterNode/ReplaceNodeSession 持久化 TTLMillis；RenewNode 使用持久值且不能复活过期 session。
+- Redis 以 Redis TIME 为权威，Memory 使用一次操作内的内部 clock 快照。
+- PlacementRoute 携带 OwnerNodeSessionID、NodeLeaseVersion 和进程内 ValidUntil；超过 ValidUntil 必须回源。
 
 ### 6. PlacementStrategy
 
@@ -391,13 +396,13 @@ NodeSessionID = 一次节点运行实例的唯一标识
 
 PlacementVersion 表示 Placement 关系的版本。
 
-当 Placement 被 Transfer / Release / Recover / Expire 等命令改变时，版本必须推进。
+当 Placement 被 Transfer / Release / Recover 或 Released 后重新 Allocate 改变时，版本必须推进。
 
-### LeaseVersion
+### NodeLeaseVersion
 
-LeaseVersion 表示 Lease 的版本。
+NodeLeaseVersion 表示当前 NodeSession Lease 的版本。
 
-Renew / Release 必须匹配 LeaseVersion。
+RenewNode 推进 NodeLeaseVersion；Directory.Renew 只校验 PlacementVersion 和当前 Node Lease，不推进 TTL。
 
 ---
 
@@ -438,16 +443,17 @@ Directory 1 -> N Placement
 - Directory 是唯一真相。
 - Directory 必须支持按 GrainKey 和 NodeIdentity 查询。
 
-### Lease 与 Placement
+### NodeLease、NodeSession 与 Placement
 
 ```text
-Placement 1 -> 1 Lease
+NodeSession 1 -> 1 NodeLease
+Placement -> OwnerNodeSessionID snapshot
 ```
 
 说明：
 
-- Lease 保护 Placement 的唯一 Owner。
-- Lease 可以作为 Placement 内部状态存在，不一定是独立存储实体。
+- NodeLease 决定当前 session 关联 Placement 的路由资格。
+- NodeLease 到期不逐条改写 Placement；记录保留供显式 Recover 或 Transfer。
 
 ### Strategy 与 Node
 
@@ -488,7 +494,8 @@ Directory
 ```text
 Node starts
   -> Register(NodeType, NodeGroup, NodeName, NodeSessionID)
-  -> Node becomes online
+  -> create immutable-TTL NodeLease
+  -> Node becomes Active
 ```
 
 注册成功后，节点只是在线。
@@ -498,6 +505,7 @@ Node starts
 ```text
 NodeStatus
 InvalidNodeGroup
+NodeLease validity
 ```
 
 ### Lookup
@@ -506,7 +514,7 @@ InvalidNodeGroup
 GrainKey
   -> LocalPlacementCache
   -> Directory
-  -> Placement
+  -> PlacementRoute
 ```
 
 规则：
@@ -516,6 +524,7 @@ GrainKey
 - Lookup 不迁移 Placement。
 - Lookup 不恢复 Placement。
 - 缓存不可信时必须回源 Directory。
+- Lookup 同时校验 Owner Node、session、状态和 Node Lease；逻辑失效时返回 NotFound 但保留 Placement。
 
 ### Allocate
 
@@ -538,8 +547,9 @@ GrainKey
 
 ```text
 Owner
-  -> Renew(NodeIdentity, NodeSessionID, PlacementVersion, LeaseVersion)
-  -> Extend Lease
+  -> Renew(NodeIdentity, NodeSessionID, PlacementVersion)
+  -> Validate current NodeLease
+  -> Audit without changing Placement or TTL
 ```
 
 规则：
@@ -547,13 +557,13 @@ Owner
 - 必须是当前 Owner。
 - NodeIdentity 必须匹配。
 - NodeSessionID 必须是当前有效 session。
-- PlacementVersion / LeaseVersion 必须匹配。
+- PlacementVersion 必须匹配，Node Lease 必须有效。
 
 ### Release
 
 ```text
 Owner
-  -> Release(NodeIdentity, NodeSessionID, PlacementVersion, LeaseVersion)
+  -> Release(NodeIdentity, NodeSessionID, PlacementVersion)
   -> Placement released
 ```
 
@@ -590,7 +600,8 @@ Old Owner unreliable
 
 - Recover 是故障恢复。
 - Recover 不等于有计划迁移。
-- Recover 必须基于 Version / Lease 保证唯一性。
+- Recover 只用于 missing、Offline、Lease 到期或 session 不匹配的 Owner，并基于 PlacementVersion 保证唯一性。
+- 健康 Owner 必须使用 Transfer；Transfer 也可以显式迁移不可用 Owner。
 
 ### MarkNodeInvalid
 
@@ -644,8 +655,9 @@ Allocate
 Release
 Transfer
 Recover
-Expire
 ```
+
+Node Lease 到期不改变 Placement；Owner 变化只能由显式 Transfer、Recover、Release 或 Released 后 Allocate 完成。
 
 ### Rule 5: Owner 操作必须校验 session
 
@@ -657,7 +669,8 @@ Renew / Release 不能只校验 NodeIdentity。
 NodeIdentity
 NodeSessionID
 PlacementVersion
-LeaseVersion
+Renew: current NodeLease validity
+Release: current session identity, even if NodeLease expired
 ```
 
 ### Rule 6: NodeGroup 是扩展边界
@@ -682,7 +695,7 @@ Directory 才是 Source of Truth。
 PlacementTransferred
 PlacementReleased
 PlacementRecovered
-LeaseExpired
+NodeLeaseExpired
 NodeDraining
 NodeReplaced
 NodeUnregistered
@@ -733,7 +746,7 @@ PlacementRenewed
 PlacementReleased
 PlacementTransferred
 PlacementRecovered
-LeaseExpired
+NodeLeaseExpired
 PlacementCacheInvalidated
 ManualCacheClear
 ```
@@ -744,6 +757,10 @@ ManualCacheClear
 - 收到比本地版本新的事件时，必须清理或更新本地缓存。
 - 收到无法判断版本的事件时，必须保守清理缓存。
 - 订阅异常、事件缺失、事件无法解析时，必须清空缓存或降级回源。
+
+Memory 与 Redis 对 TTL 配置、错误、到期边界、Register/Replace、Recover/Transfer 和路由资格保持一致；Redis Lease 判断统一使用 Redis TIME。
+
+v1/v2 只能冷切换。部署系统必须在 v1 writer、Node、scanner、consumer 全部停止，Grain 执行停止且缓存清空后，整体启动 v2 workload。`首笔 v2 业务写入` 后禁止直接回滚；该术语与启动控制面写入的边界以 [Node Lease v2 冷切换手册](./node-lease-v2-cutover.md) 为准。
 
 ---
 
@@ -762,7 +779,7 @@ Placement
 原因：
 
 - 唯一性围绕 Grain -> Node 的关系展开。
-- Version / Lease / Status 都服务于 Placement 的一致性。
+- PlacementVersion / Owner session / Status 服务于 Placement 的一致性，NodeLease 服务于路由资格。
 - Transfer / Release / Recover 都是在改变 Placement。
 - Node 是 Placement 的目标，不是 Placement 本身。
 - Grain 是业务实体，不属于 Stable Placement 管理生命周期。
@@ -789,21 +806,16 @@ NodeRegistry / InvalidNodeGroup / LocalPlacementCache 是围绕 Placement 协作
 |   Grain   |------------------>|    Placement     |-------------------->|   Node    |
 +-----------+                   +---------+--------+                     +-----+-----+
                                           |                                    |
-                                          | protected by                       |
-                                          v                                    |
-                                    +-----------+                             |
-                                    |   Lease   |                             |
-                                    +-----------+                             |
-                                          ^                                    |
-                                          |                                    |
-                          validates NodeIdentity + NodeSessionID              |
-                                                                               |
-                                                                               v
+                                          | owner session snapshot             |
+                                          +------------------------------------+
+                                                                              |
+                                                                              v
                                                                        +---------------+
                                                                        | Node Registry |
                                                                        +-------+-------+
-                                                                               |
-                                                                               |
+                                                                              |
+                                                                       owns NodeLease
+                                                                              |
                                                                        filters by
                                                                                |
                                                                                v

@@ -1,11 +1,13 @@
 # stable-placement 节点视角 BDD Checklist
 
-Redis 默认：`127.0.0.1:16379`（`STABLE_PLACEMENT_REDIS_ADDR` 可覆盖）
+Redis 默认：`127.0.0.1:6379`（`STABLE_PLACEMENT_REDIS_ADDR` 可覆盖；密码只通过 `STABLE_PLACEMENT_REDIS_PASSWORD` 注入）
 
 运行：
 
 ```bash
-go test -tags=integration ./example/node-bdd/ -v
+STABLE_PLACEMENT_REDIS_ADDR=127.0.0.1:6379 \
+  STABLE_PLACEMENT_REDIS_PASSWORD="$STABLE_PLACEMENT_REDIS_PASSWORD" \
+  go test -tags=integration ./example/node-bdd/ -v
 ```
 
 组织方式：以 `game/default` 节点集群为主线，覆盖扩容、缩容及当前所有领域规则。
@@ -18,7 +20,7 @@ go test -tags=integration ./example/node-bdd/ -v
 |----|------|----------|----------|------|
 | A1 | RegisterNode 后 FindNodes 可列出 game 节点 | NodeRegistry | `cluster_test.go` | [x] |
 | A2 | 多节点注册后列表按 NodeIdentity 稳定排序 | FindNodes | `cluster_test.go` | [x] |
-| A3 | RenewNode 刷新心跳，错误 session 被拒绝 | NodeRegistry | `cluster_test.go` | [x] |
+| A3 | RenewNode 续约 Node Lease，错误或过期 session 被拒绝 | NodeRegistry | `cluster_test.go` | [x] |
 
 ## B. 扩容（Scale Up）
 
@@ -55,8 +57,8 @@ go test -tags=integration ./example/node-bdd/ -v
 | D5 | Release 后 Lookup NotFound，可重新 Allocate | Release | `placement_test.go` | [x] |
 | D6 | Release 后 Recover 返回 NotRecoverable | Recover 语义 | `placement_test.go` | [x] |
 | D7 | Transfer 显式更换 Owner，推进 Version | Transfer | `placement_test.go` | [x] |
-| D8 | Expire 后 Lookup NotFound，Recover 可恢复 | Expire/Recover | `placement_test.go` | [x] |
-| D9 | Expire 租约未到期失败 | Expire | `placement_test.go` | [x] |
+| D8 | Node Lease 到期后 Lookup NotFound，Placement 保留并可 Recover | Node Lease/Recover | `placement_test.go` | [x] |
+| D9 | ExpireNodeLeases 只推进 Node Offline，不改写 Placement | Node Lease | `placement_test.go` | [x] |
 | D10 | Exists 仅对 Active Placement 返回 true | Exists | `placement_test.go` | [x] |
 
 ## E. Session 与节点替换
@@ -89,3 +91,11 @@ go test -tags=integration ./example/node-bdd/ -v
 ## 验收
 
 - [x] `go test -tags=integration ./example/node-bdd/ -v` 全部通过（31 场景）
+
+## Node Lease v2 部署门禁
+
+- [ ] v1 writer、Node、scanner、consumer 全部停止，旧 Grain 执行停止且 Placement 缓存清空。
+- [ ] v1 key 预置不影响 v2；检查 `redis.NamespaceVersion` / `redis.NamespacePrefix`，本库不探测其他进程。
+- [ ] 全部 v2 workload 一次性启动并健康后才开放流量。
+- [ ] `首笔 v2 业务写入` 后禁止直接回滚；定义和完整步骤以 [`docs/node-lease-v2-cutover.md`](../../docs/node-lease-v2-cutover.md) 为准。
+- [ ] 稳定后由运维人工清理 v1 key。
