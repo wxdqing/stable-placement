@@ -1837,6 +1837,68 @@ func TestRedisDirectoryNodeRegistryWritesEventsThroughLua(t *testing.T) {
 	}
 }
 
+func TestRedisDirectoryMarkNodeInvalidWrongTypeEventsKeepsInvalidSet(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	invalidKey := InvalidNodesKey("game", "default")
+	if err := client.Set(ctx, EventsStreamKey(), "wrong-type-events", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	err := dir.MarkNodeInvalid(ctx, "game", "default", "game-1")
+	if err == nil || !strings.Contains(err.Error(), "WRONGTYPE") {
+		t.Fatalf("MarkNodeInvalid error = %v, want WRONGTYPE", err)
+	}
+	if invalid := client.SIsMember(ctx, invalidKey, "game-1").Val(); invalid {
+		t.Fatal("MarkNodeInvalid changed invalid set after rejected event write")
+	}
+}
+
+func TestRedisDirectoryRestoreNodeWrongTypeEventsKeepsInvalidSet(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	invalidKey := InvalidNodesKey("game", "default")
+	if err := client.SAdd(ctx, invalidKey, "game-1").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set(ctx, EventsStreamKey(), "wrong-type-events", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	err := dir.RestoreNode(ctx, "game", "default", "game-1")
+	if err == nil || !strings.Contains(err.Error(), "WRONGTYPE") {
+		t.Fatalf("RestoreNode error = %v, want WRONGTYPE", err)
+	}
+	if invalid := client.SIsMember(ctx, invalidKey, "game-1").Val(); !invalid {
+		t.Fatal("RestoreNode removed invalid member after rejected event write")
+	}
+}
+
+func TestRedisDirectoryDrainNodeWrongTypeEventsKeepsNodeActive(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	node := registerTestNode(t, dir, "game-1", "session-a")
+	if err := client.SAdd(ctx, InvalidNodesKey(node.NodeType, node.NodeGroup), node.NodeName).Err(); err != nil {
+		t.Fatal(err)
+	}
+	nodeKey := NodeKey(node.NodeIdentity)
+	rawBefore := client.Get(ctx, nodeKey).Val()
+	if err := client.Del(ctx, EventsStreamKey()).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set(ctx, EventsStreamKey(), "wrong-type-events", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	err := dir.DrainNode(ctx, node.NodeIdentity)
+	if err == nil || !strings.Contains(err.Error(), "WRONGTYPE") {
+		t.Fatalf("DrainNode error = %v, want WRONGTYPE", err)
+	}
+	if raw := client.Get(ctx, nodeKey).Val(); raw != rawBefore {
+		t.Fatalf("DrainNode changed node after rejected event write: got %q, want %q", raw, rawBefore)
+	}
+}
+
 func TestRedisDirectoryAllocateAdvancesRoundRobinCursorOnlyWhenCreated(t *testing.T) {
 	ctx := context.Background()
 	dir, client := newTestDirectory(t)

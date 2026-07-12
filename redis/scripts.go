@@ -330,6 +330,17 @@ return old or ""
 `
 
 const markNodeInvalidLua = `
+local function expect_type(key, expected, label)
+	local actual = redis.call("TYPE", key)
+	if type(actual) == "table" then actual = actual["ok"] end
+	if actual ~= "none" and actual ~= expected then
+		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
+	end
+	return nil
+end
+local type_error = expect_type(KEYS[1], "set", "invalid_nodes")
+	or expect_type(KEYS[2], "stream", "events")
+if type_error then return type_error end
 redis.call("SADD", KEYS[1], ARGV[1])
 redis.call("XADD", KEYS[2], "*",
 	"type", ARGV[2],
@@ -341,6 +352,17 @@ return "ok"
 `
 
 const restoreNodeLua = `
+local function expect_type(key, expected, label)
+	local actual = redis.call("TYPE", key)
+	if type(actual) == "table" then actual = actual["ok"] end
+	if actual ~= "none" and actual ~= expected then
+		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
+	end
+	return nil
+end
+local type_error = expect_type(KEYS[1], "set", "invalid_nodes")
+	or expect_type(KEYS[2], "stream", "events")
+if type_error then return type_error end
 redis.call("SREM", KEYS[1], ARGV[1])
 redis.call("XADD", KEYS[2], "*",
 	"type", ARGV[2],
@@ -352,6 +374,18 @@ return "ok"
 `
 
 const drainNodeLua = `
+local function expect_type(key, expected, label)
+	local actual = redis.call("TYPE", key)
+	if type(actual) == "table" then actual = actual["ok"] end
+	if actual ~= "none" and actual ~= expected then
+		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
+	end
+	return nil
+end
+local type_error = expect_type(KEYS[1], "string", "node")
+	or expect_type(KEYS[2], "set", "invalid_nodes")
+	or expect_type(KEYS[3], "stream", "events")
+if type_error then return type_error end
 local node_raw = redis.call("GET", KEYS[1])
 if not node_raw then
 	return "node_not_found"
