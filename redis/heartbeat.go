@@ -28,6 +28,8 @@ func (d *Directory) ExpireHeartbeats(ctx context.Context, nodeType, nodeGroup st
 	type candidate struct {
 		member string
 		score  float64
+		raw    []byte
+		node   sp.Node
 	}
 	var candidates []candidate
 	min := "-inf"
@@ -72,22 +74,26 @@ func (d *Directory) ExpireHeartbeats(ctx context.Context, nodeType, nodeGroup st
 		}
 	}
 
+	for index := range candidates {
+		raw, err := d.client.Get(ctx, candidates[index].member).Bytes()
+		if err == goredis.Nil {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		var node sp.Node
+		if err := json.Unmarshal(raw, &node); err != nil {
+			return 0, err
+		}
+		candidates[index].raw = raw
+		candidates[index].node = node
+	}
+
 	expired := 0
 	for _, candidate := range candidates {
 		if int64(expired) == limit {
 			break
-		}
-		raw, err := d.client.Get(ctx, candidate.member).Bytes()
-		if err == goredis.Nil {
-			raw = nil
-		} else if err != nil {
-			return expired, err
-		}
-		var node sp.Node
-		if raw != nil {
-			if err := json.Unmarshal(raw, &node); err != nil {
-				return expired, err
-			}
 		}
 		result, err := d.client.Eval(ctx, expireHeartbeatLua, []string{
 			candidate.member,
@@ -97,8 +103,8 @@ func (d *Directory) ExpireHeartbeats(ctx context.Context, nodeType, nodeGroup st
 			candidate.member,
 			strconv.FormatFloat(candidate.score, 'f', -1, 64),
 			strconv.FormatInt(cutoff, 10),
-			string(raw),
-			node.NodeSessionID,
+			string(candidate.raw),
+			candidate.node.NodeSessionID,
 			nodeType,
 			nodeGroup,
 			string(sp.EventNodeUnregistered),

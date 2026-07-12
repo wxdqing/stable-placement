@@ -279,6 +279,61 @@ func TestRedisDirectoryExpireHeartbeatsWrongTypeKeepsState(t *testing.T) {
 	}
 }
 
+func TestRedisDirectoryExpireHeartbeatsMalformedLaterCandidateKeepsEarlierState(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	dir.SetHeartbeatTTL(time.Second)
+	now := time.Now().Truncate(time.Millisecond)
+	sharedScore := now.Add(-2 * time.Second).UnixMilli()
+	heartbeatKey := NodeHeartbeatKey("game", "default")
+	members := []string{
+		NodeKey("game/default/game-a"),
+		NodeKey("game/default/game-b"),
+	}
+	sort.Strings(members)
+	valid := sp.Node{
+		NodeType:        "game",
+		NodeGroup:       "default",
+		NodeName:        "game-a",
+		NodeIdentity:    "game/default/game-a",
+		NodeSessionID:   "session-a",
+		Status:          sp.NodeStatusActive,
+		LastHeartbeatAt: time.UnixMilli(sharedScore),
+	}
+	validRaw, err := marshalRedisNode(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set(ctx, members[0], validRaw, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set(ctx, members[1], "{malformed", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ZAdd(ctx, heartbeatKey,
+		goredis.Z{Score: float64(sharedScore), Member: members[0]},
+		goredis.Z{Score: float64(sharedScore), Member: members[1]},
+	).Err(); err != nil {
+		t.Fatal(err)
+	}
+	rawBefore := client.Get(ctx, members[0]).Val()
+	scoreBefore := client.ZScore(ctx, heartbeatKey, members[0]).Val()
+	eventsBefore := client.XLen(ctx, EventsStreamKey()).Val()
+
+	if _, err := dir.ExpireHeartbeats(ctx, "game", "default", now, 2); err == nil {
+		t.Fatal("ExpireHeartbeats error = nil, want malformed node error")
+	}
+	if raw := client.Get(ctx, members[0]).Val(); raw != rawBefore {
+		t.Fatalf("earlier raw changed: got %q, want %q", raw, rawBefore)
+	}
+	if score := client.ZScore(ctx, heartbeatKey, members[0]).Val(); score != scoreBefore {
+		t.Fatalf("earlier heartbeat score = %v, want %v", score, scoreBefore)
+	}
+	if events := client.XLen(ctx, EventsStreamKey()).Val(); events != eventsBefore {
+		t.Fatalf("events changed: got %d, want %d", events, eventsBefore)
+	}
+}
+
 func TestRedisDirectoryRegisterHeartbeatWrongTypeKeepsState(t *testing.T) {
 	ctx := context.Background()
 	dir, client := newTestDirectory(t)
