@@ -85,13 +85,13 @@ STABLE_PLACEMENT_REDIS_ADDR=127.0.0.1:6379 \
 
 - 每个场景独立 `nodeGroup`（`nbdd-{runID}`），避免共享 Redis 状态串扰
 - 场景结束 `cleanup`：Release Placement → UnregisterNode → RestoreNode；清理失败会使测试失败
-- Redis 不可达时 `t.Skip`，不污染 CI 单元测试
+- `integration` gate 下 Redis 不可达必须失败，不允许 Skip
 - 关键断言使用 `errors.Is` 校验领域错误
 - 缩容全流程按 ontology 推荐顺序执行并逐步断言
 
 ## 验收
 
-- [x] 最终验收：`8 Redis BDD subscenarios + 34 node-BDD top-level scenarios`
+- [x] 2026-07-13：真实 Redis 7.0.15，`-race -tags=integration ./example/node-bdd`，34 个 top-level 场景通过，0 Skip
 
 ## Node Lease v2 部署门禁
 
