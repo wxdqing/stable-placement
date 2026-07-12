@@ -1,9 +1,20 @@
 package stableplacement
 
 import (
+	"context"
 	"testing"
-	"time"
 )
+
+type directoryV2 interface {
+	Lookup(context.Context, GrainKey) (*PlacementRoute, error)
+}
+
+type nodeRegistryV2 interface {
+	ExpireNodeLeases(context.Context, string, string, int64) (int, error)
+}
+
+var _ directoryV2 = (Directory)(nil)
+var _ nodeRegistryV2 = (NodeRegistry)(nil)
 
 func TestCommandTypesCarryOwnerSessionAndVersions(t *testing.T) {
 	key, _ := NewGrainKey("Player", "10001")
@@ -12,10 +23,8 @@ func TestCommandTypesCarryOwnerSessionAndVersions(t *testing.T) {
 		NodeIdentity:     "game/default/game-1",
 		NodeSessionID:    "session-a",
 		PlacementVersion: 2,
-		LeaseVersion:     3,
-		ExtendTTL:        time.Minute,
 	}
-	if renew.NodeIdentity == "" || renew.NodeSessionID == "" || renew.PlacementVersion == 0 || renew.LeaseVersion == 0 {
+	if renew.NodeIdentity == "" || renew.NodeSessionID == "" || renew.PlacementVersion == 0 {
 		t.Fatalf("renew command lost owner or version fields: %+v", renew)
 	}
 
@@ -24,7 +33,6 @@ func TestCommandTypesCarryOwnerSessionAndVersions(t *testing.T) {
 		NodeIdentity:     renew.NodeIdentity,
 		NodeSessionID:    renew.NodeSessionID,
 		PlacementVersion: renew.PlacementVersion,
-		LeaseVersion:     renew.LeaseVersion,
 	}
 	if release.NodeIdentity != renew.NodeIdentity || release.NodeSessionID != renew.NodeSessionID {
 		t.Fatalf("release command owner mismatch: %+v", release)

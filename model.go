@@ -15,8 +15,24 @@ type PlacementStatus string
 const (
 	PlacementStatusActive   PlacementStatus = "active"
 	PlacementStatusReleased PlacementStatus = "released"
-	PlacementStatusExpired  PlacementStatus = "expired"
 )
+
+type NodeLease struct {
+	// Version 是 Node Lease 版本，用于并发校验。
+	Version int64
+	// TTLMillis 是该 NodeSession 注册时固定的租约时长。
+	TTLMillis int64
+	// ExpireAtUnixMilli 是 Node Lease 的绝对到期时间。
+	ExpireAtUnixMilli int64
+}
+
+type NodeLeaseConfig struct {
+	TTL time.Duration
+}
+
+func DefaultNodeLeaseConfig() NodeLeaseConfig {
+	return NodeLeaseConfig{TTL: time.Minute}
+}
 
 type Grain struct {
 	// GrainID 是业务实体 ID。
@@ -48,19 +64,8 @@ type Node struct {
 	Load int
 	// Status 是节点状态。
 	Status NodeStatus
-	// LastHeartbeatAt 是节点最后心跳时间。
-	LastHeartbeatAt time.Time
-}
-
-type Lease struct {
-	// OwnerNodeIdentity 是当前租约 Owner 的稳定节点身份。
-	OwnerNodeIdentity string
-	// OwnerNodeSessionID 是当前租约 Owner 的运行实例 ID。
-	OwnerNodeSessionID string
-	// Version 是租约版本，用于并发校验。
-	Version int64
-	// ExpireAt 是租约过期时间。
-	ExpireAt time.Time
+	// Lease 是当前 NodeSession 的租约。
+	Lease NodeLease
 }
 
 type Placement struct {
@@ -72,6 +77,8 @@ type Placement struct {
 	GrainKey GrainKey
 	// NodeIdentity 是当前 Owner 节点身份。
 	NodeIdentity string
+	// OwnerNodeSessionID 是分配时的 Owner 运行实例快照。
+	OwnerNodeSessionID string
 	// Version 是 Placement 版本，用于并发校验。
 	Version int64
 	// Status 是 Placement 当前状态。
@@ -80,16 +87,12 @@ type Placement struct {
 	CreateTime time.Time
 	// UpdateTime 是 Placement 最近更新时间。
 	UpdateTime time.Time
-	// LeaseExpireAt 是当前租约过期时间的冗余快照，方便路由判断。
-	LeaseExpireAt time.Time
-	// Lease 是当前 Owner 的租约信息。
-	Lease Lease
 }
 
 // PlacementRecoverable 判断 Placement 当前是否允许 Recover。
-// Released 表示业务主动结束，不允许 Recover；Active 与 Expired 属于故障恢复场景。
+// Released 表示业务主动结束，不允许 Recover；Active 可在 Owner 不可用时恢复。
 func PlacementRecoverable(status PlacementStatus) bool {
-	return status == PlacementStatusActive || status == PlacementStatusExpired
+	return status == PlacementStatusActive
 }
 
 type PlacementRoute struct {
@@ -97,10 +100,14 @@ type PlacementRoute struct {
 	GrainKey GrainKey
 	// NodeIdentity 是缓存路由指向的 Owner 节点。
 	NodeIdentity string
+	// OwnerNodeSessionID 是缓存路由指向的 Owner 运行实例。
+	OwnerNodeSessionID string
 	// Version 是缓存时看到的 Placement 版本。
 	Version int64
 	// Status 是缓存时看到的 Placement 状态。
 	Status PlacementStatus
-	// LeaseExpireAt 是缓存时看到的租约过期时间。
-	LeaseExpireAt time.Time
+	// NodeLeaseVersion 是缓存时看到的 Node Lease 版本。
+	NodeLeaseVersion int64
+	// ValidUntil 是当前进程可使用该路由的保守截止时间。
+	ValidUntil time.Time
 }

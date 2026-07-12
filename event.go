@@ -19,7 +19,7 @@ const (
 	EventPlacementReleased         EventType = "PlacementReleased"
 	EventPlacementTransferred      EventType = "PlacementTransferred"
 	EventPlacementRecovered        EventType = "PlacementRecovered"
-	EventLeaseExpired              EventType = "LeaseExpired"
+	EventNodeLeaseExpired          EventType = "NodeLeaseExpired"
 	EventPlacementCacheInvalidated EventType = "PlacementCacheInvalidated"
 	EventManualCacheClear          EventType = "ManualCacheClear"
 )
@@ -31,6 +31,8 @@ type PlacementEvent struct {
 	GrainKey GrainKey
 	// NodeIdentity 是事件影响的完整节点身份。
 	NodeIdentity string
+	// NodeSessionID 是事件影响的节点运行实例 ID。
+	NodeSessionID string
 	// NodeType 是事件影响的节点类型。
 	NodeType string
 	// NodeGroup 是事件影响的节点分组。
@@ -39,8 +41,8 @@ type PlacementEvent struct {
 	NodeName string
 	// PlacementVersion 是事件发生后的 Placement 版本。
 	PlacementVersion int64
-	// LeaseVersion 是事件发生后的 Lease 版本。
-	LeaseVersion int64
+	// NodeLeaseVersion 是事件发生后的 Node Lease 版本。
+	NodeLeaseVersion int64
 	// Time 是事件发生时间。
 	Time time.Time
 }

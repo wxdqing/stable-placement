@@ -15,9 +15,6 @@ func TestPlacementRecoverable(t *testing.T) {
 	if !PlacementRecoverable(PlacementStatusActive) {
 		t.Fatal("active placement should be recoverable")
 	}
-	if !PlacementRecoverable(PlacementStatusExpired) {
-		t.Fatal("expired placement should be recoverable")
-	}
 	if PlacementRecoverable(PlacementStatusReleased) {
 		t.Fatal("released placement should not be recoverable")
 	}

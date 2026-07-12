@@ -3,16 +3,56 @@ package stableplacement
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestStatusesAndErrorsAreStable(t *testing.T) {
 	if NodeStatusActive != "active" || NodeStatusDraining != "draining" || NodeStatusOffline != "offline" {
 		t.Fatalf("unexpected node statuses")
 	}
-	if PlacementStatusActive != "active" || PlacementStatusReleased != "released" || PlacementStatusExpired != "expired" {
+	if PlacementStatusActive != "active" || PlacementStatusReleased != "released" {
 		t.Fatalf("unexpected placement statuses")
 	}
 	if !errors.Is(ErrInvalidNodeSession, ErrInvalidNodeSession) {
 		t.Fatal("errors.Is failed for ErrInvalidNodeSession")
+	}
+}
+
+func TestDefaultNodeLeaseConfig(t *testing.T) {
+	config := DefaultNodeLeaseConfig()
+	if config.TTL != time.Minute {
+		t.Fatalf("default node lease TTL = %v, want %v", config.TTL, time.Minute)
+	}
+}
+
+func TestNodeLeaseAndPlacementRouteContracts(t *testing.T) {
+	lease := NodeLease{
+		Version:           3,
+		TTLMillis:         60_000,
+		ExpireAtUnixMilli: 1_725_000_000_000,
+	}
+	node := Node{Lease: lease}
+	if node.Lease != lease {
+		t.Fatalf("node lease = %+v, want %+v", node.Lease, lease)
+	}
+
+	key, err := NewGrainKey("Player", "10001")
+	if err != nil {
+		t.Fatalf("NewGrainKey error: %v", err)
+	}
+	placement := Placement{GrainKey: key, OwnerNodeSessionID: "session-a"}
+	if placement.OwnerNodeSessionID != "session-a" {
+		t.Fatalf("placement owner session = %q", placement.OwnerNodeSessionID)
+	}
+
+	validUntil := time.Date(2026, time.July, 12, 12, 0, 0, 0, time.UTC)
+	route := PlacementRoute{
+		GrainKey:           key,
+		OwnerNodeSessionID: "session-a",
+		NodeLeaseVersion:   lease.Version,
+		ValidUntil:         validUntil,
+	}
+	if route.OwnerNodeSessionID != placement.OwnerNodeSessionID || route.NodeLeaseVersion != lease.Version || route.ValidUntil != validUntil {
+		t.Fatalf("unexpected placement route: %+v", route)
 	}
 }
