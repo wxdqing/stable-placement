@@ -50,13 +50,13 @@ local now = now_millis()
 	  if existing["Status"] ~= "active" and existing["Status"] ~= "draining" then return redis.error_reply("INVALID_NODE_STATUS") end
 	  if not score or tonumber(score)~=tonumber(existing["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end
 	  if tonumber(existing["Lease"]["ExpireAtUnixMilli"] or 0) <= now then return "node_lease_expired" end
-	  return "ok"
+	  return {"ok",tostring(existing["Lease"]["Version"]),tostring(tonumber(existing["Lease"]["ExpireAtUnixMilli"])-now)}
 	end
 incoming["Status"]="active"; incoming["Lease"]={Version=1,TTLMillis=tonumber(ARGV[2]),ExpireAtUnixMilli=now+tonumber(ARGV[2])}
 local encoded=cjson.encode(incoming)
 redis.call("SET",KEYS[1],encoded);redis.call("SADD",KEYS[2],ARGV[3]);redis.call("ZADD",KEYS[3],incoming["Lease"]["ExpireAtUnixMilli"],ARGV[3])
 node_event(KEYS[4],ARGV[4],incoming["NodeIdentity"],incoming["NodeSessionID"],incoming["NodeType"],incoming["NodeGroup"],incoming["NodeName"],"1")
-return "ok"
+return {"ok","1",tostring(tonumber(ARGV[2]))}
 `
 
 const renewNodeLua = luaHelpers + `
@@ -73,7 +73,7 @@ local now=now_millis();if tonumber(node["Lease"]["ExpireAtUnixMilli"] or 0)<=now
 node["Lease"]["Version"]=tonumber(node["Lease"]["Version"])+1
 local expiry=now+tonumber(node["Lease"]["TTLMillis"]);if expiry<tonumber(score) then expiry=tonumber(score) end
 node["Lease"]["ExpireAtUnixMilli"]=expiry
-redis.call("SET",KEYS[1],cjson.encode(node));redis.call("ZADD",KEYS[2],expiry,ARGV[2]);return "ok"
+redis.call("SET",KEYS[1],cjson.encode(node));redis.call("ZADD",KEYS[2],expiry,ARGV[2]);return {"ok",tostring(node["Lease"]["Version"]),tostring(expiry-now)}
 `
 
 const replaceNodeSessionLua = luaHelpers + `
@@ -85,7 +85,7 @@ if old and old["NodeSessionID"]==incoming["NodeSessionID"] then return "invalid_
 if old then local score=redis.call("ZSCORE",KEYS[3],ARGV[3]);if old["Status"]=="offline" then if score and tonumber(score)~=tonumber(old["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end elseif old["Status"]=="active" or old["Status"]=="draining" then if not score or tonumber(score)~=tonumber(old["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end else return redis.error_reply("INVALID_NODE_STATUS") end end
 local now=now_millis();incoming["Status"]="active";incoming["Lease"]={Version=1,TTLMillis=tonumber(ARGV[2]),ExpireAtUnixMilli=now+tonumber(ARGV[2])}
 redis.call("SET",KEYS[1],cjson.encode(incoming));redis.call("SADD",KEYS[2],ARGV[3]);redis.call("ZADD",KEYS[3],incoming["Lease"]["ExpireAtUnixMilli"],ARGV[3]);node_event(KEYS[4],ARGV[4],incoming["NodeIdentity"],incoming["NodeSessionID"],incoming["NodeType"],incoming["NodeGroup"],incoming["NodeName"],"1")
-return {"ok",oldraw or ""}
+return {"ok",oldraw or "","1",tostring(tonumber(ARGV[2]))}
 `
 
 const expireNodeLeaseLua = luaHelpers + `

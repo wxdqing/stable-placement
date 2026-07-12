@@ -79,7 +79,7 @@ func newAtomicFixture(t *testing.T, grain string) atomicFixture {
 	server.SetTime(time.Unix(1100, 0))
 	a, b := testNode("game-1", "session-a"), testNode("game-2", "session-b")
 	for _, node := range []sp.Node{a, b} {
-		if err := dir.RegisterNode(ctx, node); err != nil {
+		if _, err := dir.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -182,7 +182,7 @@ func TestRedisDirectoryAllocateWrongTypeKeyMatrixV2(t *testing.T) {
 			dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 			server.SetTime(time.Unix(1220, 0))
 			node := testNode("game-1", "session-a")
-			if err := dir.RegisterNode(ctx, node); err != nil {
+			if _, err := dir.RegisterNode(ctx, node); err != nil {
 				t.Fatal(err)
 			}
 			grain, _ := sp.NewGrainKey("Player", "allocate-matrix-"+strings.ReplaceAll(tc.name, " ", "-"))
@@ -339,7 +339,7 @@ func TestRedisDirectoryRenewReleaseEscapedSessionExactV2(t *testing.T) {
 			dir, _, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 			server.SetTime(time.Unix(1200, 0))
 			node := testNode("game-1", `session\"with\\escapes`)
-			if err := dir.RegisterNode(ctx, node); err != nil {
+			if _, err := dir.RegisterNode(ctx, node); err != nil {
 				t.Fatal(err)
 			}
 			p, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "escaped-" + operation, Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
@@ -393,7 +393,7 @@ func TestRedisDirectoryReleaseRejectsSessionReplacedBeforeEvalV2(t *testing.T) {
 	base, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(1210, 0))
 	node := testNode("game-1", "session-a")
-	if err := base.RegisterNode(ctx, node); err != nil {
+	if _, err := base.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	p, err := base.Allocate(ctx, sp.AllocateCommand{GrainID: "release-replaced", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
@@ -409,7 +409,7 @@ func TestRedisDirectoryReleaseRejectsSessionReplacedBeforeEvalV2(t *testing.T) {
 			armed = false
 			next := node
 			next.NodeSessionID = "session-b"
-			if _, err := base.ReplaceNodeSession(ctx, next); err != nil {
+			if _, _, err := base.ReplaceNodeSession(ctx, next); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -498,7 +498,7 @@ func TestRedisDirectoryTransferRecoverUsesTargetSessionAtEvalV2(t *testing.T) {
 					armed = false
 					next := target
 					next.NodeSessionID = "session-c"
-					if _, err := f.dir.ReplaceNodeSession(ctx, next); err != nil {
+					if _, _, err := f.dir.ReplaceNodeSession(ctx, next); err != nil {
 						t.Fatal(err)
 					}
 				}

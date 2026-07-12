@@ -40,7 +40,7 @@ func TestStablePlacementFirstPhaseFlow(t *testing.T) {
 		NodeSessionID: "session-a",
 		Status:        sp.NodeStatusActive,
 	}
-	if err := dir.NodeRegistry().RegisterNode(ctx, node); err != nil {
+	if _, err := dir.NodeRegistry().RegisterNode(ctx, node); err != nil {
 		t.Fatalf("RegisterNode error: %v", err)
 	}
 

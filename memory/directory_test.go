@@ -37,7 +37,7 @@ func newTestDirectory(t *testing.T) (*Directory, *fakeClock, *recordingPublisher
 func registerTestNode(t *testing.T, directory *Directory, name, session string) sp.Node {
 	t.Helper()
 	node := testNode(name, session)
-	if err := directory.NodeRegistry().RegisterNode(context.Background(), node); err != nil {
+	if _, err := directory.NodeRegistry().RegisterNode(context.Background(), node); err != nil {
 		t.Fatalf("RegisterNode error: %v", err)
 	}
 	return node
@@ -502,7 +502,8 @@ func TestDirectoryConcurrentOperationsFollowDirectoryThenRegistryLockOrder(t *te
 }
 
 func registryRenew(registry *NodeRegistry, node sp.Node) error {
-	return registry.RenewNode(context.Background(), node.NodeIdentity, node.NodeSessionID)
+	_, err := registry.RenewNode(context.Background(), node.NodeIdentity, node.NodeSessionID)
+	return err
 }
 
 func setNodeStatus(registry *NodeRegistry, identity string, status sp.NodeStatus) {

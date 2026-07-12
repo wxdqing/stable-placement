@@ -30,6 +30,11 @@ type NodeLeaseConfig struct {
 	TTL time.Duration
 }
 
+type NodeLeaseGrant struct {
+	Version    int64
+	ValidUntil time.Time
+}
+
 func DefaultNodeLeaseConfig() NodeLeaseConfig {
 	return NodeLeaseConfig{TTL: time.Minute}
 }

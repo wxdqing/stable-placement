@@ -162,7 +162,7 @@ func (s *suite) registerNode(name string, session string) sp.Node {
 		NodeSessionID: session,
 		Status:        sp.NodeStatusActive,
 	}
-	if err := s.dir.RegisterNode(s.ctx, node); err != nil {
+	if _, err := s.dir.RegisterNode(s.ctx, node); err != nil {
 		s.t.Fatalf("RegisterNode %s error: %v", name, err)
 	}
 	s.nodes = append(s.nodes, node)

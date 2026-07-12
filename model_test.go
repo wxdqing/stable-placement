@@ -26,6 +26,10 @@ func TestDefaultNodeLeaseConfig(t *testing.T) {
 }
 
 func TestNodeLeaseAndPlacementRouteContracts(t *testing.T) {
+	grant := NodeLeaseGrant{Version: 3, ValidUntil: time.Unix(100, 0)}
+	if grant.Version != 3 || grant.ValidUntil.IsZero() {
+		t.Fatalf("node lease grant = %+v", grant)
+	}
 	lease := NodeLease{
 		Version:           3,
 		TTLMillis:         60_000,

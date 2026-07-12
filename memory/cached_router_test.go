@@ -332,7 +332,7 @@ func TestCachedRouterAllocateCachesAfterSynchronousPlacementCreated(t *testing.T
 		t.Fatal(err)
 	}
 	node := testNode("game-1", "session-a")
-	if err := registry.RegisterNode(ctx, node); err != nil {
+	if _, err := registry.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	placement, err := router.Allocate(ctx, sp.AllocateCommand{GrainID: "10001", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})

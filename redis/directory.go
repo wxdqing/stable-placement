@@ -78,65 +78,91 @@ func NewDirectory(client goredis.UniversalClient, mode sp.StrategyMode, config s
 	return &Directory{client: client, mode: mode, config: config}, nil
 }
 
-func (d *Directory) RegisterNode(ctx context.Context, node sp.Node) error {
+func (d *Directory) RegisterNode(ctx context.Context, node sp.Node) (sp.NodeLeaseGrant, error) {
 	if err := normalizeNode(&node); err != nil {
-		return err
+		return sp.NodeLeaseGrant{}, err
 	}
 	encoded, err := json.Marshal(redisNode{Node: node, PlacementNodeKey: PlacementNodeKey(node.NodeIdentity), NodeKey: NodeKey(node.NodeIdentity)})
 	if err != nil {
-		return err
+		return sp.NodeLeaseGrant{}, err
 	}
-	result, err := d.client.Eval(ctx, registerNodeLua, []string{NodeKey(node.NodeIdentity), NodesKey(node.NodeType, node.NodeGroup), NodeLeaseKey(node.NodeType, node.NodeGroup), EventsStreamKey()}, string(encoded), strconv.FormatInt(d.config.TTL.Milliseconds(), 10), NodeKey(node.NodeIdentity), string(sp.EventNodeRegistered)).Text()
+	requestStart := time.Now()
+	result, err := d.client.Eval(ctx, registerNodeLua, []string{NodeKey(node.NodeIdentity), NodesKey(node.NodeType, node.NodeGroup), NodeLeaseKey(node.NodeType, node.NodeGroup), EventsStreamKey()}, string(encoded), strconv.FormatInt(d.config.TTL.Milliseconds(), 10), NodeKey(node.NodeIdentity), string(sp.EventNodeRegistered)).Result()
 	if err != nil {
-		return err
+		return sp.NodeLeaseGrant{}, err
 	}
-	return nodeResultError(result)
+	return nodeLeaseGrantResult(requestStart, result, 1, 2)
 }
 
-func (d *Directory) RenewNode(ctx context.Context, identity, session string) error {
+func (d *Directory) RenewNode(ctx context.Context, identity, session string) (sp.NodeLeaseGrant, error) {
 	node, err := d.getNode(ctx, identity)
 	if err != nil {
-		return err
+		return sp.NodeLeaseGrant{}, err
 	}
-	result, err := d.client.Eval(ctx, renewNodeLua, []string{NodeKey(identity), NodeLeaseKey(node.NodeType, node.NodeGroup)}, session, NodeKey(identity)).Text()
+	requestStart := time.Now()
+	result, err := d.client.Eval(ctx, renewNodeLua, []string{NodeKey(identity), NodeLeaseKey(node.NodeType, node.NodeGroup)}, session, NodeKey(identity)).Result()
 	if err != nil {
-		return err
+		return sp.NodeLeaseGrant{}, err
 	}
-	return nodeResultError(result)
+	return nodeLeaseGrantResult(requestStart, result, 1, 2)
 }
 
-func (d *Directory) ReplaceNodeSession(ctx context.Context, node sp.Node) (*sp.Node, error) {
+func (d *Directory) ReplaceNodeSession(ctx context.Context, node sp.Node) (*sp.Node, sp.NodeLeaseGrant, error) {
 	if err := normalizeNode(&node); err != nil {
-		return nil, err
+		return nil, sp.NodeLeaseGrant{}, err
 	}
 	encoded, err := json.Marshal(redisNode{Node: node, PlacementNodeKey: PlacementNodeKey(node.NodeIdentity), NodeKey: NodeKey(node.NodeIdentity)})
 	if err != nil {
-		return nil, err
+		return nil, sp.NodeLeaseGrant{}, err
 	}
+	requestStart := time.Now()
 	result, err := d.client.Eval(ctx, replaceNodeSessionLua, []string{NodeKey(node.NodeIdentity), NodesKey(node.NodeType, node.NodeGroup), NodeLeaseKey(node.NodeType, node.NodeGroup), EventsStreamKey()}, string(encoded), strconv.FormatInt(d.config.TTL.Milliseconds(), 10), NodeKey(node.NodeIdentity), string(sp.EventNodeReplaced)).Result()
 	if err != nil {
-		return nil, err
+		return nil, sp.NodeLeaseGrant{}, err
 	}
 	if s, ok := result.(string); ok {
 		if e := nodeResultError(s); e != nil {
-			return nil, e
+			return nil, sp.NodeLeaseGrant{}, e
 		}
-		return &sp.Node{}, nil
+		return nil, sp.NodeLeaseGrant{}, fmt.Errorf("unexpected replace result %q", s)
 	}
 	raw, ok := result.([]interface{})
-	if !ok || len(raw) != 2 {
-		return nil, fmt.Errorf("unexpected replace result %T", result)
+	if !ok || len(raw) != 4 {
+		return nil, sp.NodeLeaseGrant{}, fmt.Errorf("unexpected replace result %T", result)
 	}
 	if status := fmt.Sprint(raw[0]); status != "ok" {
-		return nil, nodeResultError(status)
+		return nil, sp.NodeLeaseGrant{}, nodeResultError(status)
 	}
 	var old redisNode
 	if fmt.Sprint(raw[1]) != "" {
 		if err := json.Unmarshal([]byte(fmt.Sprint(raw[1])), &old); err != nil {
-			return nil, err
+			return nil, sp.NodeLeaseGrant{}, err
 		}
 	}
-	return &old.Node, nil
+	grant, err := nodeLeaseGrantResult(requestStart, []interface{}{raw[0], raw[2], raw[3]}, 1, 2)
+	if err != nil {
+		return nil, sp.NodeLeaseGrant{}, err
+	}
+	return &old.Node, grant, nil
+}
+
+func nodeLeaseGrantResult(requestStart time.Time, result interface{}, versionIndex, ttlIndex int) (sp.NodeLeaseGrant, error) {
+	if status, ok := result.(string); ok {
+		return sp.NodeLeaseGrant{}, nodeResultError(status)
+	}
+	items, ok := result.([]interface{})
+	if !ok || len(items) <= versionIndex || len(items) <= ttlIndex || fmt.Sprint(items[0]) != "ok" {
+		return sp.NodeLeaseGrant{}, fmt.Errorf("unexpected node lease result %T", result)
+	}
+	version, err := strconv.ParseInt(fmt.Sprint(items[versionIndex]), 10, 64)
+	if err != nil || version <= 0 {
+		return sp.NodeLeaseGrant{}, fmt.Errorf("invalid node lease version %q", items[versionIndex])
+	}
+	remainingTTLMillis, err := strconv.ParseInt(fmt.Sprint(items[ttlIndex]), 10, 64)
+	if err != nil || remainingTTLMillis <= 0 {
+		return sp.NodeLeaseGrant{}, sp.ErrNodeLeaseExpired
+	}
+	return sp.NodeLeaseGrant{Version: version, ValidUntil: requestStart.Add(time.Duration(remainingTTLMillis) * time.Millisecond)}, nil
 }
 
 func (d *Directory) UnregisterNode(ctx context.Context, identity, session string) error {

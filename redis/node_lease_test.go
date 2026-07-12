@@ -69,21 +69,21 @@ func TestRedisDirectoryRegisterAndRenewNodeLease(t *testing.T) {
 	dir, _, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: 1500 * time.Microsecond})
 	server.SetTime(time.Unix(100, 0))
 	node := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	registered := readNode(t, ctx, dir, node.NodeIdentity)
 	if registered.Status != sp.NodeStatusActive || registered.Lease.Version != 1 || registered.Lease.TTLMillis != 2 || registered.Lease.ExpireAtUnixMilli != 100002 {
 		t.Fatalf("registered = %+v", registered)
 	}
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatalf("idempotent register: %v", err)
 	}
 	if got := readNode(t, ctx, dir, node.NodeIdentity); got.Lease != registered.Lease {
 		t.Fatalf("register renewed lease: %+v", got.Lease)
 	}
 	server.SetTime(time.UnixMilli(100001))
-	if err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+	if _, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
 		t.Fatal(err)
 	}
 	renewed := readNode(t, ctx, dir, node.NodeIdentity)
@@ -97,7 +97,7 @@ func TestRedisDirectoryRenewUsesPersistedTTL(t *testing.T) {
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: 5 * time.Second})
 	server.SetTime(time.Unix(200, 0))
 	node := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	other, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin, sp.NodeLeaseConfig{TTL: time.Minute})
@@ -105,7 +105,7 @@ func TestRedisDirectoryRenewUsesPersistedTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.SetTime(time.UnixMilli(201000))
-	if err := other.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+	if _, err := other.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
 		t.Fatal(err)
 	}
 	got := readNode(t, ctx, other, node.NodeIdentity)
@@ -119,14 +119,14 @@ func TestRedisDirectoryRenewRejectsExpiredOfflineAndOldSession(t *testing.T) {
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(300, 0))
 	node := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
-	if err := dir.RenewNode(ctx, node.NodeIdentity, "old"); !errors.Is(err, sp.ErrInvalidNodeSession) {
+	if _, err := dir.RenewNode(ctx, node.NodeIdentity, "old"); !errors.Is(err, sp.ErrInvalidNodeSession) {
 		t.Fatalf("old session: %v", err)
 	}
 	server.SetTime(time.Unix(301, 0))
-	if err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeLeaseExpired) {
+	if _, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeLeaseExpired) {
 		t.Fatalf("expired: %v", err)
 	}
 	raw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
@@ -137,7 +137,7 @@ func TestRedisDirectoryRenewRejectsExpiredOfflineAndOldSession(t *testing.T) {
 	stored.Status = sp.NodeStatusOffline
 	b, _ := json.Marshal(stored)
 	client.Set(ctx, NodeKey(node.NodeIdentity), b, 0)
-	if err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
+	if _, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
 		t.Fatalf("offline: %v", err)
 	}
 }
@@ -147,7 +147,7 @@ func TestExpireNodeLeasesUsesRedisTimeAndIsIdempotent(t *testing.T) {
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(400, 0))
 	for _, node := range []sp.Node{testNode("game-1", "session-a"), testNode("game-2", "session-b")} {
-		if err := dir.RegisterNode(ctx, node); err != nil {
+		if _, err := dir.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -183,7 +183,7 @@ func TestExpiredOfflineNodeTombstoneLifecycle(t *testing.T) {
 		dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 		server.SetTime(time.Unix(450, 0))
 		node := testNode("game-1", "session-a")
-		if err := dir.RegisterNode(ctx, node); err != nil {
+		if _, err := dir.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 		var placement *sp.Placement
@@ -211,7 +211,7 @@ func TestExpiredOfflineNodeTombstoneLifecycle(t *testing.T) {
 	t.Run("same-session register reports expired", func(t *testing.T) {
 		dir, client, node, _ := setup(t, false)
 		before := snapshotRedisKeysV2(t, client, keys(node)...)
-		if err := dir.RegisterNode(ctx, node); !errors.Is(err, sp.ErrNodeLeaseExpired) {
+		if _, err := dir.RegisterNode(ctx, node); !errors.Is(err, sp.ErrNodeLeaseExpired) {
 			t.Fatalf("RegisterNode err = %v", err)
 		}
 		requireRedisSnapshotV2(t, snapshotRedisKeysV2(t, client, keys(node)...), before)
@@ -221,7 +221,7 @@ func TestExpiredOfflineNodeTombstoneLifecycle(t *testing.T) {
 		dir, client, node, _ := setup(t, false)
 		before := snapshotRedisKeysV2(t, client, keys(node)...)
 		node.NodeSessionID = "session-b"
-		if err := dir.RegisterNode(ctx, node); !errors.Is(err, sp.ErrInvalidNodeSession) {
+		if _, err := dir.RegisterNode(ctx, node); !errors.Is(err, sp.ErrInvalidNodeSession) {
 			t.Fatalf("RegisterNode err = %v", err)
 		}
 		requireRedisSnapshotV2(t, snapshotRedisKeysV2(t, client, keys(node)...), before)
@@ -230,7 +230,7 @@ func TestExpiredOfflineNodeTombstoneLifecycle(t *testing.T) {
 	t.Run("renew reports offline backend error", func(t *testing.T) {
 		dir, client, node, _ := setup(t, false)
 		before := snapshotRedisKeysV2(t, client, keys(node)...)
-		if err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
+		if _, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
 			t.Fatalf("RenewNode err = %v", err)
 		}
 		requireRedisSnapshotV2(t, snapshotRedisKeysV2(t, client, keys(node)...), before)
@@ -253,7 +253,7 @@ func TestExpiredOfflineNodeTombstoneLifecycle(t *testing.T) {
 		beforeEvents := client.XLen(ctx, EventsStreamKey()).Val()
 		replacement := node
 		replacement.NodeSessionID = "session-b"
-		old, err := dir.ReplaceNodeSession(ctx, replacement)
+		old, _, err := dir.ReplaceNodeSession(ctx, replacement)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -306,13 +306,17 @@ func TestRedisNodeLifecycleLeaseScoreRulesAreAtomic(t *testing.T) {
 		name string
 		run  func(context.Context, *Directory, sp.Node) error
 	}{
-		{name: "register", run: func(ctx context.Context, dir *Directory, node sp.Node) error { return dir.RegisterNode(ctx, node) }},
+		{name: "register", run: func(ctx context.Context, dir *Directory, node sp.Node) error {
+			_, err := dir.RegisterNode(ctx, node)
+			return err
+		}},
 		{name: "renew", run: func(ctx context.Context, dir *Directory, node sp.Node) error {
-			return dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID)
+			_, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID)
+			return err
 		}},
 		{name: "replace", run: func(ctx context.Context, dir *Directory, node sp.Node) error {
 			node.NodeSessionID = "replacement"
-			_, err := dir.ReplaceNodeSession(ctx, node)
+			_, _, err := dir.ReplaceNodeSession(ctx, node)
 			return err
 		}},
 		{name: "unregister", run: func(ctx context.Context, dir *Directory, node sp.Node) error {
@@ -331,7 +335,7 @@ func TestRedisNodeLifecycleLeaseScoreRulesAreAtomic(t *testing.T) {
 				dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 				server.SetTime(time.Unix(460, 0))
 				node := testNode("score-rules", "session-a")
-				if err := dir.RegisterNode(ctx, node); err != nil {
+				if _, err := dir.RegisterNode(ctx, node); err != nil {
 					t.Fatal(err)
 				}
 				if status == sp.NodeStatusOffline {
@@ -378,13 +382,13 @@ func TestRedisDirectoryReplaceNodeSessionPreflightsBeforeWrite(t *testing.T) {
 		dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 		server.SetTime(time.Unix(800, 0))
 		node := testNode("game-1", "session-a")
-		if err := dir.RegisterNode(ctx, node); err != nil {
+		if _, err := dir.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 		raw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
 		score := client.ZScore(ctx, NodeLeaseKey("game", "default"), NodeKey(node.NodeIdentity)).Val()
 		events := client.XLen(ctx, EventsStreamKey()).Val()
-		if _, err := dir.ReplaceNodeSession(ctx, node); !errors.Is(err, sp.ErrInvalidNodeSession) {
+		if _, _, err := dir.ReplaceNodeSession(ctx, node); !errors.Is(err, sp.ErrInvalidNodeSession) {
 			t.Fatalf("err = %v", err)
 		}
 		if client.Get(ctx, NodeKey(node.NodeIdentity)).Val() != raw || client.ZScore(ctx, NodeLeaseKey("game", "default"), NodeKey(node.NodeIdentity)).Val() != score || client.XLen(ctx, EventsStreamKey()).Val() != events {
@@ -395,7 +399,7 @@ func TestRedisDirectoryReplaceNodeSessionPreflightsBeforeWrite(t *testing.T) {
 		dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 		server.SetTime(time.Unix(820, 0))
 		node := testNode("game-1", "session-a")
-		if err := dir.RegisterNode(ctx, node); err != nil {
+		if _, err := dir.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 		raw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
@@ -404,7 +408,7 @@ func TestRedisDirectoryReplaceNodeSessionPreflightsBeforeWrite(t *testing.T) {
 		client.Set(ctx, EventsStreamKey(), "wrongtype", 0)
 		next := node
 		next.NodeSessionID = "session-b"
-		if _, err := dir.ReplaceNodeSession(ctx, next); err == nil {
+		if _, _, err := dir.ReplaceNodeSession(ctx, next); err == nil {
 			t.Fatal("expected WRONGTYPE")
 		}
 		if client.Get(ctx, NodeKey(node.NodeIdentity)).Val() != raw || client.ZScore(ctx, NodeLeaseKey("game", "default"), NodeKey(node.NodeIdentity)).Val() != score || client.Get(ctx, EventsStreamKey()).Val() != "wrongtype" {
@@ -418,7 +422,7 @@ func TestRedisReplaceMalformedOldJSONLeavesCompleteSnapshotUnchanged(t *testing.
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(810, 0))
 	node := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	placement, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "malformed-replace", Kind: "Player", TargetNodeType: node.NodeType, TargetNodeGroup: node.NodeGroup})
@@ -429,7 +433,7 @@ func TestRedisReplaceMalformedOldJSONLeavesCompleteSnapshotUnchanged(t *testing.
 	before := captureRouteMutationSnapshot(t, ctx, client, *placement, node.NodeIdentity)
 	next := node
 	next.NodeSessionID = "session-b"
-	if _, err := dir.ReplaceNodeSession(ctx, next); err == nil {
+	if _, _, err := dir.ReplaceNodeSession(ctx, next); err == nil {
 		t.Fatal("expected malformed JSON error")
 	}
 	requireRouteMutationSnapshot(t, ctx, client, *placement, before, node.NodeIdentity)
@@ -440,17 +444,17 @@ func TestRedisDirectoryRegisterCannotBypassReplaceSessionEvent(t *testing.T) {
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(830, 0))
 	old := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, old); err != nil {
+	if _, err := dir.RegisterNode(ctx, old); err != nil {
 		t.Fatal(err)
 	}
 	next := old
 	next.NodeSessionID = "session-b"
 	before := captureLeaseBatchSnapshot(t, ctx, client, old.NodeIdentity)
-	if err := dir.RegisterNode(ctx, next); !errors.Is(err, sp.ErrInvalidNodeSession) {
+	if _, err := dir.RegisterNode(ctx, next); !errors.Is(err, sp.ErrInvalidNodeSession) {
 		t.Fatalf("different-session RegisterNode err = %v", err)
 	}
 	requireLeaseBatchSnapshot(t, ctx, client, old.NodeIdentity, before)
-	returned, err := dir.ReplaceNodeSession(ctx, next)
+	returned, _, err := dir.ReplaceNodeSession(ctx, next)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -461,10 +465,10 @@ func TestRedisDirectoryRegisterCannotBypassReplaceSessionEvent(t *testing.T) {
 	if stored.NodeSessionID != next.NodeSessionID || stored.Lease.Version != 1 {
 		t.Fatalf("replacement = %+v", stored)
 	}
-	if err := dir.RenewNode(ctx, next.NodeIdentity, old.NodeSessionID); !errors.Is(err, sp.ErrInvalidNodeSession) {
+	if _, err := dir.RenewNode(ctx, next.NodeIdentity, old.NodeSessionID); !errors.Is(err, sp.ErrInvalidNodeSession) {
 		t.Fatalf("old-session RenewNode err = %v", err)
 	}
-	if err := dir.RenewNode(ctx, next.NodeIdentity, next.NodeSessionID); err != nil {
+	if _, err := dir.RenewNode(ctx, next.NodeIdentity, next.NodeSessionID); err != nil {
 		t.Fatalf("new-session RenewNode err = %v", err)
 	}
 	events := client.XRange(ctx, EventsStreamKey(), "-", "+").Val()
@@ -484,7 +488,7 @@ func TestExpireNodeLeasesStaleCandidateDoesNotExpireRenewedLease(t *testing.T) {
 	base, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(840, 0))
 	node := testNode("game-1", "session-a")
-	if err := base.RegisterNode(ctx, node); err != nil {
+	if _, err := base.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	server.SetTime(time.UnixMilli(840500))
@@ -492,7 +496,7 @@ func TestExpireNodeLeasesStaleCandidateDoesNotExpireRenewedLease(t *testing.T) {
 	hooked, err := NewDirectory(nodeLeaseEvalHookClient{UniversalClient: client, before: func(script string) {
 		if armed && script == expireNodeLeaseLua {
 			armed = false
-			if err := base.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+			if _, err := base.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
 				t.Fatalf("concurrent renew: %v", err)
 			}
 		}
@@ -522,7 +526,7 @@ func TestExpireNodeLeasesPreflightsMalformedLaterCandidateBeforeMutation(t *test
 	first := testNode("game-1", "session-a")
 	later := testNode("game-2", "session-b")
 	for _, node := range []sp.Node{first, later} {
-		if err := dir.RegisterNode(ctx, node); err != nil {
+		if _, err := dir.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -542,7 +546,7 @@ func TestExpireNodeLeasesPreflightsWrongTypeLaterCandidateBeforeMutation(t *test
 	first := testNode("game-1", "session-a")
 	later := testNode("game-2", "session-b")
 	for _, node := range []sp.Node{first, later} {
-		if err := dir.RegisterNode(ctx, node); err != nil {
+		if _, err := dir.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -561,7 +565,7 @@ func TestRedisDirectoryRenewNodeRejectsUnknownStatusWithoutMutation(t *testing.T
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(1020, 0))
 	node := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	raw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
@@ -573,7 +577,7 @@ func TestRedisDirectoryRenewNodeRejectsUnknownStatusWithoutMutation(t *testing.T
 	changed, _ := json.Marshal(stored)
 	client.Set(ctx, NodeKey(node.NodeIdentity), changed, 0)
 	before := captureLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity)
-	if err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err == nil {
+	if _, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err == nil {
 		t.Fatal("expected unknown status error")
 	}
 	requireLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity, before)
@@ -584,7 +588,7 @@ func TestExpireNodeLeasesRejectsUnknownStatusWithoutMutation(t *testing.T) {
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(1030, 0))
 	node := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	raw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
@@ -610,7 +614,7 @@ func TestRedisDirectoryReplaceNodeSessionRejectsOldMetadataMismatch(t *testing.T
 			dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 			server.SetTime(time.Unix(1040, 0))
 			node := testNode("game-1", "session-a")
-			if err := dir.RegisterNode(ctx, node); err != nil {
+			if _, err := dir.RegisterNode(ctx, node); err != nil {
 				t.Fatal(err)
 			}
 			raw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
@@ -631,7 +635,7 @@ func TestRedisDirectoryReplaceNodeSessionRejectsOldMetadataMismatch(t *testing.T
 			before := captureLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity)
 			next := node
 			next.NodeSessionID = "session-b"
-			if _, err := dir.ReplaceNodeSession(ctx, next); err == nil {
+			if _, _, err := dir.ReplaceNodeSession(ctx, next); err == nil {
 				t.Fatal("expected old metadata mismatch error")
 			}
 			requireLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity, before)

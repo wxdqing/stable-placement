@@ -45,45 +45,48 @@ func newNodeRegistry(publisher sp.EventPublisher, config sp.NodeLeaseConfig, now
 	}, nil
 }
 
-func (r *NodeRegistry) RegisterNode(ctx context.Context, node sp.Node) error {
+func (r *NodeRegistry) RegisterNode(ctx context.Context, node sp.Node) (sp.NodeLeaseGrant, error) {
 	if err := normalizeNodeIdentity(&node); err != nil {
-		return err
+		return sp.NodeLeaseGrant{}, err
 	}
 	now := r.now()
 	r.mu.Lock()
 	if existing, ok := r.nodes[node.NodeIdentity]; ok {
 		if existing.NodeSessionID != node.NodeSessionID {
 			r.mu.Unlock()
-			return sp.ErrInvalidNodeSession
+			return sp.NodeLeaseGrant{}, sp.ErrInvalidNodeSession
 		}
 		if existing.Status == sp.NodeStatusOffline || leaseExpired(existing, now) {
 			r.mu.Unlock()
-			return sp.ErrNodeLeaseExpired
+			return sp.NodeLeaseGrant{}, sp.ErrNodeLeaseExpired
 		}
 		r.mu.Unlock()
-		return nil
+		return leaseGrant(existing, now), nil
 	}
 	node.Status = sp.NodeStatusActive
 	node.Lease = r.newLease(now)
 	r.nodes[node.NodeIdentity] = node
 	event := r.nodeEvent(sp.EventNodeRegistered, node, now)
 	r.mu.Unlock()
-	return r.publish(ctx, event)
+	if err := r.publish(ctx, event); err != nil {
+		return sp.NodeLeaseGrant{}, err
+	}
+	return leaseGrant(node, now), nil
 }
 
-func (r *NodeRegistry) RenewNode(_ context.Context, nodeIdentity string, nodeSessionID string) error {
+func (r *NodeRegistry) RenewNode(_ context.Context, nodeIdentity string, nodeSessionID string) (sp.NodeLeaseGrant, error) {
 	now := r.now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	node, ok := r.nodes[nodeIdentity]
 	if !ok || node.Status == sp.NodeStatusOffline {
-		return sp.ErrNodeNotFound
+		return sp.NodeLeaseGrant{}, sp.ErrNodeNotFound
 	}
 	if node.NodeSessionID != nodeSessionID {
-		return sp.ErrInvalidNodeSession
+		return sp.NodeLeaseGrant{}, sp.ErrInvalidNodeSession
 	}
 	if leaseExpired(node, now) {
-		return sp.ErrNodeLeaseExpired
+		return sp.NodeLeaseGrant{}, sp.ErrNodeLeaseExpired
 	}
 	node.Lease.Version++
 	newExpiry := now.Add(time.Duration(node.Lease.TTLMillis) * time.Millisecond).UnixMilli()
@@ -91,7 +94,7 @@ func (r *NodeRegistry) RenewNode(_ context.Context, nodeIdentity string, nodeSes
 		node.Lease.ExpireAtUnixMilli = newExpiry
 	}
 	r.nodes[nodeIdentity] = node
-	return nil
+	return leaseGrant(node, now), nil
 }
 
 func (r *NodeRegistry) UnregisterNode(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
@@ -119,16 +122,16 @@ func (r *NodeRegistry) unregisterNode(nodeIdentity string, nodeSessionID string,
 	return r.nodeEvent(sp.EventNodeUnregistered, node, r.now()), nil
 }
 
-func (r *NodeRegistry) ReplaceNodeSession(ctx context.Context, node sp.Node) (*sp.Node, error) {
+func (r *NodeRegistry) ReplaceNodeSession(ctx context.Context, node sp.Node) (*sp.Node, sp.NodeLeaseGrant, error) {
 	if err := normalizeNodeIdentity(&node); err != nil {
-		return nil, err
+		return nil, sp.NodeLeaseGrant{}, err
 	}
 	now := r.now()
 	r.mu.Lock()
 	old, ok := r.nodes[node.NodeIdentity]
 	if ok && old.NodeSessionID == node.NodeSessionID {
 		r.mu.Unlock()
-		return nil, sp.ErrInvalidNodeSession
+		return nil, sp.NodeLeaseGrant{}, sp.ErrInvalidNodeSession
 	}
 	node.Status = sp.NodeStatusActive
 	node.Lease = r.newLease(now)
@@ -136,9 +139,9 @@ func (r *NodeRegistry) ReplaceNodeSession(ctx context.Context, node sp.Node) (*s
 	event := r.nodeEvent(sp.EventNodeReplaced, node, now)
 	r.mu.Unlock()
 	if err := r.publish(ctx, event); err != nil {
-		return nil, err
+		return nil, sp.NodeLeaseGrant{}, err
 	}
-	return &old, nil
+	return &old, leaseGrant(node, now), nil
 }
 
 func (r *NodeRegistry) ExpireNodeLeases(ctx context.Context, nodeType, nodeGroup string, limit int64) (int, error) {
@@ -329,6 +332,13 @@ func normalizeNodeIdentity(node *sp.Node) error {
 
 func leaseExpired(node sp.Node, now time.Time) bool {
 	return now.UnixMilli() >= node.Lease.ExpireAtUnixMilli
+}
+
+func leaseGrant(node sp.Node, now time.Time) sp.NodeLeaseGrant {
+	return sp.NodeLeaseGrant{
+		Version:    node.Lease.Version,
+		ValidUntil: now.Add(time.UnixMilli(node.Lease.ExpireAtUnixMilli).Sub(now)),
+	}
 }
 
 func groupKey(nodeType string, nodeGroup string) string { return nodeType + "/" + nodeGroup }

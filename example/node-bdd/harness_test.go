@@ -167,7 +167,7 @@ func (h *harness) replaceSession(name string, newSession string) sp.Node {
 	h.t.Helper()
 	node := h.nodes[name]
 	node.NodeSessionID = newSession
-	old, err := h.dir.ReplaceNodeSession(h.ctx, node)
+	old, _, err := h.dir.ReplaceNodeSession(h.ctx, node)
 	h.must(err, "ReplaceNodeSession "+name)
 	h.nodes[name] = node
 	if old != nil {

@@ -63,7 +63,7 @@ func TestRedisDirectoryAllocateLookupRenewAndReleaseRoute(t *testing.T) {
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(500, 0))
 	node := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	placement, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "1", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
@@ -116,7 +116,7 @@ func TestRedisDirectoryPlacementTimestampContract(t *testing.T) {
 	server.SetTime(time.UnixMilli(500123))
 	a, b := testNode("timestamp-a", "session-a"), testNode("timestamp-b", "session-b")
 	for _, node := range []sp.Node{a, b} {
-		if err := dir.RegisterNode(ctx, node); err != nil {
+		if _, err := dir.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -176,7 +176,7 @@ func TestRedisDirectoryPlacementTimestampContract(t *testing.T) {
 
 	next := target
 	next.NodeSessionID = "replacement"
-	if _, err := dir.ReplaceNodeSession(ctx, next); err != nil {
+	if _, _, err := dir.ReplaceNodeSession(ctx, next); err != nil {
 		t.Fatal(err)
 	}
 	server.SetTime(time.UnixMilli(503123))
@@ -195,7 +195,7 @@ func TestRedisDirectoryReleaseAndReallocateTimestampContract(t *testing.T) {
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: 10 * time.Second})
 	server.SetTime(time.UnixMilli(600123))
 	node := testNode("timestamp-release", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	first, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "timestamp-release", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
@@ -237,7 +237,7 @@ func TestRedisDirectoryRecoverReleasedReturnsNotRecoverableV2(t *testing.T) {
 	server.SetTime(time.Unix(550, 0))
 	a, b := testNode("game-1", "session-a"), testNode("game-2", "session-b")
 	for _, node := range []sp.Node{a, b} {
-		if err := dir.RegisterNode(ctx, node); err != nil {
+		if _, err := dir.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -290,7 +290,7 @@ func TestRedisDirectoryLookupRejectsExpiredOnArrival(t *testing.T) {
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: 20 * time.Millisecond})
 	server.SetTime(time.Unix(600, 0))
 	node := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	p, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "slow", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
@@ -313,7 +313,7 @@ func TestRedisDirectoryValidUntilConservativelyIncludesResponseDelay(t *testing.
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: ttl})
 	server.SetTime(time.Unix(610, 0))
 	node := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	p, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "delayed", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
@@ -340,7 +340,7 @@ func TestRedisDirectoryTransferAndRecoverUseCurrentTargetSession(t *testing.T) {
 	server.SetTime(time.Unix(700, 0))
 	a, b := testNode("game-1", "session-a"), testNode("game-2", "session-b")
 	for _, node := range []sp.Node{a, b} {
-		if err := dir.RegisterNode(ctx, node); err != nil {
+		if _, err := dir.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -360,7 +360,7 @@ func TestRedisDirectoryTransferAndRecoverUseCurrentTargetSession(t *testing.T) {
 		t.Fatalf("healthy recover = %v", err)
 	}
 	server.SetTime(time.UnixMilli(700500))
-	if err := dir.RenewNode(ctx, p.NodeIdentity, p.OwnerNodeSessionID); err != nil {
+	if _, err := dir.RenewNode(ctx, p.NodeIdentity, p.OwnerNodeSessionID); err != nil {
 		t.Fatal(err)
 	}
 	server.SetTime(time.Unix(701, 0))
@@ -375,7 +375,7 @@ func TestRedisDirectoryRenewAuditWrongTypeDoesNotChangeBusinessState(t *testing.
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(900, 0))
 	node := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	p, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "audit", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
@@ -401,7 +401,7 @@ func TestRedisDirectoryTransferSequenceBoundaryIsAtomic(t *testing.T) {
 	server.SetTime(time.Unix(910, 0))
 	a, b := testNode("game-1", "session-a"), testNode("game-2", "session-b")
 	for _, node := range []sp.Node{a, b} {
-		if err := dir.RegisterNode(ctx, node); err != nil {
+		if _, err := dir.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -430,7 +430,7 @@ func TestRedisDirectoryReleaseRejectsOwnerNodeKeyMismatchWithoutMutation(t *test
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(1050, 0))
 	node := testNode("game-1", "session-a")
-	if err := dir.RegisterNode(ctx, node); err != nil {
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	p, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "release-metadata", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
@@ -459,7 +459,7 @@ func TestRedisDirectoryTransferRecoverRejectTargetMetadataChangedBeforeEval(t *t
 			server.SetTime(time.Unix(1060, 0))
 			a, b := testNode("game-1", "session-a"), testNode("game-2", "session-b")
 			for _, node := range []sp.Node{a, b} {
-				if err := base.RegisterNode(ctx, node); err != nil {
+				if _, err := base.RegisterNode(ctx, node); err != nil {
 					t.Fatal(err)
 				}
 			}

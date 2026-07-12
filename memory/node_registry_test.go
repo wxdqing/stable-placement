@@ -106,7 +106,7 @@ func TestNodeRegistryRoundsPositiveSubMillisecondTTLUp(t *testing.T) {
 	registry := newTestRegistry(t, clock, nil, 500*time.Microsecond)
 	node := testNode("game-1", "session-a")
 
-	if err := registry.RegisterNode(context.Background(), node); err != nil {
+	if _, err := registry.RegisterNode(context.Background(), node); err != nil {
 		t.Fatalf("RegisterNode error: %v", err)
 	}
 	got, ok := registry.Node(node.NodeIdentity)
@@ -125,7 +125,7 @@ func TestNodeRegistryCapsTTLAtLargestWholeMillisecond(t *testing.T) {
 	}
 	node := testNode("game-1", "session-a")
 
-	if err := registry.RegisterNode(context.Background(), node); err != nil {
+	if _, err := registry.RegisterNode(context.Background(), node); err != nil {
 		t.Fatalf("RegisterNode error: %v", err)
 	}
 	got, ok := registry.Node(node.NodeIdentity)
@@ -144,7 +144,7 @@ func TestNodeRegistryRegisterLeaseRules(t *testing.T) {
 	node := testNode("game-1", "session-a")
 	node.Status = sp.NodeStatusDraining
 
-	if err := registry.RegisterNode(ctx, node); err != nil {
+	if _, err := registry.RegisterNode(ctx, node); err != nil {
 		t.Fatalf("RegisterNode error: %v", err)
 	}
 	got, ok := registry.Node(node.NodeIdentity)
@@ -153,7 +153,7 @@ func TestNodeRegistryRegisterLeaseRules(t *testing.T) {
 	}
 
 	clock.Advance(time.Second)
-	if err := registry.RegisterNode(ctx, node); err != nil {
+	if _, err := registry.RegisterNode(ctx, node); err != nil {
 		t.Fatalf("idempotent RegisterNode error: %v", err)
 	}
 	idempotent, _ := registry.Node(node.NodeIdentity)
@@ -166,7 +166,7 @@ func TestNodeRegistryRegisterLeaseRules(t *testing.T) {
 	offline.Status = sp.NodeStatusOffline
 	registry.nodes[node.NodeIdentity] = offline
 	registry.mu.Unlock()
-	if err := registry.RegisterNode(ctx, node); !errors.Is(err, sp.ErrNodeLeaseExpired) {
+	if _, err := registry.RegisterNode(ctx, node); !errors.Is(err, sp.ErrNodeLeaseExpired) {
 		t.Fatalf("offline RegisterNode err = %v", err)
 	}
 
@@ -176,7 +176,7 @@ func TestNodeRegistryRegisterLeaseRules(t *testing.T) {
 	expired.Lease.ExpireAtUnixMilli = clock.Now().UnixMilli()
 	registry.nodes[node.NodeIdentity] = expired
 	registry.mu.Unlock()
-	if err := registry.RegisterNode(ctx, node); !errors.Is(err, sp.ErrNodeLeaseExpired) {
+	if _, err := registry.RegisterNode(ctx, node); !errors.Is(err, sp.ErrNodeLeaseExpired) {
 		t.Fatalf("expired RegisterNode err = %v", err)
 	}
 }
@@ -190,7 +190,7 @@ func TestNodeRegistryIdentityMismatchDoesNotWriteStateOrEvents(t *testing.T) {
 		{NodeType: "game", NodeGroup: "default", NodeName: "game-1", NodeSessionID: "s"},
 		{NodeType: "game", NodeGroup: "default", NodeName: "game-1", NodeIdentity: "wrong", NodeSessionID: "s"},
 	} {
-		if err := registry.RegisterNode(context.Background(), node); err == nil {
+		if _, err := registry.RegisterNode(context.Background(), node); err == nil {
 			t.Fatalf("RegisterNode(%+v) succeeded", node)
 		}
 	}
@@ -199,7 +199,7 @@ func TestNodeRegistryIdentityMismatchDoesNotWriteStateOrEvents(t *testing.T) {
 	}
 
 	valid := testNode("game-1", "session-a")
-	if err := registry.RegisterNode(context.Background(), valid); err != nil {
+	if _, err := registry.RegisterNode(context.Background(), valid); err != nil {
 		t.Fatal(err)
 	}
 	before, _ := registry.Node(valid.NodeIdentity)
@@ -207,7 +207,7 @@ func TestNodeRegistryIdentityMismatchDoesNotWriteStateOrEvents(t *testing.T) {
 	mismatch := valid
 	mismatch.NodeIdentity = "wrong"
 	mismatch.NodeSessionID = "session-b"
-	if _, err := registry.ReplaceNodeSession(context.Background(), mismatch); err == nil {
+	if _, _, err := registry.ReplaceNodeSession(context.Background(), mismatch); err == nil {
 		t.Fatal("identity-mismatch ReplaceNodeSession succeeded")
 	}
 	after, _ := registry.Node(valid.NodeIdentity)
@@ -222,12 +222,12 @@ func TestNodeRegistryRenewLeaseRules(t *testing.T) {
 	clock := newFakeClock(start)
 	registry := newTestRegistry(t, clock, nil, 10*time.Second)
 	node := testNode("game-1", "session-a")
-	if err := registry.RegisterNode(ctx, node); err != nil {
+	if _, err := registry.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 
 	clock.Advance(2 * time.Second)
-	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+	if _, err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
 		t.Fatalf("active RenewNode error: %v", err)
 	}
 	renewed, _ := registry.Node(node.NodeIdentity)
@@ -242,7 +242,7 @@ func TestNodeRegistryRenewLeaseRules(t *testing.T) {
 	registry.nodes[node.NodeIdentity] = draining
 	registry.mu.Unlock()
 	clock.Advance(time.Second)
-	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+	if _, err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
 		t.Fatalf("draining RenewNode error: %v", err)
 	}
 	renewed, _ = registry.Node(node.NodeIdentity)
@@ -250,7 +250,7 @@ func TestNodeRegistryRenewLeaseRules(t *testing.T) {
 		t.Fatalf("draining renewed lease = %+v", renewed.Lease)
 	}
 
-	if err := registry.RenewNode(ctx, node.NodeIdentity, "old-session"); !errors.Is(err, sp.ErrInvalidNodeSession) {
+	if _, err := registry.RenewNode(ctx, node.NodeIdentity, "old-session"); !errors.Is(err, sp.ErrInvalidNodeSession) {
 		t.Fatalf("old session err = %v", err)
 	}
 	registry.mu.Lock()
@@ -258,7 +258,7 @@ func TestNodeRegistryRenewLeaseRules(t *testing.T) {
 	offline.Status = sp.NodeStatusOffline
 	registry.nodes[node.NodeIdentity] = offline
 	registry.mu.Unlock()
-	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
+	if _, err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
 		t.Fatalf("offline err = %v", err)
 	}
 	registry.mu.Lock()
@@ -267,7 +267,7 @@ func TestNodeRegistryRenewLeaseRules(t *testing.T) {
 	expired.Lease.ExpireAtUnixMilli = clock.Now().UnixMilli()
 	registry.nodes[node.NodeIdentity] = expired
 	registry.mu.Unlock()
-	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeLeaseExpired) {
+	if _, err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeLeaseExpired) {
 		t.Fatalf("expired err = %v", err)
 	}
 }
@@ -277,11 +277,11 @@ func TestNodeRegistryConcurrentRenewDoesNotMoveExpiryBackward(t *testing.T) {
 	clock := newFakeClock(time.Unix(300, 0))
 	registry := newTestRegistry(t, clock, nil, time.Minute)
 	node := testNode("game-1", "session-a")
-	if err := registry.RegisterNode(ctx, node); err != nil {
+	if _, err := registry.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	clock.Set(time.Unix(350, 0))
-	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+	if _, err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
 		t.Fatal(err)
 	}
 	wantExpiry, _ := registry.Node(node.NodeIdentity)
@@ -291,7 +291,7 @@ func TestNodeRegistryConcurrentRenewDoesNotMoveExpiryBackward(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+			if _, err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
 				t.Errorf("RenewNode error: %v", err)
 			}
 		}()
@@ -310,7 +310,7 @@ func TestNodeRegistryRegisterCannotBypassReplaceSessionEvent(t *testing.T) {
 	registry := newTestRegistry(t, clock, publisher, 15*time.Second)
 	oldNode := testNode("game-1", "session-a")
 	oldNode.Address = "old"
-	if err := registry.RegisterNode(ctx, oldNode); err != nil {
+	if _, err := registry.RegisterNode(ctx, oldNode); err != nil {
 		t.Fatal(err)
 	}
 	if err := registry.MarkNodeInvalid(ctx, oldNode.NodeType, oldNode.NodeGroup, oldNode.NodeName); err != nil {
@@ -319,7 +319,7 @@ func TestNodeRegistryRegisterCannotBypassReplaceSessionEvent(t *testing.T) {
 	eventsBefore := len(publisher.Events())
 	otherSession := oldNode
 	otherSession.NodeSessionID = "session-b"
-	if err := registry.RegisterNode(ctx, otherSession); !errors.Is(err, sp.ErrInvalidNodeSession) {
+	if _, err := registry.RegisterNode(ctx, otherSession); !errors.Is(err, sp.ErrInvalidNodeSession) {
 		t.Fatalf("different-session RegisterNode err = %v", err)
 	}
 	unchanged, _ := registry.Node(oldNode.NodeIdentity)
@@ -329,7 +329,7 @@ func TestNodeRegistryRegisterCannotBypassReplaceSessionEvent(t *testing.T) {
 
 	same := oldNode
 	same.Address = "changed"
-	if _, err := registry.ReplaceNodeSession(ctx, same); !errors.Is(err, sp.ErrInvalidNodeSession) {
+	if _, _, err := registry.ReplaceNodeSession(ctx, same); !errors.Is(err, sp.ErrInvalidNodeSession) {
 		t.Fatalf("same-session ReplaceNodeSession err = %v", err)
 	}
 	unchanged, _ = registry.Node(oldNode.NodeIdentity)
@@ -341,7 +341,7 @@ func TestNodeRegistryRegisterCannotBypassReplaceSessionEvent(t *testing.T) {
 	replacement := oldNode
 	replacement.NodeSessionID = "session-b"
 	replacement.Status = sp.NodeStatusDraining
-	returnedOld, err := registry.ReplaceNodeSession(ctx, replacement)
+	returnedOld, _, err := registry.ReplaceNodeSession(ctx, replacement)
 	if err != nil {
 		t.Fatalf("ReplaceNodeSession error: %v", err)
 	}
@@ -365,7 +365,7 @@ func TestNodeRegistryExpireLeasesIsBoundedAndIdempotent(t *testing.T) {
 	registry := newTestRegistry(t, clock, publisher, time.Second)
 	for i, name := range []string{"game-1", "game-2", "game-3"} {
 		node := testNode(name, "session-a")
-		if err := registry.RegisterNode(ctx, node); err != nil {
+		if _, err := registry.RegisterNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 		if i == 1 {
@@ -417,7 +417,7 @@ func TestNodeRegistryDrainRejectsExpiredOfflineTombstoneWithoutMutation(t *testi
 	publisher := &recordingPublisher{}
 	registry := newTestRegistry(t, clock, publisher, time.Second)
 	node := testNode("game-1", "session-a")
-	if err := registry.RegisterNode(ctx, node); err != nil {
+	if _, err := registry.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	if err := registry.MarkNodeInvalid(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
@@ -463,7 +463,7 @@ func TestNodeRegistryDrainRequiresInvalidMarkForExpiredOfflineTombstone(t *testi
 	publisher := &recordingPublisher{}
 	registry := newTestRegistry(t, clock, publisher, time.Second)
 	node := testNode("game-1", "session-a")
-	if err := registry.RegisterNode(ctx, node); err != nil {
+	if _, err := registry.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	clock.Advance(time.Second)
@@ -487,11 +487,11 @@ func TestNodeRegistryRenewedLeaseIsNotExpiredByOldDeadline(t *testing.T) {
 	clock := newFakeClock(time.Unix(700, 0))
 	registry := newTestRegistry(t, clock, nil, 10*time.Second)
 	node := testNode("game-1", "session-a")
-	if err := registry.RegisterNode(ctx, node); err != nil {
+	if _, err := registry.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	clock.Advance(9 * time.Second)
-	if err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+	if _, err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
 		t.Fatal(err)
 	}
 	clock.Advance(time.Second)
