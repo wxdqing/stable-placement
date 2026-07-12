@@ -55,10 +55,10 @@ STABLE_PLACEMENT_REDIS_ADDR=127.0.0.1:6379 \
 | D3 | Renew 校验 Owner/session/version（Rule 5） | Renew | `placement_test.go` | [x] |
 | D4 | 旧 session / 非 Owner Renew 失败 | Rule 5 | `placement_test.go` | [x] |
 | D5 | Release 后 Lookup NotFound，可重新 Allocate | Release | `placement_test.go` | [x] |
-| D6 | Release 后 Recover 返回 NotRecoverable | Recover 语义 | `placement_test.go` | [x] |
+| D6 | 健康 Owner 拒绝 Recover，Placement 保持不变 | Recover 语义 | `placement_test.go` | [x] |
 | D7 | Transfer 显式更换 Owner，推进 Version | Transfer | `placement_test.go` | [x] |
-| D8 | Node Lease 到期后 Lookup NotFound，Placement 保留并可 Recover | Node Lease/Recover | `placement_test.go` | [x] |
-| D9 | ExpireNodeLeases 只推进 Node Offline，不改写 Placement | Node Lease | `placement_test.go` | [x] |
+| D8 | Node Lease 到期后同节点多条 Route 逻辑失效，Placement 保留 | Node Lease | `placement_test.go` | [x] |
+| D9 | Node Lease 到期后同 session 仍可 Release 保留的 Placement | Release | `placement_test.go` | [x] |
 | D10 | Exists 仅对 Active Placement 返回 true | Exists | `placement_test.go` | [x] |
 
 ## E. Session 与节点替换
@@ -66,7 +66,7 @@ STABLE_PLACEMENT_REDIS_ADDR=127.0.0.1:6379 \
 | ID | 场景 | 规则来源 | 测试文件 | 状态 |
 |----|------|----------|----------|------|
 | E1 | ReplaceNodeSession 后旧 session Renew 失败 | NodeReplaced | `session_test.go` | [x] |
-| E2 | ReplaceNodeSession 后旧 session Release 失败 | Rule 5 | `session_test.go` | [x] |
+| E2 | ReplaceNodeSession 后新 session 不继承旧 Placement | NodeReplaced | `session_test.go` | [x] |
 | E3 | UnregisterNode 错误 session 失败 | NodeRegistry | `session_test.go` | [x] |
 
 ## F. 边界与负向
@@ -77,6 +77,7 @@ STABLE_PLACEMENT_REDIS_ADDR=127.0.0.1:6379 \
 | F2 | 全部节点 Invalid 时 Allocate 失败 | InvalidNodeGroup | `negative_test.go` | [x] |
 | F3 | Transfer 到无效/ draining 节点失败 | Transfer | `negative_test.go` | [x] |
 | F4 | Version 冲突时 Renew/Release 失败 | 并发校验 | `negative_test.go` | [x] |
+| F5 | Owner 不可用时 Allocate 不自动重分配 | Allocate | `negative_test.go` | [x] |
 
 ---
 
@@ -90,7 +91,7 @@ STABLE_PLACEMENT_REDIS_ADDR=127.0.0.1:6379 \
 
 ## 验收
 
-- [x] `go test -tags=integration ./example/node-bdd/ -v` 全部通过（31 场景）
+- [x] 最终验收：`8 Redis BDD subscenarios + 34 node-BDD top-level scenarios`
 
 ## Node Lease v2 部署门禁
 

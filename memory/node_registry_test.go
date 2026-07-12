@@ -411,6 +411,77 @@ func TestNodeRegistryExpireLeasesIsBoundedAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestNodeRegistryDrainRejectsExpiredOfflineTombstoneWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeClock(time.Unix(650, 0))
+	publisher := &recordingPublisher{}
+	registry := newTestRegistry(t, clock, publisher, time.Second)
+	node := testNode("game-1", "session-a")
+	if err := registry.RegisterNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.MarkNodeInvalid(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	if count, err := registry.ExpireNodeLeases(ctx, node.NodeType, node.NodeGroup, 1); err != nil || count != 1 {
+		t.Fatalf("ExpireNodeLeases = %d, %v", count, err)
+	}
+
+	beforeNode, ok := registry.Node(node.NodeIdentity)
+	if !ok || beforeNode.Status != sp.NodeStatusOffline {
+		t.Fatalf("expired node = %+v, ok=%v", beforeNode, ok)
+	}
+	beforeEvents := publisher.Events()
+	if err := registry.DrainNode(ctx, node.NodeIdentity); !errors.Is(err, sp.ErrNodeNotFound) {
+		t.Fatalf("DrainNode err = %v", err)
+	}
+	afterNode, ok := registry.Node(node.NodeIdentity)
+	if !ok || afterNode != beforeNode {
+		t.Fatalf("node after DrainNode = %+v, want unchanged %+v, ok=%v", afterNode, beforeNode, ok)
+	}
+	afterEvents := publisher.Events()
+	if len(afterEvents) != len(beforeEvents) {
+		t.Fatalf("events after DrainNode = %+v, want unchanged %+v", afterEvents, beforeEvents)
+	}
+	for _, event := range afterEvents {
+		if event.Type == sp.EventNodeDraining {
+			t.Fatalf("unexpected NodeDraining event: %+v", event)
+		}
+	}
+	if count, err := registry.ExpireNodeLeases(ctx, node.NodeType, node.NodeGroup, 1); err != nil || count != 0 {
+		t.Fatalf("repeated ExpireNodeLeases = %d, %v", count, err)
+	}
+	if events := publisher.Events(); len(events) != len(beforeEvents) {
+		t.Fatalf("events after repeated expiry = %+v, want unchanged %+v", events, beforeEvents)
+	}
+}
+
+func TestNodeRegistryDrainRequiresInvalidMarkForExpiredOfflineTombstone(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeClock(time.Unix(675, 0))
+	publisher := &recordingPublisher{}
+	registry := newTestRegistry(t, clock, publisher, time.Second)
+	node := testNode("game-1", "session-a")
+	if err := registry.RegisterNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	if count, err := registry.ExpireNodeLeases(ctx, node.NodeType, node.NodeGroup, 1); err != nil || count != 1 {
+		t.Fatalf("ExpireNodeLeases = %d, %v", count, err)
+	}
+
+	beforeNode, _ := registry.Node(node.NodeIdentity)
+	beforeEvents := publisher.Events()
+	if err := registry.DrainNode(ctx, node.NodeIdentity); !errors.Is(err, sp.ErrNodeNotInvalid) {
+		t.Fatalf("DrainNode err = %v", err)
+	}
+	afterNode, ok := registry.Node(node.NodeIdentity)
+	if !ok || afterNode != beforeNode || len(publisher.Events()) != len(beforeEvents) {
+		t.Fatalf("DrainNode changed unmarked tombstone: before=%+v after=%+v ok=%v events=%+v", beforeNode, afterNode, ok, publisher.Events())
+	}
+}
+
 func TestNodeRegistryRenewedLeaseIsNotExpiredByOldDeadline(t *testing.T) {
 	ctx := context.Background()
 	clock := newFakeClock(time.Unix(700, 0))

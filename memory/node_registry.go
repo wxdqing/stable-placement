@@ -202,6 +202,10 @@ func (r *NodeRegistry) DrainNode(ctx context.Context, nodeIdentity string) error
 		r.mu.Unlock()
 		return sp.ErrNodeNotInvalid
 	}
+	if node.Status == sp.NodeStatusOffline {
+		r.mu.Unlock()
+		return sp.ErrNodeNotFound
+	}
 	node.Status = sp.NodeStatusDraining
 	r.nodes[nodeIdentity] = node
 	event := r.nodeEvent(sp.EventNodeDraining, node, r.now())
