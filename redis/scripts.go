@@ -22,6 +22,33 @@ local function expect_type(key, expected, label)
 	return nil
 end
 
+local function read_counter(key, label)
+	local raw = redis.call("GET", key)
+	if not raw then
+		return "0", nil
+	end
+	if not string.match(raw, "^%d+$") then
+		return nil, redis.error_reply("INVALID_COUNTER " .. label .. " must be a non-negative decimal")
+	end
+	local normalized = string.gsub(raw, "^0+", "")
+	if normalized == "" then
+		normalized = "0"
+	end
+	local maximum = "9223372036854775807"
+	if #normalized > #maximum or (#normalized == #maximum and normalized >= maximum) then
+		return nil, redis.error_reply("INVALID_COUNTER " .. label .. " must be less than " .. maximum)
+	end
+	return normalized, nil
+end
+
+local function decimal_mod(value, divisor)
+	local remainder = 0
+	for index = 1, #value do
+		remainder = (remainder * 10 + tonumber(string.sub(value, index, index))) % divisor
+	end
+	return remainder
+end
+
 local type_error = expect_type(KEYS[1], "string", "placement")
 	or expect_type(KEYS[2], "set", "nodes")
 	or expect_type(KEYS[3], "set", "invalid_nodes")
@@ -75,8 +102,15 @@ if #effective == 0 then
 	return "no_available_node"
 end
 
-local cursor = tonumber(redis.call("GET", KEYS[4]) or "0")
-local chosen = effective[(cursor % #effective) + 1]
+local cursor, counter_error = read_counter(KEYS[4], "round_robin")
+if counter_error then
+	return counter_error
+end
+local _, sequence_error = read_counter(KEYS[6], "sequence")
+if sequence_error then
+	return sequence_error
+end
+local chosen = effective[decimal_mod(cursor, #effective) + 1]
 type_error = expect_type(chosen["PlacementNodeKey"], "zset", "new_node_index")
 if type_error then
 	return type_error

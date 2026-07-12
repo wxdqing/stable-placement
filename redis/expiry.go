@@ -25,19 +25,20 @@ end
 return redis.call("ZREM", KEYS[2], ARGV[1])
 `
 
+const maxExpireScanRounds = 100
+
 func (d *Directory) ExpireDue(ctx context.Context, now time.Time, limit int64) (int, error) {
 	if limit <= 0 {
 		return 0, nil
 	}
 	expired := 0
-	skipped := make(map[string]struct{})
-	for scan := 0; scan < 100 && int64(expired) < limit; scan++ {
-		count := limit - int64(expired) + int64(len(skipped))
+	min := "-inf"
+	for scan := 0; scan < maxExpireScanRounds && int64(expired) < limit; scan++ {
 		values, err := d.client.ZRangeByScoreWithScores(ctx, LeaseExpireKey(), &goredis.ZRangeBy{
-			Min:    "-inf",
+			Min:    min,
 			Max:    strconv.FormatInt(now.UnixMilli(), 10),
 			Offset: 0,
-			Count:  count,
+			Count:  limit,
 		}).Result()
 		if err != nil {
 			return expired, err
@@ -46,34 +47,31 @@ func (d *Directory) ExpireDue(ctx context.Context, now time.Time, limit int64) (
 			break
 		}
 
-		progressed := false
 		for _, value := range values {
+			if int64(expired) == limit {
+				break
+			}
 			rawKey, ok := value.Member.(string)
 			if !ok {
-				continue
-			}
-			if _, ok := skipped[rawKey]; ok {
 				continue
 			}
 			key := sp.GrainKey(rawKey)
 			placement, err := d.getPlacement(ctx, key)
 			if errors.Is(err, sp.ErrPlacementNotFound) {
-				removed, cleanupErr := d.cleanupStaleLease(ctx, key, value.Score)
+				_, cleanupErr := d.cleanupStaleLease(ctx, key, value.Score)
 				if cleanupErr != nil {
 					return expired, cleanupErr
 				}
-				progressed = progressed || removed
 				continue
 			}
 			if err != nil {
 				return expired, err
 			}
 			if placement.Status != sp.PlacementStatusActive {
-				removed, cleanupErr := d.cleanupStaleLease(ctx, key, value.Score)
+				_, cleanupErr := d.cleanupStaleLease(ctx, key, value.Score)
 				if cleanupErr != nil {
 					return expired, cleanupErr
 				}
-				progressed = progressed || removed
 				continue
 			}
 
@@ -84,26 +82,21 @@ func (d *Directory) ExpireDue(ctx context.Context, now time.Time, limit int64) (
 			})
 			if err == nil {
 				expired++
-				progressed = true
 				continue
 			}
 			if errors.Is(err, sp.ErrPlacementNotFound) {
-				removed, cleanupErr := d.cleanupStaleLease(ctx, key, value.Score)
+				_, cleanupErr := d.cleanupStaleLease(ctx, key, value.Score)
 				if cleanupErr != nil {
 					return expired, cleanupErr
 				}
-				progressed = progressed || removed
 				continue
 			}
 			if errors.Is(err, sp.ErrVersionConflict) || errors.Is(err, sp.ErrLeaseNotExpired) {
-				skipped[rawKey] = struct{}{}
 				continue
 			}
 			return expired, err
 		}
-		if !progressed {
-			break
-		}
+		min = "(" + strconv.FormatFloat(values[len(values)-1].Score, 'f', -1, 64)
 	}
 	return expired, nil
 }

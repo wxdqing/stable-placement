@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,6 +24,25 @@ type getHookClient struct {
 type blockingZRangeClient struct {
 	goredis.UniversalClient
 	started chan struct{}
+}
+
+type zRangeCountClient struct {
+	goredis.UniversalClient
+	mu     sync.Mutex
+	counts []int64
+}
+
+func (c *zRangeCountClient) ZRangeByScoreWithScores(ctx context.Context, key string, opt *goredis.ZRangeBy) *goredis.ZSliceCmd {
+	c.mu.Lock()
+	c.counts = append(c.counts, opt.Count)
+	c.mu.Unlock()
+	return c.UniversalClient.ZRangeByScoreWithScores(ctx, key, opt)
+}
+
+func (c *zRangeCountClient) Counts() []int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]int64(nil), c.counts...)
 }
 
 func (c blockingZRangeClient) ZRangeByScoreWithScores(ctx context.Context, key string, opt *goredis.ZRangeBy) *goredis.ZSliceCmd {
@@ -355,6 +376,71 @@ func TestRedisDirectoryAllocateWrongTypePreflightKeepsAllState(t *testing.T) {
 	}
 }
 
+func TestRedisDirectoryAllocateCounterPreflightKeepsAllState(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		key   func() string
+		label string
+		value string
+	}{
+		{name: "round-robin non-integer", key: func() string { return StrategyRoundRobinKey("game", "default") }, label: "round_robin", value: "not-an-integer"},
+		{name: "round-robin int64 max", key: func() string { return StrategyRoundRobinKey("game", "default") }, label: "round_robin", value: "9223372036854775807"},
+		{name: "sequence non-integer", key: SequenceKey, label: "sequence", value: "not-an-integer"},
+		{name: "sequence int64 max", key: SequenceKey, label: "sequence", value: "9223372036854775807"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir, client := newTestDirectory(t)
+			oldNode := registerTestNode(t, dir, "game-1", "session-a")
+			newNode := registerTestNode(t, dir, "game-2", "session-b")
+			old := allocateExpiringPlacement(t, dir, "invalid-counter-"+test.name)
+			waitUntilExpired(old.LeaseExpireAt)
+			if err := client.Set(ctx, test.key(), test.value, 0).Err(); err != nil {
+				t.Fatal(err)
+			}
+
+			oldRaw := client.Get(ctx, PlacementKey(old.GrainKey)).Val()
+			oldNodeScore := client.ZScore(ctx, PlacementNodeKey(oldNode.NodeIdentity), old.GrainKey.String()).Val()
+			leaseScore := client.ZScore(ctx, LeaseExpireKey(), old.GrainKey.String()).Val()
+			roundRobin := client.Get(ctx, StrategyRoundRobinKey("game", "default")).Val()
+			sequence := client.Get(ctx, SequenceKey()).Val()
+			eventsBefore := client.XLen(ctx, EventsStreamKey()).Val()
+
+			_, err := dir.Allocate(ctx, sp.AllocateCommand{
+				GrainID:         old.GrainID,
+				Kind:            old.Kind,
+				TargetNodeType:  "game",
+				TargetNodeGroup: "default",
+				LeaseTTL:        time.Minute,
+			})
+			if err == nil || !strings.Contains(err.Error(), "INVALID_COUNTER "+test.label) {
+				t.Fatalf("Allocate error = %v, want INVALID_COUNTER %s", err, test.label)
+			}
+			if raw := client.Get(ctx, PlacementKey(old.GrainKey)).Val(); raw != oldRaw {
+				t.Fatalf("placement raw changed after error")
+			}
+			if score := client.ZScore(ctx, PlacementNodeKey(oldNode.NodeIdentity), old.GrainKey.String()).Val(); score != oldNodeScore {
+				t.Fatalf("old node score = %v, want %v", score, oldNodeScore)
+			}
+			if score := client.ZScore(ctx, LeaseExpireKey(), old.GrainKey.String()).Val(); score != leaseScore {
+				t.Fatalf("lease score = %v, want %v", score, leaseScore)
+			}
+			if value := client.Get(ctx, StrategyRoundRobinKey("game", "default")).Val(); value != roundRobin {
+				t.Fatalf("round-robin cursor = %q, want %q", value, roundRobin)
+			}
+			if value := client.Get(ctx, SequenceKey()).Val(); value != sequence {
+				t.Fatalf("sequence = %q, want %q", value, sequence)
+			}
+			if events := client.XLen(ctx, EventsStreamKey()).Val(); events != eventsBefore {
+				t.Fatalf("outbox length = %d, want %d", events, eventsBefore)
+			}
+			if _, err := client.ZScore(ctx, PlacementNodeKey(newNode.NodeIdentity), old.GrainKey.String()).Result(); !errors.Is(err, goredis.Nil) {
+				t.Fatalf("new node index err = %v, want redis.Nil", err)
+			}
+		})
+	}
+}
+
 func TestRedisDirectoryExpireDueHonorsBatch(t *testing.T) {
 	ctx := context.Background()
 	dir, client := newTestDirectory(t)
@@ -443,6 +529,71 @@ func TestRedisDirectoryExpireDueCleansStaleMembersAndFillsBatch(t *testing.T) {
 	for _, key := range []sp.GrainKey{missingKey, nonActive.GrainKey} {
 		if _, err := client.ZScore(ctx, LeaseExpireKey(), key.String()).Result(); !errors.Is(err, goredis.Nil) {
 			t.Fatalf("stale member %q err = %v, want redis.Nil", key, err)
+		}
+	}
+}
+
+func TestRedisDirectoryExpireDueKeepsEachQueryBoundedWhileAdvancingPastSkipped(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	recording := &zRangeCountClient{UniversalClient: base}
+	dir, err := NewDirectory(recording, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerTestNode(t, dir, "game-1", "session-a")
+
+	now := time.Now()
+	missingKey, _ := sp.NewGrainKey("Player", "bounded-missing")
+	if err := base.ZAdd(ctx, LeaseExpireKey(), goredis.Z{
+		Score:  float64(now.Add(-4 * time.Second).UnixMilli()),
+		Member: missingKey.String(),
+	}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 2; index++ {
+		placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+			GrainID:         "bounded-skipped-" + strconv.Itoa(index),
+			Kind:            "Player",
+			TargetNodeType:  "game",
+			TargetNodeGroup: "default",
+			LeaseTTL:        time.Minute,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := base.ZAdd(ctx, LeaseExpireKey(), goredis.Z{
+			Score:  float64(now.Add(time.Duration(index-3) * time.Second).UnixMilli()),
+			Member: placement.GrainKey.String(),
+		}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	due := allocateExpiringPlacement(t, dir, "bounded-real-due")
+	scanNow := due.LeaseExpireAt.Add(time.Millisecond)
+
+	count, err := dir.ExpireDue(ctx, scanNow, 2)
+	if err != nil {
+		t.Fatalf("ExpireDue error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("ExpireDue count = %d, want 1", count)
+	}
+	stored, err := dir.getPlacement(ctx, due.GrainKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != sp.PlacementStatusExpired {
+		t.Fatalf("due status = %q, want expired", stored.Status)
+	}
+	counts := recording.Counts()
+	if len(counts) < 2 {
+		t.Fatalf("query counts = %v, want multiple cursor scans", counts)
+	}
+	for _, queryCount := range counts {
+		if queryCount > 2 {
+			t.Fatalf("query Count = %d, want <= 2; all counts = %v", queryCount, counts)
 		}
 	}
 }
