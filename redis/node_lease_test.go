@@ -4,12 +4,43 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 	sp "github.com/wxdqing/stable-placement"
 )
+
+type leaseBatchSnapshot struct {
+	firstRaw     string
+	leaseMembers []goredis.Z
+	nodeMembers  []string
+	eventCount   int64
+}
+
+func captureLeaseBatchSnapshot(t *testing.T, ctx context.Context, client *goredis.Client, firstIdentity string) leaseBatchSnapshot {
+	t.Helper()
+	members, err := client.ZRangeWithScores(ctx, NodeLeaseKey("game", "default"), 0, -1).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := client.SMembers(ctx, NodesKey("game", "default")).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(nodes)
+	return leaseBatchSnapshot{firstRaw: client.Get(ctx, NodeKey(firstIdentity)).Val(), leaseMembers: members, nodeMembers: nodes, eventCount: client.XLen(ctx, EventsStreamKey()).Val()}
+}
+
+func requireLeaseBatchSnapshot(t *testing.T, ctx context.Context, client *goredis.Client, firstIdentity string, want leaseBatchSnapshot) {
+	t.Helper()
+	got := captureLeaseBatchSnapshot(t, ctx, client, firstIdentity)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("batch snapshot changed\ngot:  %#v\nwant: %#v", got, want)
+	}
+}
 
 type nodeLeaseEvalHookClient struct {
 	goredis.UniversalClient
@@ -262,5 +293,129 @@ func TestExpireNodeLeasesStaleCandidateDoesNotExpireRenewedLease(t *testing.T) {
 		if event.Values["type"] == string(sp.EventNodeLeaseExpired) {
 			t.Fatal("stale scan wrote expiry event")
 		}
+	}
+}
+
+func TestExpireNodeLeasesPreflightsMalformedLaterCandidateBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
+	server.SetTime(time.Unix(1000, 0))
+	first := testNode("game-1", "session-a")
+	later := testNode("game-2", "session-b")
+	for _, node := range []sp.Node{first, later} {
+		if err := dir.RegisterNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client.Set(ctx, NodeKey(later.NodeIdentity), "{", 0)
+	server.SetTime(time.Unix(1001, 0))
+	before := captureLeaseBatchSnapshot(t, ctx, client, first.NodeIdentity)
+	if _, err := dir.ExpireNodeLeases(ctx, "game", "default", 2); err == nil {
+		t.Fatal("expected malformed later candidate error")
+	}
+	requireLeaseBatchSnapshot(t, ctx, client, first.NodeIdentity, before)
+}
+
+func TestExpireNodeLeasesPreflightsWrongTypeLaterCandidateBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
+	server.SetTime(time.Unix(1010, 0))
+	first := testNode("game-1", "session-a")
+	later := testNode("game-2", "session-b")
+	for _, node := range []sp.Node{first, later} {
+		if err := dir.RegisterNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client.Del(ctx, NodeKey(later.NodeIdentity))
+	client.RPush(ctx, NodeKey(later.NodeIdentity), "wrongtype")
+	server.SetTime(time.Unix(1011, 0))
+	before := captureLeaseBatchSnapshot(t, ctx, client, first.NodeIdentity)
+	if _, err := dir.ExpireNodeLeases(ctx, "game", "default", 2); err == nil {
+		t.Fatal("expected WRONGTYPE later candidate error")
+	}
+	requireLeaseBatchSnapshot(t, ctx, client, first.NodeIdentity, before)
+}
+
+func TestRedisDirectoryRenewNodeRejectsUnknownStatusWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
+	server.SetTime(time.Unix(1020, 0))
+	node := testNode("game-1", "session-a")
+	if err := dir.RegisterNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	raw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
+	var stored redisNode
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Status = sp.NodeStatus("corrupt")
+	changed, _ := json.Marshal(stored)
+	client.Set(ctx, NodeKey(node.NodeIdentity), changed, 0)
+	before := captureLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity)
+	if err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err == nil {
+		t.Fatal("expected unknown status error")
+	}
+	requireLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity, before)
+}
+
+func TestExpireNodeLeasesRejectsUnknownStatusWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
+	server.SetTime(time.Unix(1030, 0))
+	node := testNode("game-1", "session-a")
+	if err := dir.RegisterNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	raw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
+	var stored redisNode
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Status = sp.NodeStatus("corrupt")
+	changed, _ := json.Marshal(stored)
+	client.Set(ctx, NodeKey(node.NodeIdentity), changed, 0)
+	server.SetTime(time.Unix(1031, 0))
+	before := captureLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity)
+	if _, err := dir.ExpireNodeLeases(ctx, "game", "default", 1); err == nil {
+		t.Fatal("expected unknown status error")
+	}
+	requireLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity, before)
+}
+
+func TestRedisDirectoryReplaceNodeSessionRejectsOldMetadataMismatch(t *testing.T) {
+	for _, field := range []string{"type", "group", "name"} {
+		t.Run(field, func(t *testing.T) {
+			ctx := context.Background()
+			dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
+			server.SetTime(time.Unix(1040, 0))
+			node := testNode("game-1", "session-a")
+			if err := dir.RegisterNode(ctx, node); err != nil {
+				t.Fatal(err)
+			}
+			raw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
+			var stored redisNode
+			if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+				t.Fatal(err)
+			}
+			switch field {
+			case "type":
+				stored.NodeType = "other"
+			case "group":
+				stored.NodeGroup = "other"
+			case "name":
+				stored.NodeName = "other"
+			}
+			changed, _ := json.Marshal(stored)
+			client.Set(ctx, NodeKey(node.NodeIdentity), changed, 0)
+			before := captureLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity)
+			next := node
+			next.NodeSessionID = "session-b"
+			if _, err := dir.ReplaceNodeSession(ctx, next); err == nil {
+				t.Fatal("expected old metadata mismatch error")
+			}
+			requireLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity, before)
+		})
 	}
 }

@@ -2,13 +2,52 @@ package redis
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 	sp "github.com/wxdqing/stable-placement"
 )
+
+type routeMutationSnapshot struct {
+	placement   string
+	nodes       map[string]string
+	leases      []goredis.Z
+	nodeMembers []string
+	indexes     map[string][]goredis.Z
+	sequence    string
+	events      int64
+	audit       int64
+}
+
+func captureRouteMutationSnapshot(t *testing.T, ctx context.Context, client *goredis.Client, p sp.Placement, identities ...string) routeMutationSnapshot {
+	t.Helper()
+	s := routeMutationSnapshot{placement: client.Get(ctx, PlacementKey(p.GrainKey)).Val(), nodes: map[string]string{}, indexes: map[string][]goredis.Z{}, sequence: client.Get(ctx, SequenceKey()).Val(), events: client.XLen(ctx, EventsStreamKey()).Val(), audit: client.XLen(ctx, AuditStreamKey()).Val()}
+	for _, identity := range identities {
+		s.nodes[identity] = client.Get(ctx, NodeKey(identity)).Val()
+		values, err := client.ZRangeWithScores(ctx, PlacementNodeKey(identity), 0, -1).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.indexes[identity] = values
+	}
+	s.leases, _ = client.ZRangeWithScores(ctx, NodeLeaseKey("game", "default"), 0, -1).Result()
+	s.nodeMembers, _ = client.SMembers(ctx, NodesKey("game", "default")).Result()
+	sort.Strings(s.nodeMembers)
+	return s
+}
+
+func requireRouteMutationSnapshot(t *testing.T, ctx context.Context, client *goredis.Client, p sp.Placement, want routeMutationSnapshot, identities ...string) {
+	t.Helper()
+	got := captureRouteMutationSnapshot(t, ctx, client, p, identities...)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mutation snapshot changed\ngot:  %#v\nwant: %#v", got, want)
+	}
+}
 
 func TestRedisDirectoryAllocateLookupRenewAndReleaseRoute(t *testing.T) {
 	ctx := context.Background()
@@ -184,5 +223,92 @@ func TestRedisDirectoryTransferSequenceBoundaryIsAtomic(t *testing.T) {
 	}
 	if client.Get(ctx, PlacementKey(p.GrainKey)).Val() != praw || client.ZScore(ctx, PlacementNodeKey(p.NodeIdentity), p.GrainKey.String()).Val() != oldScore || client.ZCard(ctx, PlacementNodeKey(target.NodeIdentity)).Val() != 0 || client.XLen(ctx, EventsStreamKey()).Val() != events {
 		t.Fatal("sequence failure changed state")
+	}
+}
+
+func TestRedisDirectoryReleaseRejectsOwnerNodeKeyMismatchWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
+	server.SetTime(time.Unix(1050, 0))
+	node := testNode("game-1", "session-a")
+	if err := dir.RegisterNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	p, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "release-metadata", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored redisNode
+	if err := json.Unmarshal([]byte(client.Get(ctx, NodeKey(node.NodeIdentity)).Val()), &stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.NodeKey = NodeKey("other/default/node")
+	changed, _ := json.Marshal(stored)
+	client.Set(ctx, NodeKey(node.NodeIdentity), changed, 0)
+	before := captureRouteMutationSnapshot(t, ctx, client, *p, node.NodeIdentity)
+	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: p.GrainKey, NodeIdentity: p.NodeIdentity, NodeSessionID: p.OwnerNodeSessionID, PlacementVersion: p.Version}); err == nil {
+		t.Fatal("expected owner NodeKey mismatch")
+	}
+	requireRouteMutationSnapshot(t, ctx, client, *p, before, node.NodeIdentity)
+}
+
+func TestRedisDirectoryTransferRecoverRejectTargetMetadataChangedBeforeEval(t *testing.T) {
+	for _, mode := range []string{"transfer", "recover"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			base, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
+			server.SetTime(time.Unix(1060, 0))
+			a, b := testNode("game-1", "session-a"), testNode("game-2", "session-b")
+			for _, node := range []sp.Node{a, b} {
+				if err := base.RegisterNode(ctx, node); err != nil {
+					t.Fatal(err)
+				}
+			}
+			p, err := base.Allocate(ctx, sp.AllocateCommand{GrainID: "metadata-" + mode, Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := b
+			if p.NodeIdentity == b.NodeIdentity {
+				target = a
+			}
+			if mode == "recover" {
+				var owner redisNode
+				if err := json.Unmarshal([]byte(client.Get(ctx, NodeKey(p.NodeIdentity)).Val()), &owner); err != nil {
+					t.Fatal(err)
+				}
+				owner.Status = sp.NodeStatusOffline
+				raw, _ := json.Marshal(owner)
+				client.Set(ctx, NodeKey(p.NodeIdentity), raw, 0)
+			}
+			armed := true
+			hooked, err := NewDirectory(nodeLeaseEvalHookClient{UniversalClient: client, before: func(script string) {
+				if armed && script == mutationLua {
+					armed = false
+					var changed redisNode
+					if err := json.Unmarshal([]byte(client.Get(ctx, NodeKey(target.NodeIdentity)).Val()), &changed); err != nil {
+						t.Fatal(err)
+					}
+					changed.NodeGroup = "changed-after-read"
+					raw, _ := json.Marshal(changed)
+					client.Set(ctx, NodeKey(target.NodeIdentity), raw, 0)
+				}
+			}}, sp.StrategyModeRedisRoundRobin, sp.NodeLeaseConfig{TTL: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := captureRouteMutationSnapshot(t, ctx, client, *p, p.NodeIdentity, target.NodeIdentity)
+			if mode == "transfer" {
+				_, err = hooked.Transfer(ctx, sp.TransferCommand{GrainKey: p.GrainKey, FromNodeIdentity: p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: p.Version})
+			} else {
+				_, err = hooked.Recover(ctx, sp.RecoverCommand{GrainKey: p.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: p.Version})
+			}
+			if err == nil {
+				t.Fatal("expected target metadata error")
+			}
+			// The hook's metadata write is expected; business state and outbox must otherwise remain unchanged.
+			before.nodes[target.NodeIdentity] = client.Get(ctx, NodeKey(target.NodeIdentity)).Val()
+			requireRouteMutationSnapshot(t, ctx, client, *p, before, p.NodeIdentity, target.NodeIdentity)
+		})
 	}
 }

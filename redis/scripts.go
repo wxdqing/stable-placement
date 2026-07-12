@@ -64,6 +64,7 @@ if node["NodeKey"]~=ARGV[2] or tonumber(node["Lease"]["Version"] or 0)<=0 or ton
 local score=redis.call("ZSCORE",KEYS[2],ARGV[2]);if not score or tonumber(score)~=tonumber(node["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end
 if node["NodeSessionID"]~=ARGV[1] then return "invalid_node_session" end
 if node["Status"]=="offline" then return "node_not_found" end
+if node["Status"]~="active" and node["Status"]~="draining" then return redis.error_reply("INVALID_NODE_STATUS") end
 local now=now_millis();if tonumber(node["Lease"]["ExpireAtUnixMilli"] or 0)<=now then return "node_lease_expired" end
 node["Lease"]["Version"]=tonumber(node["Lease"]["Version"])+1
 local expiry=now+tonumber(node["Lease"]["TTLMillis"]);if expiry<tonumber(score) then expiry=tonumber(score) end
@@ -75,8 +76,7 @@ const replaceNodeSessionLua = luaHelpers + `
 local e=expect_type(KEYS[1],"string","node") or expect_type(KEYS[2],"set","nodes") or expect_type(KEYS[3],"zset","leases") or expect_type(KEYS[4],"stream","events");if e then return e end
 local incoming,de=decode(ARGV[1],"incoming_node");if de then return de end
 local oldraw=redis.call("GET",KEYS[1]);local old,oe=decode(oldraw,"node");if oe then return oe end
-if old and old["NodeIdentity"]~=incoming["NodeIdentity"] then return redis.error_reply("IDENTITY_MISMATCH") end
-if old and old["NodeKey"]~=ARGV[3] then return redis.error_reply("IDENTITY_MISMATCH") end
+if old and (old["NodeIdentity"]~=incoming["NodeIdentity"] or old["NodeType"]~=incoming["NodeType"] or old["NodeGroup"]~=incoming["NodeGroup"] or old["NodeName"]~=incoming["NodeName"] or old["NodeKey"]~=ARGV[3]) then return redis.error_reply("IDENTITY_MISMATCH") end
 if old and old["NodeSessionID"]==incoming["NodeSessionID"] then return "invalid_node_session" end
 if old then local score=redis.call("ZSCORE",KEYS[3],ARGV[3]);if not score or tonumber(score)~=tonumber(old["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end end
 local now=now_millis();incoming["Status"]="active";incoming["Lease"]={Version=1,TTLMillis=tonumber(ARGV[2]),ExpireAtUnixMilli=now+tonumber(ARGV[2])}
@@ -94,6 +94,7 @@ local node,de=decode(raw,"node");if de then return de end
 if tonumber(node["Lease"]["ExpireAtUnixMilli"] or -1)~=tonumber(current_score) or tostring(node["Lease"]["Version"])~=ARGV[4] or node["NodeSessionID"]~=ARGV[5] then return "stale" end
 if node["NodeKey"]~=ARGV[1] or tonumber(node["Lease"]["Version"] or 0)<=0 or tonumber(node["Lease"]["TTLMillis"] or 0)<=0 then return redis.error_reply("INVALID_NODE") end
 if node["Status"]=="offline" then redis.call("ZREM",KEYS[2],ARGV[1]);return "stale" end
+if node["Status"]~="active" and node["Status"]~="draining" then return redis.error_reply("INVALID_NODE_STATUS") end
 if tonumber(current_score)>now_millis() then return "not_due" end
 node["Status"]="offline";redis.call("SET",KEYS[1],cjson.encode(node));redis.call("ZREM",KEYS[2],ARGV[1]);node_event(KEYS[3],ARGV[6],node["NodeIdentity"],node["NodeSessionID"],node["NodeType"],node["NodeGroup"],node["NodeName"],tostring(node["Lease"]["Version"]));return "expired"
 `
@@ -152,11 +153,11 @@ local raw=redis.call("GET",KEYS[1]);if not raw then return "placement_not_found"
 local ownerraw=redis.call("GET",KEYS[2]);local owner,oe=decode(ownerraw,"owner_node");if oe then return oe end;local targetraw=redis.call("GET",KEYS[3]);local target,te=decode(targetraw,"target_node");if te then return te end
 if p["GrainKey"]~=ARGV[8] or p["Status"]~="active" then return "placement_not_found" end;if tostring(p["Version"])~=ARGV[6] then return "version_conflict" end
 local seq,se=read_counter(KEYS[10],"sequence","9007199254740991");if se then return se end
-if ARGV[1]=="release" then if p["NodeIdentity"]~=ARGV[3] then return "invalid_owner" end;if not owner or owner["NodeIdentity"]~=p["NodeIdentity"] then return "owner_unavailable" end;if p["OwnerNodeSessionID"]~=ARGV[5] or owner["NodeSessionID"]~=ARGV[5] then return "invalid_node_session" end
+if ARGV[1]=="release" then if p["NodeIdentity"]~=ARGV[3] then return "invalid_owner" end;if not owner or owner["NodeKey"]~=KEYS[2] or owner["NodeIdentity"]~=p["NodeIdentity"] or owner["NodeType"]~=ARGV[9] or owner["NodeGroup"]~=ARGV[10] or owner["NodeName"]~=ARGV[11] then return "owner_unavailable" end;if p["OwnerNodeSessionID"]~=ARGV[5] or owner["NodeSessionID"]~=ARGV[5] then return "invalid_node_session" end
 else
  if ARGV[1]=="transfer" and ARGV[3]~="" and p["NodeIdentity"]~=ARGV[3] then return "invalid_owner" end
  local now=now_millis();if ARGV[1]=="recover" then local owner_score=owner and redis.call("ZSCORE",KEYS[8],KEYS[2]) or nil;local healthy=owner and owner["NodeKey"]==KEYS[2] and owner["NodeIdentity"]==p["NodeIdentity"] and owner["NodeSessionID"]==p["OwnerNodeSessionID"] and (owner["Status"]=="active" or owner["Status"]=="draining") and owner_score and tonumber(owner_score)==tonumber(owner["Lease"]["ExpireAtUnixMilli"] or -1) and tonumber(owner_score)>now;if healthy then return "not_recoverable" end end
- if not target or target["NodeKey"]~=KEYS[3] or target["NodeIdentity"]~=ARGV[4] or target["PlacementNodeKey"]~=KEYS[5] or target["Status"]~="active" or redis.call("SISMEMBER",KEYS[9],target["NodeName"])~=0 then return "no_available_node" end;local score=redis.call("ZSCORE",KEYS[6],KEYS[3]);if not score or tonumber(score)~=tonumber(target["Lease"]["ExpireAtUnixMilli"] or -1) or tonumber(score)<=now then return "no_available_node" end
+ if not target or target["NodeKey"]~=KEYS[3] or target["NodeIdentity"]~=ARGV[4] or target["NodeType"]~=ARGV[12] or target["NodeGroup"]~=ARGV[13] or target["NodeName"]~=ARGV[14] or target["PlacementNodeKey"]~=KEYS[5] or target["Status"]~="active" or redis.call("SISMEMBER",KEYS[9],target["NodeName"])~=0 then return "no_available_node" end;local score=redis.call("ZSCORE",KEYS[6],KEYS[3]);if not score or tonumber(score)~=tonumber(target["Lease"]["ExpireAtUnixMilli"] or -1) or tonumber(score)<=now then return "no_available_node" end
 end
 p["Version"]=tonumber(p["Version"])+1;if ARGV[1]=="release" then p["Status"]="released" else p["NodeIdentity"]=target["NodeIdentity"];p["OwnerNodeSessionID"]=target["NodeSessionID"] end;local encoded=cjson.encode(p)
 redis.call("ZREM",KEYS[4],p["GrainKey"]);redis.call("SET",KEYS[1],encoded);if ARGV[1]~="release" then local score=redis.call("INCR",KEYS[10]);redis.call("ZADD",KEYS[5],score,p["GrainKey"]) end;event(KEYS[7],ARGV[7],p["GrainKey"],p["NodeIdentity"],p["OwnerNodeSessionID"],tostring(p["Version"]),"0");return encoded

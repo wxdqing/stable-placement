@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -24,6 +26,8 @@ type redisNode struct {
 	PlacementNodeKey string
 	NodeKey          string
 }
+
+const maxPlacementIndexScore = int64(1<<53 - 1)
 
 func NewDirectory(client goredis.UniversalClient, mode sp.StrategyMode, config sp.NodeLeaseConfig) (*Directory, error) {
 	if mode != sp.StrategyModeRedisRoundRobin {
@@ -307,7 +311,7 @@ func (d *Directory) mutate(ctx context.Context, mode string, key sp.GrainKey, fr
 	ownerLeaseKey := NodeLeaseKey(ownerID.NodeType(), ownerID.NodeGroup())
 	targetID := sp.NodeIdentity(target)
 	targetInvalidKey := InvalidNodesKey(targetID.NodeType(), targetID.NodeGroup())
-	result, err := d.client.Eval(ctx, mutationLua, []string{PlacementKey(key), NodeKey(p.NodeIdentity), targetKey, PlacementNodeKey(p.NodeIdentity), newIndex, leaseKey, EventsStreamKey(), ownerLeaseKey, targetInvalidKey, SequenceKey()}, mode, string(raw), from, target, session, strconv.FormatInt(version, 10), string(event), key.String()).Result()
+	result, err := d.client.Eval(ctx, mutationLua, []string{PlacementKey(key), NodeKey(p.NodeIdentity), targetKey, PlacementNodeKey(p.NodeIdentity), newIndex, leaseKey, EventsStreamKey(), ownerLeaseKey, targetInvalidKey, SequenceKey()}, mode, string(raw), from, target, session, strconv.FormatInt(version, 10), string(event), key.String(), ownerID.NodeType(), ownerID.NodeGroup(), ownerID.NodeName(), targetID.NodeType(), targetID.NodeGroup(), targetID.NodeName()).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -326,47 +330,116 @@ func (d *Directory) Exists(ctx context.Context, key sp.GrainKey) (bool, error) {
 	}
 	return err == nil, err
 }
-func (d *Directory) FindByNode(ctx context.Context, q sp.FindByNodeQuery) (sp.PlacementPage, error) {
-	if q.Cursor != "" {
-		n, err := strconv.Atoi(q.Cursor)
-		if err != nil || n < 0 {
-			return sp.PlacementPage{}, fmt.Errorf("invalid cursor")
-		}
-	}
-	start := int64(0)
-	if q.Cursor != "" {
-		start, _ = strconv.ParseInt(q.Cursor, 10, 64)
-	}
-	limit := q.Limit
+func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (sp.PlacementPage, error) {
+	limit := query.Limit
 	if limit <= 0 {
 		limit = 100
 	}
-	members, err := d.client.ZRange(ctx, PlacementNodeKey(q.NodeIdentity), start, start+int64(limit)-1).Result()
-	if err != nil {
-		return sp.PlacementPage{}, err
+	batchSize := int64(max(limit, 100))
+	min := "-inf"
+	var boundaryScore int64
+	var boundaryKey string
+	hasBoundary := false
+	if query.Cursor != "" {
+		score, key, err := parseCursor(query.Cursor)
+		if err != nil {
+			return sp.PlacementPage{}, err
+		}
+		if score < 0 || score > maxPlacementIndexScore {
+			return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %d in cursor", score)
+		}
+		boundaryScore = score
+		boundaryKey = key
+		hasBoundary = true
+		min = strconv.FormatInt(score, 10)
 	}
-	status := q.Status
+	status := query.Status
 	if status == "" {
 		status = sp.PlacementStatusActive
 	}
-	page := sp.PlacementPage{}
-	for _, member := range members {
-		p, err := d.getPlacement(ctx, sp.GrainKey(member))
-		if errors.Is(err, sp.ErrPlacementNotFound) {
-			continue
-		}
+	var placements []sp.Placement
+	var placementScores []int64
+	var placementKeys []string
+	previousScore := boundaryScore
+	hasPreviousScore := hasBoundary
+	indexKey := PlacementNodeKey(query.NodeIdentity)
+	for {
+		values, err := d.client.ZRangeByScoreWithScores(ctx, indexKey, &goredis.ZRangeBy{Min: min, Max: "+inf", Count: batchSize}).Result()
 		if err != nil {
-			return page, err
+			return sp.PlacementPage{}, err
 		}
-		if p.Status == status {
-			page.Placements = append(page.Placements, *p)
+		if len(values) == 0 {
+			break
 		}
+		var lastScore int64
+		var lastKey string
+		for index, value := range values {
+			if math.IsNaN(value.Score) || math.IsInf(value.Score, 0) || math.Trunc(value.Score) != value.Score || value.Score < 0 || value.Score > float64(maxPlacementIndexScore) {
+				return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %v", value.Score)
+			}
+			score := int64(value.Score)
+			key, ok := value.Member.(string)
+			if !ok {
+				return sp.PlacementPage{}, fmt.Errorf("invalid placement index member type %T", value.Member)
+			}
+			lastScore = score
+			lastKey = key
+			if hasBoundary && index == 0 {
+				if score < boundaryScore {
+					return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %d before cursor score %d", score, boundaryScore)
+				}
+				if score == boundaryScore {
+					if key != boundaryKey {
+						return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %d: duplicate member %q after %q", score, key, boundaryKey)
+					}
+					continue
+				}
+			}
+			if hasPreviousScore && score <= previousScore {
+				return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %d: scores must be unique and increasing", score)
+			}
+			previousScore = score
+			hasPreviousScore = true
+			placement, err := d.getPlacement(ctx, sp.GrainKey(key))
+			if errors.Is(err, sp.ErrPlacementNotFound) {
+				continue
+			}
+			if err != nil {
+				return sp.PlacementPage{}, err
+			}
+			if placement.Status != status {
+				continue
+			}
+			placements = append(placements, *placement)
+			placementScores = append(placementScores, score)
+			placementKeys = append(placementKeys, key)
+			if len(placements) > limit {
+				return sp.PlacementPage{Placements: placements[:limit], NextCursor: formatCursor(placementScores[limit-1], placementKeys[limit-1])}, nil
+			}
+		}
+		if int64(len(values)) < batchSize {
+			break
+		}
+		boundaryScore = lastScore
+		boundaryKey = lastKey
+		hasBoundary = true
+		min = strconv.FormatInt(lastScore, 10)
 	}
-	if len(members) == limit {
-		page.NextCursor = strconv.FormatInt(start+int64(len(members)), 10)
-	}
-	return page, nil
+	return sp.PlacementPage{Placements: placements}, nil
 }
+
+func parseCursor(cursor string) (int64, string, error) {
+	rawScore, key, ok := strings.Cut(cursor, ":")
+	if !ok || key == "" {
+		return 0, "", fmt.Errorf("invalid placement cursor %q", cursor)
+	}
+	score, err := strconv.ParseInt(rawScore, 10, 64)
+	if err != nil {
+		return 0, "", err
+	}
+	return score, key, nil
+}
+func formatCursor(score int64, key string) string { return strconv.FormatInt(score, 10) + ":" + key }
 
 func (d *Directory) getNode(ctx context.Context, identity string) (*sp.Node, error) {
 	raw, err := d.client.Get(ctx, NodeKey(identity)).Bytes()

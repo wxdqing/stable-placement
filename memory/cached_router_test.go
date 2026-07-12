@@ -229,6 +229,20 @@ func TestCachedRouterHandleEventMappings(t *testing.T) {
 	}
 }
 
+func TestCachedRouterEventBusIncompleteNodeLeaseExpiredClearsAll(t *testing.T) {
+	router, cache, keys := seededCachedRouter(t)
+	bus := NewEventBus()
+	if err := bus.Subscribe(context.Background(), router.HandleEvent); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Publish(context.Background(), sp.PlacementEvent{Type: sp.EventNodeLeaseExpired}); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range keys {
+		assertCached(t, cache, key, false)
+	}
+}
+
 func TestCachedRouterInflightLookupCannotRefillAcrossEventOrHealthChange(t *testing.T) {
 	key, _ := sp.NewGrainKey("Player", "10001")
 	for _, transition := range []string{"event", "degrade", "recover"} {
