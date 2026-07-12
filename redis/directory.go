@@ -32,6 +32,9 @@ type mutationArgs struct {
 	checkTargetNode  bool
 	targetNodeKey    string
 	invalidNodesKey  string
+	targetNodeType   string
+	targetNodeGroup  string
+	targetNodeName   string
 }
 
 type redisNode struct {
@@ -302,6 +305,9 @@ func (d *Directory) Transfer(ctx context.Context, cmd sp.TransferCommand) (*sp.P
 		checkTargetNode: true,
 		targetNodeKey:   NodeKey(target.NodeIdentity),
 		invalidNodesKey: InvalidNodesKey(target.NodeType, target.NodeGroup),
+		targetNodeType:  target.NodeType,
+		targetNodeGroup: target.NodeGroup,
+		targetNodeName:  target.NodeName,
 	})
 }
 
@@ -349,6 +355,9 @@ func (d *Directory) Recover(ctx context.Context, cmd sp.RecoverCommand) (*sp.Pla
 		checkTargetNode: true,
 		targetNodeKey:   NodeKey(target.NodeIdentity),
 		invalidNodesKey: InvalidNodesKey(target.NodeType, target.NodeGroup),
+		targetNodeType:  target.NodeType,
+		targetNodeGroup: target.NodeGroup,
+		targetNodeName:  target.NodeName,
 	})
 }
 
@@ -659,6 +668,9 @@ func (d *Directory) mutateWithLua(ctx context.Context, args mutationArgs) (*sp.P
 		checkNodeSession,
 		args.nodeSessionID,
 		checkTargetNode,
+		args.targetNodeType,
+		args.targetNodeGroup,
+		args.targetNodeName,
 	).Text()
 	if err != nil {
 		return nil, err

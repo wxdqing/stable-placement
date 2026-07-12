@@ -125,7 +125,10 @@ if ARGV[14] == "1" then
 		return "no_available_node"
 	end
 	local target = cjson.decode(target_raw)
-	if target["Status"] ~= "active" or redis.call("SISMEMBER", KEYS[9], target["NodeName"]) ~= 0 then
+	if target["NodeType"] ~= ARGV[15] or target["NodeGroup"] ~= ARGV[16] or target["NodeName"] ~= ARGV[17] then
+		return "no_available_node"
+	end
+	if target["Status"] ~= "active" or redis.call("SISMEMBER", KEYS[9], ARGV[17]) ~= 0 then
 		return "no_available_node"
 	end
 	local placement = cjson.decode(updated_placement)
