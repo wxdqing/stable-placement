@@ -62,6 +62,14 @@ func TestPlacement_D3_RenewValidatesWithoutChangingPlacementOrNodeLease(t *testi
 	if leaseAfter := h.listGameNodes()[0].Lease; leaseAfter != leaseBefore {
 		t.Fatalf("Renew changed node lease: before=%+v after=%+v", leaseBefore, leaseAfter)
 	}
+	persisted := h.placementsOn(sp.Node{NodeIdentity: placement.NodeIdentity})
+	if len(persisted) != 1 {
+		t.Fatalf("Renew changed persisted placement: got=%+v want=%+v", persisted, placement)
+	}
+	got := persisted[0]
+	if got.GrainID != placement.GrainID || got.Kind != placement.Kind || got.GrainKey != placement.GrainKey || got.NodeIdentity != placement.NodeIdentity || got.OwnerNodeSessionID != placement.OwnerNodeSessionID || got.Version != placement.Version || got.Status != placement.Status || !got.CreateTime.Equal(placement.CreateTime) || !got.UpdateTime.Equal(placement.UpdateTime) {
+		t.Fatalf("Renew changed persisted placement: got=%+v want=%+v", got, placement)
+	}
 }
 
 func TestPlacement_D4_RenewRejectsWrongOwnerAndSession(t *testing.T) {
@@ -145,22 +153,30 @@ func TestPlacement_D7_TransferChangesOwner(t *testing.T) {
 	defer h.cleanup()
 	h.scenario("D7 Transfer 显式更换 Owner")
 
-	h.registerGame("game-1", "session-a")
+	node1 := h.registerGame("game-1", "session-a")
 	node2 := h.registerGame("game-2", "session-b")
 	placement := h.allocate(h.grainID("d7"))
+	owner, target := node1, node2
+	if placement.NodeIdentity == node2.NodeIdentity {
+		owner, target = node2, node1
+	}
 
 	transferred, err := h.dir.Transfer(h.ctx, sp.TransferCommand{
 		GrainKey:         placement.GrainKey,
 		FromNodeIdentity: placement.NodeIdentity,
-		ToNodeIdentity:   node2.NodeIdentity,
+		ToNodeIdentity:   target.NodeIdentity,
 		PlacementVersion: placement.Version,
 	})
 	h.must(err, "Transfer")
-	if transferred.NodeIdentity != node2.NodeIdentity || transferred.OwnerNodeSessionID != node2.NodeSessionID || transferred.Version != placement.Version+1 {
+	if transferred.NodeIdentity != target.NodeIdentity || transferred.OwnerNodeSessionID != target.NodeSessionID || transferred.Version != placement.Version+1 {
 		t.Fatalf("transferred = %+v", transferred)
 	}
-	if len(h.placementsOn(node2)) != 1 {
-		t.Fatalf("game-2 placements = %d", len(h.placementsOn(node2)))
+	persisted := h.placementsOn(target)
+	if len(persisted) != 1 || persisted[0].GrainKey != placement.GrainKey || persisted[0].NodeIdentity != target.NodeIdentity || persisted[0].OwnerNodeSessionID != target.NodeSessionID || persisted[0].Version != placement.Version+1 || persisted[0].Status != sp.PlacementStatusActive {
+		t.Fatalf("target persisted placement = %+v", persisted)
+	}
+	if old := h.placementsOn(owner); len(old) != 0 {
+		t.Fatalf("old owner placements after Transfer = %+v", old)
 	}
 }
 

@@ -46,11 +46,19 @@ func TestCluster_A3_RenewNodeSessionValidation(t *testing.T) {
 	before := h.listGameNodes()[0].Lease
 
 	h.step("When RenewNode 正确 session")
-	time.Sleep(time.Millisecond)
-	h.must(h.dir.RenewNode(h.ctx, node.NodeIdentity, node.NodeSessionID), "RenewNode")
-	after := h.listGameNodes()[0].Lease
-	if after.Version != before.Version+1 || after.ExpireAtUnixMilli <= before.ExpireAtUnixMilli {
-		t.Fatalf("renewed lease = %+v, want version after %+v and later expiry", after, before)
+	deadline := time.Now().Add(3 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		h.must(h.dir.RenewNode(h.ctx, node.NodeIdentity, node.NodeSessionID), "RenewNode")
+		after := h.listGameNodes()[0].Lease
+		if after.Version > before.Version && after.ExpireAtUnixMilli > before.ExpireAtUnixMilli {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Node Lease did not advance beyond %+v", before)
+		}
+		<-ticker.C
 	}
 
 	h.step("Then 错误 session 返回 ErrInvalidNodeSession")

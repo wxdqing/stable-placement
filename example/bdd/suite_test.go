@@ -71,12 +71,12 @@ func (s *suite) cleanup() {
 			continue
 		}
 		seen[node.NodeIdentity] = struct{}{}
-		page, err := s.dir.FindByNode(s.ctx, sp.FindByNodeQuery{NodeIdentity: node.NodeIdentity, Limit: 100})
+		placements, err := s.placementsOn(node.NodeIdentity)
 		if err != nil {
 			s.t.Errorf("cleanup FindByNode %s failed: %v", node.NodeIdentity, err)
 			continue
 		}
-		for _, placement := range page.Placements {
+		for _, placement := range placements {
 			if err := s.releasePlacement(placement); err != nil {
 				s.t.Errorf("cleanup Release %s failed: %v", placement.GrainKey, err)
 			}
@@ -87,6 +87,26 @@ func (s *suite) cleanup() {
 		_ = s.dir.RestoreNode(s.ctx, node.NodeType, node.NodeGroup, node.NodeName)
 	}
 	_ = s.client.Close()
+}
+
+func (s *suite) placementsOn(nodeIdentity string) ([]sp.Placement, error) {
+	var placements []sp.Placement
+	cursor := ""
+	for {
+		page, err := s.dir.FindByNode(s.ctx, sp.FindByNodeQuery{
+			NodeIdentity: nodeIdentity,
+			Cursor:       cursor,
+			Limit:        50,
+		})
+		if err != nil {
+			return nil, err
+		}
+		placements = append(placements, page.Placements...)
+		if page.NextCursor == "" {
+			return placements, nil
+		}
+		cursor = page.NextCursor
+	}
 }
 
 func (s *suite) releasePlacement(placement sp.Placement) error {
