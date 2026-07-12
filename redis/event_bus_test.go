@@ -38,6 +38,47 @@ type continuityMetadataClient struct {
 	lag          int64
 	maxDeletedID string
 	pending      *goredis.XPending
+	pendingExt   []goredis.XPendingExt
+}
+
+type continuityRaceClient struct {
+	goredis.UniversalClient
+	mu          sync.Mutex
+	mutateEvery bool
+	mutate      func(context.Context) error
+	infoCalls   int
+	err         error
+}
+
+func (c *continuityRaceClient) XInfoStream(ctx context.Context, stream string) *goredis.XInfoStreamCmd {
+	info, err := c.UniversalClient.XInfoStream(ctx, stream).Result()
+	if err == nil {
+		info.EntriesAdded = info.Length
+		c.mu.Lock()
+		c.infoCalls++
+		if c.err == nil && (c.mutateEvery || c.infoCalls == 1) {
+			c.err = c.mutate(ctx)
+		}
+		err = c.err
+		c.mu.Unlock()
+	}
+	cmd := goredis.NewXInfoStreamCmd(ctx, stream)
+	cmd.SetVal(info)
+	cmd.SetErr(err)
+	return cmd
+}
+
+func (c *continuityRaceClient) XInfoGroups(ctx context.Context, stream string) *goredis.XInfoGroupsCmd {
+	groups, err := c.UniversalClient.XInfoGroups(ctx, stream).Result()
+	if err == nil {
+		for i := range groups {
+			groups[i].EntriesRead = 0
+		}
+	}
+	cmd := goredis.NewXInfoGroupsCmd(ctx, stream)
+	cmd.SetVal(groups)
+	cmd.SetErr(err)
+	return cmd
 }
 
 func (c continuityMetadataClient) XInfoStream(ctx context.Context, stream string) *goredis.XInfoStreamCmd {
@@ -72,6 +113,15 @@ func (c continuityMetadataClient) XPending(ctx context.Context, stream, group st
 	}
 	cmd := goredis.NewXPendingCmd(ctx, "xpending", stream, group)
 	cmd.SetVal(c.pending)
+	return cmd
+}
+
+func (c continuityMetadataClient) XPendingExt(ctx context.Context, args *goredis.XPendingExtArgs) *goredis.XPendingExtCmd {
+	if c.pendingExt == nil {
+		return c.UniversalClient.XPendingExt(ctx, args)
+	}
+	cmd := goredis.NewXPendingExtCmd(ctx, "xpending", args.Stream, args.Group)
+	cmd.SetVal(c.pendingExt)
 	return cmd
 }
 
@@ -338,6 +388,45 @@ func TestRedisEventBusHandlerCancellationKeepsMessagePendingWithoutDegrading(t *
 	}
 	if pending.Count != 1 {
 		t.Fatalf("pending count = %d, want 1", pending.Count)
+	}
+}
+
+func TestRedisEventBusHandlerCancellationErrorKeepsMessagePendingWithoutDegrading(t *testing.T) {
+	for _, handlerErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(handlerErr.Error(), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			server := miniredis.RunT(t)
+			client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+			consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+			if err != nil {
+				t.Fatalf("consumer error: %v", err)
+			}
+			bus := NewEventBus(client, consumer)
+			if err := bus.EnsureConsumerGroup(ctx); err != nil {
+				t.Fatalf("EnsureConsumerGroup error: %v", err)
+			}
+			if err := bus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+				t.Fatalf("Publish error: %v", err)
+			}
+
+			if err := bus.Subscribe(ctx, func(sp.PlacementEvent) error {
+				cancel()
+				return handlerErr
+			}); err != nil {
+				t.Fatalf("Subscribe error: %v", err)
+			}
+			if bus.IsDegraded() {
+				t.Fatal("handler cancellation error put bus in degraded mode")
+			}
+			pending, err := client.XPending(context.Background(), bus.StreamKey(), consumer.Group).Result()
+			if err != nil {
+				t.Fatalf("XPending error: %v", err)
+			}
+			if pending.Count != 1 {
+				t.Fatalf("pending count = %d, want 1", pending.Count)
+			}
+		})
 	}
 }
 
@@ -727,6 +816,10 @@ func TestRedisEventBusContinuityDetectsDeletedPendingAtMaxDeleted(t *testing.T) 
 	bus.client = continuityMetadataClient{
 		UniversalClient: base, entriesAdded: 2, entriesRead: 2, lag: 0, maxDeletedID: "1000-0",
 		pending: &goredis.XPending{Count: 2, Lower: "1000-0", Higher: "2000-0"},
+		pendingExt: []goredis.XPendingExt{
+			{ID: "1000-0", Consumer: consumer.NodeSessionID},
+			{ID: "2000-0", Consumer: consumer.NodeSessionID},
+		},
 	}
 
 	if err := bus.CheckContinuity(ctx); !errors.Is(err, ErrStreamGap) {
@@ -880,6 +973,72 @@ func TestRedisEventBusContinuityAllowsSafeHistoricalTrim(t *testing.T) {
 	}
 }
 
+func TestRedisEventBusContinuityRetriesMixedStreamSnapshot(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(base, consumer)
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	if err := bus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+		t.Fatalf("Publish error: %v", err)
+	}
+	hooked := &continuityRaceClient{UniversalClient: base}
+	hooked.mutate = func(ctx context.Context) error {
+		return base.XAdd(ctx, &goredis.XAddArgs{
+			Stream: bus.StreamKey(), Values: eventValues(sp.PlacementEvent{Type: sp.EventManualCacheClear}),
+		}).Err()
+	}
+	bus.client = hooked
+
+	if err := bus.CheckContinuity(ctx); err != nil {
+		t.Fatalf("CheckContinuity error: %v", err)
+	}
+	if bus.IsDegraded() {
+		t.Fatal("mixed stream snapshot put bus in degraded mode")
+	}
+}
+
+func TestRedisEventBusContinuityBoundsRetriesOnActiveStream(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(base, consumer)
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	if err := bus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+		t.Fatalf("Publish error: %v", err)
+	}
+	hooked := &continuityRaceClient{UniversalClient: base, mutateEvery: true}
+	hooked.mutate = func(ctx context.Context) error {
+		return base.XAdd(ctx, &goredis.XAddArgs{
+			Stream: bus.StreamKey(), Values: eventValues(sp.PlacementEvent{Type: sp.EventManualCacheClear}),
+		}).Err()
+	}
+	bus.client = hooked
+
+	if err := bus.CheckContinuity(ctx); err != nil {
+		t.Fatalf("CheckContinuity error: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("CheckContinuity retried until context timeout")
+	}
+	if bus.IsDegraded() {
+		t.Fatal("active stream put bus in degraded mode")
+	}
+}
+
 func TestRedisEventBusRealRedisContinuityMetadata(t *testing.T) {
 	addr := os.Getenv("STABLE_PLACEMENT_REAL_REDIS_ADDR")
 	if addr == "" {
@@ -959,6 +1118,36 @@ func TestRedisEventBusRealRedisContinuityMetadata(t *testing.T) {
 		}
 		if err := bus.CheckContinuity(ctx); err != nil {
 			t.Fatalf("CheckContinuity error: %v", err)
+		}
+	})
+
+	t.Run("acked deletion between pending messages", func(t *testing.T) {
+		bus, consumer := newBus(t)
+		add(t, bus, "1000-0")
+		add(t, bus, "2000-0")
+		add(t, bus, "3000-0")
+		streams, err := client.XReadGroup(ctx, &goredis.XReadGroupArgs{
+			Group: consumer.Group, Consumer: consumer.NodeSessionID,
+			Streams: []string{bus.stream, ">"}, Count: 3,
+		}).Result()
+		if err != nil {
+			t.Fatalf("XReadGroup error: %v", err)
+		}
+		if len(streams) != 1 || len(streams[0].Messages) != 3 {
+			t.Fatalf("messages = %+v, want 3", streams)
+		}
+		if err := client.XAck(ctx, bus.stream, consumer.Group, "2000-0").Err(); err != nil {
+			t.Fatalf("XAck middle error: %v", err)
+		}
+		if err := client.XDel(ctx, bus.stream, "2000-0").Err(); err != nil {
+			t.Fatalf("XDel middle error: %v", err)
+		}
+
+		if err := bus.CheckContinuity(ctx); err != nil {
+			t.Fatalf("CheckContinuity error: %v", err)
+		}
+		if bus.IsDegraded() {
+			t.Fatal("acked middle deletion put bus in degraded mode")
 		}
 	})
 

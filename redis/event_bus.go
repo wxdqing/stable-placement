@@ -205,22 +205,51 @@ func (b *EventBus) RunTrimLoop(ctx context.Context, interval time.Duration, maxL
 
 // CheckContinuity enters degraded mode when Redis reports that this group may have missed trimmed events.
 func (b *EventBus) CheckContinuity(ctx context.Context) error {
-	info, err := b.client.XInfoStream(ctx, b.stream).Result()
-	if err != nil {
-		if strings.Contains(err.Error(), "no such key") {
-			return nil
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		info, err := b.client.XInfoStream(ctx, b.stream).Result()
+		if err != nil {
+			if strings.Contains(err.Error(), "no such key") {
+				return nil
+			}
+			if ctx.Err() == nil {
+				b.setDegraded()
+			}
+			return err
 		}
-		if ctx.Err() == nil {
+		gap, err := b.checkContinuitySnapshot(ctx, info)
+		if err != nil {
+			if ctx.Err() == nil {
+				b.setDegraded()
+			}
+			return err
+		}
+		after, err := b.client.XInfoStream(ctx, b.stream).Result()
+		if err != nil {
+			if strings.Contains(err.Error(), "no such key") {
+				return nil
+			}
+			if ctx.Err() == nil {
+				b.setDegraded()
+			}
+			return err
+		}
+		if !sameContinuityStreamInfo(info, after) {
+			continue
+		}
+		if gap {
 			b.setDegraded()
+			return ErrStreamGap
 		}
-		return err
+		return nil
 	}
+	return nil
+}
+
+func (b *EventBus) checkContinuitySnapshot(ctx context.Context, info *goredis.XInfoStream) (bool, error) {
 	groups, err := b.client.XInfoGroups(ctx, b.stream).Result()
 	if err != nil {
-		if ctx.Err() == nil {
-			b.setDegraded()
-		}
-		return err
+		return false, err
 	}
 	var consumerGroup *goredis.XInfoGroup
 	for i := range groups {
@@ -230,58 +259,103 @@ func (b *EventBus) CheckContinuity(ctx context.Context) error {
 		}
 	}
 	if consumerGroup == nil {
-		return nil
+		return false, nil
 	}
 	pending, err := b.client.XPending(ctx, b.stream, b.consumer.Group).Result()
 	if err != nil {
-		if ctx.Err() == nil {
-			b.setDegraded()
-		}
-		return err
+		return false, err
 	}
 	firstEntryID := info.FirstEntry.ID
 	if firstEntryID == "" && info.Length > 0 {
 		messages, err := b.client.XRangeN(ctx, b.stream, "-", "+", 1).Result()
 		if err != nil {
-			if ctx.Err() == nil {
-				b.setDegraded()
-			}
-			return err
+			return false, err
 		}
 		if len(messages) > 0 {
 			firstEntryID = messages[0].ID
 		}
 	}
 	maxDeleted := info.MaxDeletedEntryID != "" && info.MaxDeletedEntryID != "0-0"
+	deletionObserved := maxDeleted || info.EntriesAdded > info.Length
 	if pending.Count > 0 {
 		pendingMissing := info.Length == 0
-		pendingMissing = pendingMissing || (maxDeleted && compareRedisStreamID(pending.Lower, info.MaxDeletedEntryID) <= 0)
 		pendingMissing = pendingMissing || (firstEntryID != "" && compareRedisStreamID(pending.Lower, firstEntryID) < 0)
 		if pendingMissing {
-			b.setDegraded()
-			return ErrStreamGap
+			return true, nil
+		}
+		if deletionObserved {
+			missing, err := b.pendingPayloadMissing(ctx, pending.Count)
+			if err != nil {
+				return false, err
+			}
+			if missing {
+				return true, nil
+			}
 		}
 	}
 	if maxDeleted && compareRedisStreamID(info.MaxDeletedEntryID, consumerGroup.LastDeliveredID) > 0 {
-		b.setDegraded()
-		return ErrStreamGap
+		return true, nil
 	}
 	if info.EntriesAdded > 0 && consumerGroup.EntriesRead >= 0 && consumerGroup.Lag >= 0 {
 		if consumerGroup.EntriesRead > info.EntriesAdded || consumerGroup.Lag > info.EntriesAdded-consumerGroup.EntriesRead {
-			b.setDegraded()
-			return ErrStreamGap
+			return true, nil
 		}
 		if consumerGroup.EntriesRead+consumerGroup.Lag < info.EntriesAdded {
-			b.setDegraded()
-			return ErrStreamGap
+			return true, nil
 		}
-		return nil
+		return false, nil
 	}
 	if info.EntriesAdded > info.Length {
-		b.setDegraded()
-		return ErrStreamGap
+		return true, nil
 	}
-	return nil
+	return false, nil
+}
+
+func (b *EventBus) pendingPayloadMissing(ctx context.Context, pendingCount int64) (bool, error) {
+	const batchSize = int64(100)
+	start := "-"
+	var checked int64
+	for checked < pendingCount {
+		entries, err := b.client.XPendingExt(ctx, &goredis.XPendingExtArgs{
+			Stream: b.stream,
+			Group:  b.consumer.Group,
+			Start:  start,
+			End:    "+",
+			Count:  batchSize,
+		}).Result()
+		if err != nil {
+			return false, err
+		}
+		if len(entries) == 0 {
+			return false, nil
+		}
+		for _, entry := range entries {
+			messages, err := b.client.XRangeN(ctx, b.stream, entry.ID, entry.ID, 1).Result()
+			if err != nil {
+				return false, err
+			}
+			if len(messages) != 1 || messages[0].ID != entry.ID {
+				return true, nil
+			}
+		}
+		checked += int64(len(entries))
+		if int64(len(entries)) < batchSize {
+			return false, nil
+		}
+		start = "(" + entries[len(entries)-1].ID
+	}
+	return false, nil
+}
+
+func sameContinuityStreamInfo(first, second *goredis.XInfoStream) bool {
+	return first.Length == second.Length &&
+		first.Groups == second.Groups &&
+		first.LastGeneratedID == second.LastGeneratedID &&
+		first.MaxDeletedEntryID == second.MaxDeletedEntryID &&
+		first.EntriesAdded == second.EntriesAdded &&
+		first.FirstEntry.ID == second.FirstEntry.ID &&
+		first.LastEntry.ID == second.LastEntry.ID &&
+		first.RecordedFirstEntryID == second.RecordedFirstEntryID
 }
 
 func (b *EventBus) Subscribe(ctx context.Context, handler func(sp.PlacementEvent) error) error {
@@ -341,6 +415,9 @@ func (b *EventBus) consume(ctx context.Context, id string, handler func(sp.Place
 				return err
 			}
 			if err := handler(event); err != nil {
+				if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+					return nil
+				}
 				b.setDegraded()
 				return err
 			}
