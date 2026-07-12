@@ -9,6 +9,7 @@ import (
 	"time"
 
 	sp "github.com/wxdqing/stable-placement"
+	"github.com/wxdqing/stable-placement/strategies"
 )
 
 type cachedRouterDirectory struct {
@@ -308,6 +309,176 @@ func TestCachedRouterConcurrentDegradeRecoverAndLookup(t *testing.T) {
 	wg.Wait()
 }
 
+func TestCachedRouterLookupDoesNotRefillAfterInvalidation(t *testing.T) {
+	key, _ := sp.NewGrainKey("Player", "10001")
+	events := []sp.PlacementEvent{
+		{Type: sp.EventPlacementReleased, GrainKey: key, PlacementVersion: 4},
+		{Type: sp.EventPlacementTransferred, GrainKey: key, PlacementVersion: 4},
+		{Type: sp.EventLeaseExpired, GrainKey: key, PlacementVersion: 4},
+		{Type: sp.EventNodeMarkedInvalid, NodeIdentity: "game/default/game-1"},
+	}
+	for _, event := range events {
+		t.Run(string(event.Type), func(t *testing.T) {
+			directory := newBlockingCachedRouterDirectory(activePlacement(key, "game/default/game-1"))
+			cache := NewPlacementCache()
+			router := NewCachedRouter(directory, cache)
+
+			result := make(chan error, 1)
+			go func() {
+				_, err := router.Lookup(context.Background(), key)
+				result <- err
+			}()
+			<-directory.lookupStarted
+			if err := router.HandleEvent(event); err != nil {
+				t.Fatalf("HandleEvent error: %v", err)
+			}
+			close(directory.lookupRelease)
+			if err := <-result; err != nil {
+				t.Fatalf("Lookup error: %v", err)
+			}
+			assertCached(t, cache, key, false)
+		})
+	}
+}
+
+func TestCachedRouterAllocateDoesNotRefillAfterInvalidation(t *testing.T) {
+	key, _ := sp.NewGrainKey("Player", "10001")
+	directory := newBlockingCachedRouterDirectory(activePlacement(key, "game/default/game-1"))
+	cache := NewPlacementCache()
+	router := NewCachedRouter(directory, cache)
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := router.Allocate(context.Background(), sp.AllocateCommand{Kind: "Player", GrainID: "10001"})
+		result <- err
+	}()
+	<-directory.allocateStarted
+	if err := router.HandleEvent(sp.PlacementEvent{
+		Type:             sp.EventPlacementTransferred,
+		GrainKey:         key,
+		PlacementVersion: 4,
+	}); err != nil {
+		t.Fatalf("HandleEvent error: %v", err)
+	}
+	close(directory.allocateRelease)
+	if err := <-result; err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	assertCached(t, cache, key, false)
+}
+
+func TestCachedRouterAllocateDoesNotRefillOlderThanCreatedEvent(t *testing.T) {
+	key, _ := sp.NewGrainKey("Player", "10001")
+	directory := newBlockingCachedRouterDirectory(activePlacement(key, "game/default/game-1"))
+	cache := NewPlacementCache()
+	router := NewCachedRouter(directory, cache)
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := router.Allocate(context.Background(), sp.AllocateCommand{Kind: "Player", GrainID: "10001"})
+		result <- err
+	}()
+	<-directory.allocateStarted
+	if err := router.HandleEvent(sp.PlacementEvent{
+		Type:             sp.EventPlacementCreated,
+		GrainKey:         key,
+		PlacementVersion: directory.placement.Version + 1,
+	}); err != nil {
+		t.Fatalf("HandleEvent error: %v", err)
+	}
+	close(directory.allocateRelease)
+	if err := <-result; err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	assertCached(t, cache, key, false)
+}
+
+func TestCachedRouterInflightRefillCannotCrossHealthTransition(t *testing.T) {
+	key, _ := sp.NewGrainKey("Player", "10001")
+	for _, operation := range []string{"lookup", "allocate"} {
+		for _, transition := range []string{"degrade", "recover"} {
+			t.Run(operation+"/"+transition, func(t *testing.T) {
+				directory := newBlockingCachedRouterDirectory(activePlacement(key, "game/default/game-1"))
+				cache := NewPlacementCache()
+				router := NewCachedRouter(directory, cache)
+				if transition == "recover" {
+					router.Degrade()
+				}
+
+				result := make(chan error, 1)
+				go func() {
+					var err error
+					if operation == "lookup" {
+						_, err = router.Lookup(context.Background(), key)
+					} else {
+						_, err = router.Allocate(context.Background(), sp.AllocateCommand{Kind: "Player", GrainID: "10001"})
+					}
+					result <- err
+				}()
+				if operation == "lookup" {
+					<-directory.lookupStarted
+				} else {
+					<-directory.allocateStarted
+				}
+				if transition == "degrade" {
+					router.Degrade()
+				} else {
+					router.Recover()
+				}
+				if operation == "lookup" {
+					close(directory.lookupRelease)
+				} else {
+					close(directory.allocateRelease)
+				}
+				if err := <-result; err != nil {
+					t.Fatalf("%s error: %v", operation, err)
+				}
+				assertCached(t, cache, key, false)
+			})
+		}
+	}
+}
+
+func TestCachedRouterAllocateCachesAfterSynchronousPlacementCreated(t *testing.T) {
+	ctx := context.Background()
+	bus := NewEventBus()
+	directory, err := NewDirectory(NewNodeRegistry(bus), sp.StrategyModeGo, strategies.NewRoundRobin(), bus)
+	if err != nil {
+		t.Fatalf("NewDirectory error: %v", err)
+	}
+	cache := NewPlacementCache()
+	router := NewCachedRouter(directory, cache)
+	if err := bus.Subscribe(ctx, router.HandleEvent); err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+	nodeIdentity, _ := sp.NewNodeIdentity("game", "default", "game-1")
+	if err := directory.NodeRegistry().RegisterNode(ctx, sp.Node{
+		NodeType:      "game",
+		NodeGroup:     "default",
+		NodeName:      "game-1",
+		NodeIdentity:  nodeIdentity.String(),
+		NodeSessionID: "session-a",
+		Status:        sp.NodeStatusActive,
+	}); err != nil {
+		t.Fatalf("RegisterNode error: %v", err)
+	}
+
+	placement, err := router.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	route, ok := cache.GetCachedPlacement(placement.GrainKey)
+	if !ok || route.Version != placement.Version {
+		t.Fatalf("cached route = %+v, ok %v; placement = %+v", route, ok, placement)
+	}
+}
+
 func activePlacement(key sp.GrainKey, nodeIdentity string) sp.Placement {
 	return sp.Placement{
 		GrainKey:      key,
@@ -352,6 +523,38 @@ func assertCached(t *testing.T, cache *PlacementCache, key sp.GrainKey, want boo
 type orderedPlacementCache struct {
 	*PlacementCache
 	calls []string
+}
+
+type blockingCachedRouterDirectory struct {
+	*cachedRouterDirectory
+	lookupStarted   chan struct{}
+	lookupRelease   chan struct{}
+	allocateStarted chan struct{}
+	allocateRelease chan struct{}
+}
+
+func newBlockingCachedRouterDirectory(placement sp.Placement) *blockingCachedRouterDirectory {
+	return &blockingCachedRouterDirectory{
+		cachedRouterDirectory: &cachedRouterDirectory{placement: placement},
+		lookupStarted:         make(chan struct{}),
+		lookupRelease:         make(chan struct{}),
+		allocateStarted:       make(chan struct{}),
+		allocateRelease:       make(chan struct{}),
+	}
+}
+
+func (d *blockingCachedRouterDirectory) Lookup(context.Context, sp.GrainKey) (*sp.Placement, error) {
+	placement := d.placement
+	close(d.lookupStarted)
+	<-d.lookupRelease
+	return &placement, nil
+}
+
+func (d *blockingCachedRouterDirectory) Allocate(context.Context, sp.AllocateCommand) (*sp.Placement, error) {
+	placement := d.placement
+	close(d.allocateStarted)
+	<-d.allocateRelease
+	return &placement, nil
 }
 
 func (c *orderedPlacementCache) ClearPlacementCache() {
