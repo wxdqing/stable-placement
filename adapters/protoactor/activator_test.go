@@ -50,3 +50,16 @@ func TestSerialActivatorRejectsExpectedRouteMismatch(t *testing.T) {
 		t.Fatal("stale activation succeeded")
 	}
 }
+
+func TestSerialActivatorReadsLocalAddressAtActivationTime(t *testing.T) {
+	lookup := &resolverDirectory{route: sp.PlacementRoute{GrainKey: "player/acct-1", NodeIdentity: "game/server-1/game-1", OwnerNodeSessionID: "s", Version: 1, ValidUntil: time.Now().Add(time.Minute)}}
+	address := "before-remote-start"
+	activator := NewSerialActivatorWithAddress(lookup, "game/server-1/game-1", "s", func() string { return address }, func(context.Context, *cluster.ClusterIdentity) (*actor.PID, error) {
+		return actor.NewPID(address, "player-acct-1"), nil
+	})
+	address = "127.0.0.1:12001"
+	pid, err := activator.Activate(context.Background(), cluster.NewClusterIdentity("acct-1", "player"), lookup.route)
+	if err != nil || pid.Address != address {
+		t.Fatalf("pid=%v err=%v", pid, err)
+	}
+}

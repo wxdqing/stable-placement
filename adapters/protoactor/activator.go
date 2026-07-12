@@ -14,19 +14,24 @@ import (
 type SpawnFunc func(context.Context, *cluster.ClusterIdentity) (*actor.PID, error)
 
 type SerialActivator struct {
-	directory                                 RouteDirectory
-	nodeIdentity, nodeSessionID, localAddress string
-	spawn                                     SpawnFunc
-	mu                                        sync.Mutex
-	active                                    map[sp.GrainKey]PIDRoute
+	directory                   RouteDirectory
+	nodeIdentity, nodeSessionID string
+	localAddress                func() string
+	spawn                       SpawnFunc
+	mu                          sync.Mutex
+	active                      map[sp.GrainKey]PIDRoute
 }
 
 func NewSerialActivator(directory RouteDirectory, nodeIdentity, nodeSessionID, localAddress string, spawn SpawnFunc) *SerialActivator {
+	return NewSerialActivatorWithAddress(directory, nodeIdentity, nodeSessionID, func() string { return localAddress }, spawn)
+}
+
+func NewSerialActivatorWithAddress(directory RouteDirectory, nodeIdentity, nodeSessionID string, localAddress func() string, spawn SpawnFunc) *SerialActivator {
 	return &SerialActivator{directory: directory, nodeIdentity: nodeIdentity, nodeSessionID: nodeSessionID, localAddress: localAddress, spawn: spawn, active: make(map[sp.GrainKey]PIDRoute)}
 }
 
 func (a *SerialActivator) Activate(ctx context.Context, identity *cluster.ClusterIdentity, expected sp.PlacementRoute) (*actor.PID, error) {
-	if a == nil || a.directory == nil || a.spawn == nil || identity == nil {
+	if a == nil || a.directory == nil || a.spawn == nil || a.localAddress == nil || identity == nil {
 		return nil, fmt.Errorf("serial activator is not configured")
 	}
 	if expected.NodeIdentity != a.nodeIdentity || expected.OwnerNodeSessionID != a.nodeSessionID {
@@ -52,7 +57,7 @@ func (a *SerialActivator) Activate(ctx context.Context, identity *cluster.Cluste
 	if err != nil {
 		return nil, err
 	}
-	if pid == nil || pid.Address != a.localAddress {
+	if pid == nil || pid.Address != a.localAddress() {
 		return nil, fmt.Errorf("activation returned non-local PID")
 	}
 	a.active[key] = pidRoute(pid, current)

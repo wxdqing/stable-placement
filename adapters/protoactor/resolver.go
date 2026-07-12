@@ -102,6 +102,11 @@ func (r *Resolver) Remove(identity *cluster.ClusterIdentity, pid *actor.PID) {
 		delete(r.cache, key)
 	}
 	r.mu.Unlock()
+	if remover, ok := r.activator.(interface {
+		Remove(*cluster.ClusterIdentity, *actor.PID)
+	}); ok {
+		remover.Remove(identity, pid)
+	}
 }
 
 func (r *Resolver) HandleEvent(event sp.PlacementEvent) {

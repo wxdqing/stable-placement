@@ -104,3 +104,25 @@ func TestResolverDegradeClearsAndDisablesCache(t *testing.T) {
 		t.Fatalf("calls=%d/%d", directory.calls, activator.calls)
 	}
 }
+
+func TestResolverRemoveClearsActivatorPIDWithoutReleasingPlacement(t *testing.T) {
+	pid := actor.NewPID("local", "player")
+	activator := &removableActivator{recordingActivator: recordingActivator{pid: pid}}
+	resolver := NewResolver(&resolverDirectory{}, map[string]sp.KindRouteConfig{}, activator)
+	identity := cluster.NewClusterIdentity("acct-1", "player")
+	resolver.cache["player/acct-1"] = PIDRoute{PID: pid, GrainKey: "player/acct-1"}
+	resolver.Remove(identity, pid)
+	if activator.removeCalls != 1 {
+		t.Fatalf("activator remove calls=%d", activator.removeCalls)
+	}
+	if _, ok := resolver.cache["player/acct-1"]; ok {
+		t.Fatal("resolver cache retained stopped PID")
+	}
+}
+
+type removableActivator struct {
+	recordingActivator
+	removeCalls int
+}
+
+func (a *removableActivator) Remove(*cluster.ClusterIdentity, *actor.PID) { a.removeCalls++ }
