@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +48,8 @@ type redisNode struct {
 	sp.Node
 	PlacementNodeKey string
 }
+
+const maxPlacementIndexScore = int64(1<<53 - 1)
 
 func NewDirectory(client goredis.UniversalClient, mode sp.StrategyMode) (*Directory, error) {
 	if mode != sp.StrategyModeRedisRoundRobin {
@@ -460,6 +463,10 @@ func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (s
 		status = sp.PlacementStatusActive
 	}
 	var placements []sp.Placement
+	var placementScores []int64
+	var placementKeys []string
+	var previousScore int64
+	hasPreviousScore := false
 	indexKey := PlacementNodeKey(query.NodeIdentity)
 	for {
 		values, err := d.client.ZRangeByScoreWithScores(ctx, indexKey, &goredis.ZRangeBy{
@@ -473,7 +480,18 @@ func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (s
 		if len(values) == 0 {
 			break
 		}
-		for index, value := range values {
+		var lastScore int64
+		for _, value := range values {
+			if math.IsNaN(value.Score) || math.IsInf(value.Score, 0) || math.Trunc(value.Score) != value.Score || value.Score < 0 || value.Score > float64(maxPlacementIndexScore) {
+				return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %v", value.Score)
+			}
+			score := int64(value.Score)
+			if hasPreviousScore && score <= previousScore {
+				return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %d: scores must be unique and increasing", score)
+			}
+			previousScore = score
+			hasPreviousScore = true
+			lastScore = score
 			key, ok := value.Member.(string)
 			if !ok {
 				return sp.PlacementPage{}, fmt.Errorf("invalid placement index member type %T", value.Member)
@@ -489,30 +507,18 @@ func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (s
 				continue
 			}
 			placements = append(placements, *placement)
-			if len(placements) == limit {
-				hasMore := index+1 < len(values)
-				if !hasMore && int64(len(values)) == batchSize {
-					nextValues, err := d.client.ZRangeByScoreWithScores(ctx, indexKey, &goredis.ZRangeBy{
-						Min:   "(" + strconv.FormatInt(int64(value.Score), 10),
-						Max:   "+inf",
-						Count: batchSize,
-					}).Result()
-					if err != nil {
-						return sp.PlacementPage{}, err
-					}
-					hasMore = len(nextValues) > 0
-				}
-				next := ""
-				if hasMore {
-					next = formatCursor(int64(value.Score), key)
-				}
-				return sp.PlacementPage{Placements: placements, NextCursor: next}, nil
+			placementScores = append(placementScores, score)
+			placementKeys = append(placementKeys, key)
+			if len(placements) > limit {
+				return sp.PlacementPage{
+					Placements: placements[:limit],
+					NextCursor: formatCursor(placementScores[limit-1], placementKeys[limit-1]),
+				}, nil
 			}
 		}
 		if int64(len(values)) < batchSize {
 			break
 		}
-		lastScore := int64(values[len(values)-1].Score)
 		min = "(" + strconv.FormatInt(lastScore, 10)
 	}
 	return sp.PlacementPage{Placements: placements}, nil
@@ -588,14 +594,6 @@ func (d *Directory) setPlacement(ctx context.Context, placement sp.Placement) er
 		return err
 	}
 	return d.client.Set(ctx, PlacementKey(placement.GrainKey), value, 0).Err()
-}
-
-func (d *Directory) addPlacementNodeIndex(ctx context.Context, nodeIdentity string, key sp.GrainKey) error {
-	score, err := d.client.Incr(ctx, SequenceKey()).Result()
-	if err != nil {
-		return err
-	}
-	return d.client.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: float64(score), Member: key.String()}).Err()
 }
 
 func (d *Directory) allocateWithLua(ctx context.Context, placement sp.Placement, nodeType string, nodeGroup string, oldRaw string, oldNodeKey string, now time.Time) (*sp.Placement, error) {

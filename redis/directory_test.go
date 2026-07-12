@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -85,6 +87,15 @@ func (c invalidPlacementIndexClient) ZRangeByScoreWithScores(context.Context, st
 	return goredis.NewZSliceCmdResult([]goredis.Z{{Score: 1, Member: 42}}, nil)
 }
 
+type staticPlacementIndexClient struct {
+	goredis.UniversalClient
+	values []goredis.Z
+}
+
+func (c staticPlacementIndexClient) ZRangeByScoreWithScores(context.Context, string, *goredis.ZRangeBy) *goredis.ZSliceCmd {
+	return goredis.NewZSliceCmdResult(c.values, nil)
+}
+
 func newTestDirectory(t *testing.T) (*Directory, *goredis.Client) {
 	t.Helper()
 	server := miniredis.RunT(t)
@@ -94,6 +105,27 @@ func newTestDirectory(t *testing.T) (*Directory, *goredis.Client) {
 		t.Fatal(err)
 	}
 	return dir, client
+}
+
+func addIndexedPlacement(t *testing.T, client *goredis.Client, nodeIdentity, grainID string, score float64, status sp.PlacementStatus) sp.GrainKey {
+	t.Helper()
+	key, err := sp.NewGrainKey("Player", grainID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	placement := sp.Placement{GrainID: grainID, Kind: "Player", GrainKey: key, NodeIdentity: nodeIdentity, Status: status}
+	raw, err := json.Marshal(placement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := client.Set(ctx, PlacementKey(key), raw, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: score, Member: key.String()}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	return key
 }
 
 func TestRedisDirectoryRejectsGoStrategyMode(t *testing.T) {
@@ -274,6 +306,191 @@ func TestRedisDirectoryFindByNodeUsesBoundedReads(t *testing.T) {
 		if count <= 0 || count > 100 {
 			t.Fatalf("query Count = %d, want 1..100; all counts = %v", count, recording.counts)
 		}
+	}
+}
+
+func TestRedisDirectoryFindByNodeCursorReflectsValidResults(t *testing.T) {
+	const nodeIdentity = "game/default/game-1"
+	ctx := context.Background()
+
+	t.Run("no cursor when only filtered and stale members follow", func(t *testing.T) {
+		server := miniredis.RunT(t)
+		client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+		dir, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addIndexedPlacement(t, client, nodeIdentity, "active-1", 1, sp.PlacementStatusActive)
+		addIndexedPlacement(t, client, nodeIdentity, "active-2", 2, sp.PlacementStatusActive)
+		addIndexedPlacement(t, client, nodeIdentity, "released", 3, sp.PlacementStatusReleased)
+		staleKey, _ := sp.NewGrainKey("Player", "stale")
+		if err := client.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: 4, Member: staleKey.String()}).Err(); err != nil {
+			t.Fatal(err)
+		}
+
+		page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: nodeIdentity, Limit: 2})
+		if err != nil {
+			t.Fatalf("FindByNode error: %v", err)
+		}
+		if len(page.Placements) != 2 || page.NextCursor != "" {
+			t.Fatalf("FindByNode page = %+v, want two placements and no cursor", page)
+		}
+	})
+
+	t.Run("error after filtered and stale members discards page", func(t *testing.T) {
+		server := miniredis.RunT(t)
+		client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+		dir, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addIndexedPlacement(t, client, nodeIdentity, "active-1", 1, sp.PlacementStatusActive)
+		addIndexedPlacement(t, client, nodeIdentity, "active-2", 2, sp.PlacementStatusActive)
+		addIndexedPlacement(t, client, nodeIdentity, "released", 3, sp.PlacementStatusReleased)
+		staleKey, _ := sp.NewGrainKey("Player", "stale")
+		if err := client.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: 4, Member: staleKey.String()}).Err(); err != nil {
+			t.Fatal(err)
+		}
+		brokenKey, _ := sp.NewGrainKey("Player", "broken-after-limit")
+		if err := client.Set(ctx, PlacementKey(brokenKey), "{", 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: 5, Member: brokenKey.String()}).Err(); err != nil {
+			t.Fatal(err)
+		}
+
+		page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: nodeIdentity, Limit: 2})
+		if err == nil || len(page.Placements) != 0 || page.NextCursor != "" {
+			t.Fatalf("FindByNode page = %+v, err = %v, want empty page and data error", page, err)
+		}
+	})
+
+	t.Run("cursor points to the last returned placement when another valid result exists", func(t *testing.T) {
+		server := miniredis.RunT(t)
+		client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+		dir, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addIndexedPlacement(t, client, nodeIdentity, "active-1", 1, sp.PlacementStatusActive)
+		secondKey := addIndexedPlacement(t, client, nodeIdentity, "active-2", 2, sp.PlacementStatusActive)
+		thirdKey := addIndexedPlacement(t, client, nodeIdentity, "active-3", 3, sp.PlacementStatusActive)
+
+		first, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: nodeIdentity, Limit: 2})
+		if err != nil {
+			t.Fatalf("first FindByNode error: %v", err)
+		}
+		if len(first.Placements) != 2 || first.NextCursor != formatCursor(2, secondKey.String()) {
+			t.Fatalf("first page = %+v, want cursor after second placement", first)
+		}
+		second, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: nodeIdentity, Cursor: first.NextCursor, Limit: 2})
+		if err != nil {
+			t.Fatalf("second FindByNode error: %v", err)
+		}
+		if len(second.Placements) != 1 || second.Placements[0].GrainKey != thirdKey || second.NextCursor != "" {
+			t.Fatalf("second page = %+v, want third placement only", second)
+		}
+	})
+}
+
+func TestRedisDirectoryFindByNodeRejectsInvalidScores(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		scores []float64
+	}{
+		{name: "fractional", scores: []float64{1.5}},
+		{name: "NaN", scores: []float64{math.NaN()}},
+		{name: "above safe integer", scores: []float64{9007199254740992}},
+		{name: "duplicate", scores: []float64{1, 1}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := miniredis.RunT(t)
+			base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+			var values []goredis.Z
+			for index, score := range test.scores {
+				key := addIndexedPlacement(t, base, "game/default/game-1", "score-"+strconv.Itoa(index), float64(index+1), sp.PlacementStatusActive)
+				values = append(values, goredis.Z{Score: score, Member: key.String()})
+			}
+			dir, err := NewDirectory(staticPlacementIndexClient{UniversalClient: base, values: values}, sp.StrategyModeRedisRoundRobin)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			page, err := dir.FindByNode(context.Background(), sp.FindByNodeQuery{NodeIdentity: "game/default/game-1", Limit: 10})
+			if err == nil || !strings.Contains(err.Error(), "invalid placement index score") {
+				t.Fatalf("FindByNode error = %v, want invalid placement index score", err)
+			}
+			if len(page.Placements) != 0 || page.NextCursor != "" {
+				t.Fatalf("FindByNode page = %+v, want empty page on invalid score", page)
+			}
+		})
+	}
+}
+
+func TestRedisDirectoryAllocateAcceptsLargestSafeSequenceResult(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	registerTestNode(t, dir, "game-1", "session-a")
+	if err := client.Set(ctx, SequenceKey(), "9007199254740990", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID: "largest-safe-score", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	if sequence := client.Get(ctx, SequenceKey()).Val(); sequence != "9007199254740991" {
+		t.Fatalf("sequence = %q, want largest safe integer", sequence)
+	}
+	if score := client.ZScore(ctx, PlacementNodeKey(placement.NodeIdentity), placement.GrainKey.String()).Val(); score != 9007199254740991 {
+		t.Fatalf("placement score = %.0f, want largest safe integer", score)
+	}
+}
+
+func TestRedisDirectoryTransferSequencePreflightKeepsAllState(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	oldNode := registerTestNode(t, dir, "game-1", "session-a")
+	newNode := registerTestNode(t, dir, "game-2", "session-b")
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID: "transfer-sequence-bound", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if placement.NodeIdentity != oldNode.NodeIdentity {
+		t.Fatalf("allocated node = %q, want %q", placement.NodeIdentity, oldNode.NodeIdentity)
+	}
+	if err := client.Set(ctx, SequenceKey(), "9007199254740991", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	oldRaw := client.Get(ctx, PlacementKey(placement.GrainKey)).Val()
+	oldNodeScore := client.ZScore(ctx, PlacementNodeKey(oldNode.NodeIdentity), placement.GrainKey.String()).Val()
+	eventsBefore := client.XLen(ctx, EventsStreamKey()).Val()
+
+	_, err = dir.Transfer(ctx, sp.TransferCommand{
+		GrainKey: placement.GrainKey, FromNodeIdentity: oldNode.NodeIdentity, ToNodeIdentity: newNode.NodeIdentity,
+		PlacementVersion: placement.Version, LeaseTTL: time.Minute,
+	})
+	if err == nil || !strings.Contains(err.Error(), "INVALID_COUNTER sequence") {
+		t.Fatalf("Transfer error = %v, want INVALID_COUNTER sequence", err)
+	}
+	if raw := client.Get(ctx, PlacementKey(placement.GrainKey)).Val(); raw != oldRaw {
+		t.Fatal("placement changed after sequence preflight error")
+	}
+	if sequence := client.Get(ctx, SequenceKey()).Val(); sequence != "9007199254740991" {
+		t.Fatalf("sequence = %q, want unchanged", sequence)
+	}
+	if score := client.ZScore(ctx, PlacementNodeKey(oldNode.NodeIdentity), placement.GrainKey.String()).Val(); score != oldNodeScore {
+		t.Fatalf("old node score = %v, want %v", score, oldNodeScore)
+	}
+	if _, err := client.ZScore(ctx, PlacementNodeKey(newNode.NodeIdentity), placement.GrainKey.String()).Result(); !errors.Is(err, goredis.Nil) {
+		t.Fatalf("new node index error = %v, want redis.Nil", err)
+	}
+	if events := client.XLen(ctx, EventsStreamKey()).Val(); events != eventsBefore {
+		t.Fatalf("events = %d, want %d", events, eventsBefore)
 	}
 }
 

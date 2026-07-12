@@ -406,6 +406,7 @@ func TestRedisDirectoryAllocateCounterPreflightKeepsAllState(t *testing.T) {
 		{name: "round-robin int64 max", key: func() string { return StrategyRoundRobinKey("game", "default") }, label: "round_robin", value: "9223372036854775807"},
 		{name: "sequence non-integer", key: SequenceKey, label: "sequence", value: "not-an-integer"},
 		{name: "sequence leading zero", key: SequenceKey, label: "sequence", value: "0001"},
+		{name: "sequence safe integer max", key: SequenceKey, label: "sequence", value: "9007199254740991"},
 		{name: "sequence int64 max", key: SequenceKey, label: "sequence", value: "9223372036854775807"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

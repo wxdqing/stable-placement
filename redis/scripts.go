@@ -22,7 +22,7 @@ local function expect_type(key, expected, label)
 	return nil
 end
 
-local function read_counter(key, label)
+local function read_counter(key, label, maximum)
 	local raw = redis.call("GET", key)
 	if not raw then
 		return "0", nil
@@ -33,7 +33,6 @@ local function read_counter(key, label)
 	if #raw > 1 and string.sub(raw, 1, 1) == "0" then
 		return nil, redis.error_reply("INVALID_COUNTER " .. label .. " must not contain leading zeros")
 	end
-	local maximum = "9223372036854775807"
 	if #raw > #maximum or (#raw == #maximum and raw >= maximum) then
 		return nil, redis.error_reply("INVALID_COUNTER " .. label .. " must be less than " .. maximum)
 	end
@@ -101,11 +100,11 @@ if #effective == 0 then
 	return "no_available_node"
 end
 
-local cursor, counter_error = read_counter(KEYS[4], "round_robin")
+local cursor, counter_error = read_counter(KEYS[4], "round_robin", "9223372036854775807")
 if counter_error then
 	return counter_error
 end
-local _, sequence_error = read_counter(KEYS[6], "sequence")
+local _, sequence_error = read_counter(KEYS[6], "sequence", "9007199254740991")
 if sequence_error then
 	return sequence_error
 end
@@ -198,6 +197,22 @@ return updated
 `
 
 const mutationLua = `
+local function validate_sequence_counter(key)
+	local raw = redis.call("GET", key)
+	if not raw then return nil end
+	if not string.match(raw, "^%d+$") then
+		return redis.error_reply("INVALID_COUNTER sequence must be a non-negative decimal")
+	end
+	if #raw > 1 and string.sub(raw, 1, 1) == "0" then
+		return redis.error_reply("INVALID_COUNTER sequence must not contain leading zeros")
+	end
+	local maximum = "9007199254740991"
+	if #raw > #maximum or (#raw == #maximum and raw >= maximum) then
+		return redis.error_reply("INVALID_COUNTER sequence must be less than " .. maximum)
+	end
+	return nil
+end
+
 if ARGV[12] == "1" then
 	local node = redis.call("GET", KEYS[7])
 	if not node then
@@ -232,6 +247,11 @@ end
 
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then
 	return "conflict"
+end
+
+if ARGV[4] == "1" then
+	local sequence_error = validate_sequence_counter(KEYS[5])
+	if sequence_error then return sequence_error end
 end
 
 redis.call("SET", KEYS[1], updated_placement)
