@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -907,12 +908,15 @@ func marshalRedisNode(node sp.Node) ([]byte, error) {
 }
 
 func normalizeNode(node *sp.Node) error {
+	identity, err := sp.NewNodeIdentity(node.NodeType, node.NodeGroup, node.NodeName)
+	if err != nil {
+		return err
+	}
+	expected := identity.String()
 	if node.NodeIdentity == "" {
-		identity, err := sp.NewNodeIdentity(node.NodeType, node.NodeGroup, node.NodeName)
-		if err != nil {
-			return err
-		}
-		node.NodeIdentity = identity.String()
+		node.NodeIdentity = expected
+	} else if node.NodeIdentity != expected {
+		return fmt.Errorf("node identity mismatch: expected %q, got %q", expected, node.NodeIdentity)
 	}
 	if node.Status == "" {
 		node.Status = sp.NodeStatusActive

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -123,6 +124,88 @@ func TestRedisDirectoryExpireHeartbeatsWritesOfflineEventOnce(t *testing.T) {
 	}
 }
 
+func TestRedisDirectoryExpireHeartbeatsPaginatesEqualScoresPastStaleMembers(t *testing.T) {
+	ctx := context.Background()
+	dir, base := newTestDirectory(t)
+	dir.SetHeartbeatTTL(time.Second)
+	heartbeatKey := NodeHeartbeatKey("game", "default")
+	now := time.Now().Truncate(time.Millisecond)
+	sharedScore := now.Add(-2 * time.Second).UnixMilli()
+	members := []string{
+		NodeKey("game/default/game-a"),
+		NodeKey("game/default/game-b"),
+		NodeKey("game/default/game-c"),
+		NodeKey("game/default/game-d"),
+	}
+	sort.Strings(members)
+	writeNode := func(member string, node sp.Node) {
+		t.Helper()
+		raw, err := marshalRedisNode(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := base.Set(ctx, member, raw, 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeNode(members[0], sp.Node{
+		NodeType: "game", NodeGroup: "default", NodeName: "draining",
+		NodeIdentity: "game/default/draining", NodeSessionID: "session-a", Status: sp.NodeStatusDraining,
+	})
+	// members[1] intentionally has no raw node.
+	writeNode(members[2], sp.Node{
+		NodeType: "game", NodeGroup: "other", NodeName: "wrong-group",
+		NodeIdentity: "game/other/wrong-group", NodeSessionID: "session-c", Status: sp.NodeStatusActive,
+	})
+	active := sp.Node{
+		NodeType: "game", NodeGroup: "default", NodeName: "active",
+		NodeIdentity: "game/default/active", NodeSessionID: "session-d", Status: sp.NodeStatusActive,
+		LastHeartbeatAt: time.UnixMilli(sharedScore),
+	}
+	writeNode(members[3], active)
+	for _, member := range members {
+		if err := base.ZAdd(ctx, heartbeatKey, goredis.Z{Score: float64(sharedScore), Member: member}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recording := &zRangeCountClient{UniversalClient: base}
+	dir.client = recording
+
+	count, err := dir.ExpireHeartbeats(ctx, "game", "default", now, 1)
+	if err != nil {
+		t.Fatalf("ExpireHeartbeats error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("ExpireHeartbeats count = %d, want 1", count)
+	}
+	counts := recording.Counts()
+	if len(counts) < len(members) || len(counts) > maxExpireScanRounds {
+		t.Fatalf("query rounds = %d, want [%d, %d]; counts = %v", len(counts), len(members), maxExpireScanRounds, counts)
+	}
+	for _, queryCount := range counts {
+		if queryCount > 1 {
+			t.Fatalf("query Count = %d, want <= 1; all counts = %v", queryCount, counts)
+		}
+	}
+	if remaining := base.ZCard(ctx, heartbeatKey).Val(); remaining != 0 {
+		t.Fatalf("heartbeat members remaining = %d, want 0", remaining)
+	}
+	raw, err := base.Get(ctx, members[3]).Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored sp.Node
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != sp.NodeStatusOffline {
+		t.Fatalf("active node status = %s, want offline", stored.Status)
+	}
+	if events := base.XLen(ctx, EventsStreamKey()).Val(); events != 1 {
+		t.Fatalf("offline events = %d, want 1", events)
+	}
+}
+
 func TestRedisDirectoryExpireHeartbeatsDoesNotExpireConcurrentRenew(t *testing.T) {
 	ctx := context.Background()
 	dir, base := newTestDirectory(t)
@@ -218,6 +301,86 @@ func TestRedisDirectoryRegisterHeartbeatWrongTypeKeepsState(t *testing.T) {
 	}
 }
 
+func TestRedisDirectoryRegisterRejectsNodeIdentityMetadataMismatchWithoutWrites(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	node := sp.Node{
+		NodeType:      "game",
+		NodeGroup:     "default",
+		NodeName:      "game-1",
+		NodeIdentity:  "game/other/game-1",
+		NodeSessionID: "session-a",
+	}
+
+	if err := dir.RegisterNode(ctx, node); err == nil {
+		t.Fatal("RegisterNode error = nil, want identity metadata mismatch")
+	}
+	keys := []string{
+		NodeKey(node.NodeIdentity),
+		NodeKey("game/default/game-1"),
+		NodesKey(node.NodeType, node.NodeGroup),
+		NodeHeartbeatKey(node.NodeType, node.NodeGroup),
+		EventsStreamKey(),
+	}
+	if exists := client.Exists(ctx, keys...).Val(); exists != 0 {
+		t.Fatalf("state exists after rejected register: %d keys", exists)
+	}
+}
+
+func TestRedisDirectoryReplaceRejectsNodeIdentityMetadataMismatchWithoutWrites(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	node := registerTestNode(t, dir, "game-1", "session-a")
+	nodeKey := NodeKey(node.NodeIdentity)
+	heartbeatKey := NodeHeartbeatKey(node.NodeType, node.NodeGroup)
+	rawBefore := client.Get(ctx, nodeKey).Val()
+	membersBefore := client.SMembers(ctx, NodesKey(node.NodeType, node.NodeGroup)).Val()
+	heartbeatBefore := client.ZScore(ctx, heartbeatKey, nodeKey).Val()
+	eventsBefore := client.XLen(ctx, EventsStreamKey()).Val()
+
+	replacement := node
+	replacement.NodeGroup = "other"
+	replacement.NodeSessionID = "session-b"
+	if _, err := dir.ReplaceNodeSession(ctx, replacement); err == nil {
+		t.Fatal("ReplaceNodeSession error = nil, want identity metadata mismatch")
+	}
+	if raw := client.Get(ctx, nodeKey).Val(); raw != rawBefore {
+		t.Fatalf("raw changed after rejected replace: got %q, want %q", raw, rawBefore)
+	}
+	if members := client.SMembers(ctx, NodesKey(node.NodeType, node.NodeGroup)).Val(); !sameStrings(members, membersBefore) {
+		t.Fatalf("nodes changed after rejected replace: got %v, want %v", members, membersBefore)
+	}
+	if score := client.ZScore(ctx, heartbeatKey, nodeKey).Val(); score != heartbeatBefore {
+		t.Fatalf("heartbeat changed after rejected replace: got %v, want %v", score, heartbeatBefore)
+	}
+	if events := client.XLen(ctx, EventsStreamKey()).Val(); events != eventsBefore {
+		t.Fatalf("events changed after rejected replace: got %d, want %d", events, eventsBefore)
+	}
+	if exists := client.Exists(ctx,
+		NodesKey(replacement.NodeType, replacement.NodeGroup),
+		NodeHeartbeatKey(replacement.NodeType, replacement.NodeGroup),
+	).Val(); exists != 0 {
+		t.Fatalf("replacement group state exists after rejection: %d keys", exists)
+	}
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	want := make(map[string]int, len(left))
+	for _, value := range left {
+		want[value]++
+	}
+	for _, value := range right {
+		want[value]--
+		if want[value] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func TestRedisDirectoryRunHeartbeatLoopStopsOnContextCancel(t *testing.T) {
 	dir, _ := newTestDirectory(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -272,6 +435,34 @@ func TestRedisDirectoryHeartbeatRawStoresOfflineStatus(t *testing.T) {
 	}
 	if stored.Status != sp.NodeStatusOffline {
 		t.Fatalf("stored status = %s, want offline", stored.Status)
+	}
+}
+
+func TestRedisDirectoryRenewNodeRejectsOfflineNodeWithoutWrites(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	dir.SetHeartbeatTTL(time.Second)
+	staleAt := time.Now().Add(-time.Minute)
+	node := registerHeartbeatTestNode(t, dir, "game-1", "session-a", staleAt)
+	if _, err := dir.ExpireHeartbeats(ctx, node.NodeType, node.NodeGroup, staleAt.Add(2*time.Second), 1); err != nil {
+		t.Fatalf("ExpireHeartbeats error: %v", err)
+	}
+	nodeKey := NodeKey(node.NodeIdentity)
+	heartbeatKey := NodeHeartbeatKey(node.NodeType, node.NodeGroup)
+	rawBefore := client.Get(ctx, nodeKey).Val()
+	eventsBefore := client.XLen(ctx, EventsStreamKey()).Val()
+
+	if err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
+		t.Fatalf("RenewNode offline error = %v, want ErrNodeNotFound", err)
+	}
+	if raw := client.Get(ctx, nodeKey).Val(); raw != rawBefore {
+		t.Fatalf("raw changed after rejected renew: got %q, want %q", raw, rawBefore)
+	}
+	if _, err := client.ZScore(ctx, heartbeatKey, nodeKey).Result(); !errors.Is(err, goredis.Nil) {
+		t.Fatalf("offline heartbeat re-added, error = %v", err)
+	}
+	if events := client.XLen(ctx, EventsStreamKey()).Val(); events != eventsBefore {
+		t.Fatalf("events changed after rejected renew: got %d, want %d", events, eventsBefore)
 	}
 }
 

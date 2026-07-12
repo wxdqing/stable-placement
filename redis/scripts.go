@@ -188,6 +188,7 @@ if type_error then return type_error end
 local raw = redis.call("GET", KEYS[1])
 if not raw then return "node_not_found" end
 local node = cjson.decode(raw)
+if node["Status"] ~= "active" then return "node_not_found" end
 if node["NodeSessionID"] ~= ARGV[1] then return "invalid_node_session" end
 node["LastHeartbeatAt"] = ARGV[2]
 local updated = cjson.encode(node)
@@ -414,10 +415,11 @@ if not raw then
 end
 if raw ~= ARGV[4] then return 0 end
 local node = cjson.decode(raw)
-if node["Status"] ~= "active" or node["NodeSessionID"] ~= ARGV[5]
-	or node["NodeType"] ~= ARGV[6] or node["NodeGroup"] ~= ARGV[7] then
+if node["Status"] ~= "active" or node["NodeType"] ~= ARGV[6] or node["NodeGroup"] ~= ARGV[7] then
+	redis.call("ZREM", KEYS[2], ARGV[1])
 	return 0
 end
+if node["NodeSessionID"] ~= ARGV[5] then return 0 end
 node["Status"] = "offline"
 redis.call("SET", KEYS[1], cjson.encode(node))
 redis.call("ZREM", KEYS[2], ARGV[1])

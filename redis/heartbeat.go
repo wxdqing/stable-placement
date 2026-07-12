@@ -25,22 +25,59 @@ func (d *Directory) ExpireHeartbeats(ctx context.Context, nodeType, nodeGroup st
 	d.heartbeatMu.RUnlock()
 	cutoff := now.Add(-ttl).UnixMilli()
 	heartbeatKey := NodeHeartbeatKey(nodeType, nodeGroup)
-	values, err := d.client.ZRangeByScoreWithScores(ctx, heartbeatKey, &goredis.ZRangeBy{
-		Min:   "-inf",
-		Max:   strconv.FormatInt(cutoff, 10),
-		Count: limit,
-	}).Result()
-	if err != nil {
-		return 0, err
+	type candidate struct {
+		member string
+		score  float64
+	}
+	var candidates []candidate
+	min := "-inf"
+	var cursorScore float64
+	var offsetWithinScore int64
+	hasCursor := false
+	for scan := 0; scan < maxExpireScanRounds; scan++ {
+		values, err := d.client.ZRangeByScoreWithScores(ctx, heartbeatKey, &goredis.ZRangeBy{
+			Min:    min,
+			Max:    strconv.FormatInt(cutoff, 10),
+			Offset: offsetWithinScore,
+			Count:  limit,
+		}).Result()
+		if err != nil {
+			return 0, err
+		}
+		if len(values) == 0 {
+			break
+		}
+		for _, value := range values {
+			member, ok := value.Member.(string)
+			if ok {
+				candidates = append(candidates, candidate{member: member, score: value.Score})
+			}
+		}
+
+		lastScore := values[len(values)-1].Score
+		trailingAtLastScore := int64(0)
+		for index := len(values) - 1; index >= 0 && values[index].Score == lastScore; index-- {
+			trailingAtLastScore++
+		}
+		if hasCursor && lastScore == cursorScore {
+			offsetWithinScore += trailingAtLastScore
+		} else {
+			cursorScore = lastScore
+			offsetWithinScore = trailingAtLastScore
+			hasCursor = true
+		}
+		min = strconv.FormatFloat(lastScore, 'f', -1, 64)
+		if int64(len(values)) < limit {
+			break
+		}
 	}
 
 	expired := 0
-	for _, value := range values {
-		member, ok := value.Member.(string)
-		if !ok {
-			continue
+	for _, candidate := range candidates {
+		if int64(expired) == limit {
+			break
 		}
-		raw, err := d.client.Get(ctx, member).Bytes()
+		raw, err := d.client.Get(ctx, candidate.member).Bytes()
 		if err == goredis.Nil {
 			raw = nil
 		} else if err != nil {
@@ -53,12 +90,12 @@ func (d *Directory) ExpireHeartbeats(ctx context.Context, nodeType, nodeGroup st
 			}
 		}
 		result, err := d.client.Eval(ctx, expireHeartbeatLua, []string{
-			member,
+			candidate.member,
 			heartbeatKey,
 			EventsStreamKey(),
 		},
-			member,
-			strconv.FormatFloat(value.Score, 'f', -1, 64),
+			candidate.member,
+			strconv.FormatFloat(candidate.score, 'f', -1, 64),
 			strconv.FormatInt(cutoff, 10),
 			string(raw),
 			node.NodeSessionID,

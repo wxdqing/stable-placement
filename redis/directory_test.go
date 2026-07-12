@@ -1078,7 +1078,7 @@ func TestRedisTransferRecoverLuaRejectsTargetMetadataChangedBeforeEval(t *testin
 						return
 					}
 					once.Do(func() {
-						replacement := sp.Node{
+						malicious := sp.Node{
 							NodeType:      "game",
 							NodeGroup:     "other",
 							NodeName:      "renamed",
@@ -1086,11 +1086,19 @@ func TestRedisTransferRecoverLuaRejectsTargetMetadataChangedBeforeEval(t *testin
 							NodeSessionID: "session-c",
 							Status:        sp.NodeStatusActive,
 						}
-						if _, err := dir.ReplaceNodeSession(ctx, replacement); err != nil {
-							t.Fatalf("ReplaceNodeSession in hook error: %v", err)
+						raw, err := marshalRedisNode(malicious)
+						if err != nil {
+							t.Fatalf("marshal malicious node error: %v", err)
 						}
-						if err := dir.MarkNodeInvalid(ctx, replacement.NodeType, replacement.NodeGroup, replacement.NodeName); err != nil {
-							t.Fatalf("MarkNodeInvalid in hook error: %v", err)
+						if err := base.Eval(ctx, `
+redis.call("SET", KEYS[1], ARGV[1])
+redis.call("SADD", KEYS[2], ARGV[2])
+return "ok"
+`, []string{
+							NodeKey(malicious.NodeIdentity),
+							InvalidNodesKey(malicious.NodeType, malicious.NodeGroup),
+						}, string(raw), malicious.NodeName).Err(); err != nil {
+							t.Fatalf("inject malicious node metadata error: %v", err)
 						}
 					})
 				},
