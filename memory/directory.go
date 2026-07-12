@@ -61,7 +61,7 @@ func (d *Directory) Lookup(_ context.Context, key sp.GrainKey) (*sp.PlacementRou
 		Version:            placement.Version,
 		Status:             placement.Status,
 		NodeLeaseVersion:   node.Lease.Version,
-		ValidUntil:         now.Add(time.Duration(node.Lease.ExpireAtUnixMilli-now.UnixMilli()) * time.Millisecond),
+		ValidUntil:         now.Add(time.UnixMilli(node.Lease.ExpireAtUnixMilli).Sub(now)),
 	}
 	d.registry.mu.RUnlock()
 	d.mu.RUnlock()

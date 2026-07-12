@@ -100,6 +100,21 @@ func TestNodeRegistryLeaseConfig(t *testing.T) {
 	}
 }
 
+func TestNodeRegistryRoundsPositiveSubMillisecondTTLUp(t *testing.T) {
+	start := time.Unix(100, 0)
+	clock := newFakeClock(start)
+	registry := newTestRegistry(t, clock, nil, 500*time.Microsecond)
+	node := testNode("game-1", "session-a")
+
+	if err := registry.RegisterNode(context.Background(), node); err != nil {
+		t.Fatalf("RegisterNode error: %v", err)
+	}
+	got, ok := registry.Node(node.NodeIdentity)
+	if !ok || got.Lease.TTLMillis != 1 || got.Lease.ExpireAtUnixMilli != start.Add(time.Millisecond).UnixMilli() {
+		t.Fatalf("registered node = %+v, ok=%v", got, ok)
+	}
+}
+
 func TestNodeRegistryRegisterLeaseRules(t *testing.T) {
 	ctx := context.Background()
 	start := time.Unix(100, 0)

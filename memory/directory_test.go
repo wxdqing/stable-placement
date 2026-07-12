@@ -98,6 +98,23 @@ func TestDirectoryLookupAndExistsRequireUsableOwnerLease(t *testing.T) {
 	}
 }
 
+func TestDirectoryLookupValidUntilDoesNotExceedPersistedLeaseDeadline(t *testing.T) {
+	directory, clock, _ := newTestDirectory(t)
+	clock.Set(time.Unix(1_000, int64(500*time.Microsecond)))
+	node := registerTestNode(t, directory, "game-1", "session-a")
+	placement := allocateTestPlacement(t, directory, "10001", node)
+
+	route, err := directory.Lookup(context.Background(), placement.GrainKey)
+	if err != nil {
+		t.Fatalf("Lookup error: %v", err)
+	}
+	nodeState, _ := directory.registry.Node(node.NodeIdentity)
+	persistedDeadline := time.UnixMilli(nodeState.Lease.ExpireAtUnixMilli)
+	if route.ValidUntil.After(persistedDeadline) {
+		t.Fatalf("ValidUntil = %v, exceeds persisted lease deadline %v", route.ValidUntil, persistedDeadline)
+	}
+}
+
 func TestDirectoryLookupRejectsReleasedPlacement(t *testing.T) {
 	directory, _, _ := newTestDirectory(t)
 	node := registerTestNode(t, directory, "game-1", "session-a")

@@ -30,6 +30,11 @@ func newNodeRegistry(publisher sp.EventPublisher, config sp.NodeLeaseConfig, now
 	if config.TTL <= 0 {
 		return nil, sp.ErrInvalidNodeLeaseTTL
 	}
+	ttlMillis := config.TTL.Milliseconds()
+	if config.TTL%time.Millisecond != 0 {
+		ttlMillis++
+	}
+	config.TTL = time.Duration(ttlMillis) * time.Millisecond
 	return &NodeRegistry{
 		nodes:     make(map[string]sp.Node),
 		invalid:   make(map[string]map[string]struct{}),
