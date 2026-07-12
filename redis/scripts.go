@@ -95,6 +95,17 @@ redis.call("XADD", KEYS[3], "*",
 return ARGV[2]
 `
 
+const renewNodeLua = `
+local raw = redis.call("GET", KEYS[1])
+if not raw then return "node_not_found" end
+local node = cjson.decode(raw)
+if node["NodeSessionID"] ~= ARGV[1] then return "invalid_node_session" end
+node["LastHeartbeatAt"] = ARGV[2]
+local updated = cjson.encode(node)
+redis.call("SET", KEYS[1], updated)
+return updated
+`
+
 const mutationLua = `
 if ARGV[12] == "1" then
 	local node = redis.call("GET", KEYS[7])
@@ -106,11 +117,30 @@ if ARGV[12] == "1" then
 	end
 end
 
+local updated_placement = ARGV[2]
+local event_node_identity = ARGV[9]
+if ARGV[14] == "1" then
+	local target_raw = redis.call("GET", KEYS[8])
+	if not target_raw then
+		return "no_available_node"
+	end
+	local target = cjson.decode(target_raw)
+	if target["Status"] ~= "active" or redis.call("SISMEMBER", KEYS[9], target["NodeName"]) ~= 0 then
+		return "no_available_node"
+	end
+	local placement = cjson.decode(updated_placement)
+	placement["NodeIdentity"] = target["NodeIdentity"]
+	placement["Lease"]["OwnerNodeIdentity"] = target["NodeIdentity"]
+	placement["Lease"]["OwnerNodeSessionID"] = target["NodeSessionID"]
+	updated_placement = cjson.encode(placement)
+	event_node_identity = target["NodeIdentity"]
+end
+
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then
 	return "conflict"
 end
 
-redis.call("SET", KEYS[1], ARGV[2])
+redis.call("SET", KEYS[1], updated_placement)
 if ARGV[3] == "1" then
 	redis.call("ZREM", KEYS[2], ARGV[6])
 end
@@ -126,10 +156,10 @@ end
 redis.call("XADD", KEYS[6], "*",
 	"type", ARGV[8],
 	"grain_key", ARGV[6],
-	"node_identity", ARGV[9],
+	"node_identity", event_node_identity,
 	"placement_version", ARGV[10],
 	"lease_version", ARGV[11])
-return ARGV[2]
+return updated_placement
 `
 
 const registerNodeLua = `

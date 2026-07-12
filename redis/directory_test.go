@@ -17,6 +17,26 @@ type evalHookClient struct {
 	beforeEval func(script string)
 }
 
+type setHookClient struct {
+	goredis.UniversalClient
+	beforeSet  func(key string)
+	beforeEval func(script string)
+}
+
+func (c setHookClient) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) *goredis.StatusCmd {
+	if c.beforeSet != nil {
+		c.beforeSet(key)
+	}
+	return c.UniversalClient.Set(ctx, key, value, expiration)
+}
+
+func (c setHookClient) Eval(ctx context.Context, script string, keys []string, args ...interface{}) *goredis.Cmd {
+	if c.beforeEval != nil {
+		c.beforeEval(script)
+	}
+	return c.UniversalClient.Eval(ctx, script, keys, args...)
+}
+
 func (c evalHookClient) Eval(ctx context.Context, script string, keys []string, args ...interface{}) *goredis.Cmd {
 	if c.beforeEval != nil {
 		c.beforeEval(script)
@@ -728,6 +748,278 @@ func TestRedisDirectoryRenewLuaRejectsSessionReplacedAfterGoValidation(t *testin
 	})
 	if !errors.Is(err, sp.ErrInvalidNodeSession) {
 		t.Fatalf("Renew err = %v, want ErrInvalidNodeSession", err)
+	}
+}
+
+func TestRedisRenewNodeLuaRejectsSessionReplacedBeforeEval(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	var dir *Directory
+	var err error
+	var once sync.Once
+	replaceSession := func(key string) {
+		if key != NodeKey("game/default/game-1") {
+			return
+		}
+		once.Do(func() {
+			replacement := sp.Node{
+				NodeType:      "game",
+				NodeGroup:     "default",
+				NodeName:      "game-1",
+				NodeIdentity:  "game/default/game-1",
+				NodeSessionID: "session-b",
+				Status:        sp.NodeStatusActive,
+			}
+			if _, err := dir.ReplaceNodeSession(ctx, replacement); err != nil {
+				t.Fatalf("ReplaceNodeSession in hook error: %v", err)
+			}
+		})
+	}
+	client := setHookClient{
+		UniversalClient: base,
+		beforeSet:       replaceSession,
+		beforeEval: func(script string) {
+			if script == renewNodeLua {
+				replaceSession(NodeKey("game/default/game-1"))
+			}
+		},
+	}
+	dir, err = NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := registerTestNode(t, dir, "game-1", "session-a")
+
+	err = dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID)
+	if !errors.Is(err, sp.ErrInvalidNodeSession) {
+		t.Fatalf("RenewNode err = %v, want ErrInvalidNodeSession", err)
+	}
+	stored, err := dir.getNode(ctx, node.NodeIdentity)
+	if err != nil {
+		t.Fatalf("getNode error: %v", err)
+	}
+	if stored.NodeSessionID != "session-b" {
+		t.Fatalf("stored session = %q, want session-b", stored.NodeSessionID)
+	}
+}
+
+func TestRedisTransferLuaRejectsTargetInvalidatedBeforeEval(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	var dir *Directory
+	var err error
+	var once sync.Once
+	client := evalHookClient{
+		UniversalClient: base,
+		beforeEval: func(script string) {
+			if script != mutationLua {
+				return
+			}
+			once.Do(func() {
+				if err := dir.MarkNodeInvalid(ctx, "game", "default", "game-2"); err != nil {
+					t.Fatalf("MarkNodeInvalid in hook error: %v", err)
+				}
+			})
+		},
+	}
+	dir, err = NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node1 := registerTestNode(t, dir, "game-1", "session-a")
+	node2 := registerTestNode(t, dir, "game-2", "session-b")
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+
+	_, err = dir.Transfer(ctx, sp.TransferCommand{
+		GrainKey:         placement.GrainKey,
+		FromNodeIdentity: node1.NodeIdentity,
+		ToNodeIdentity:   node2.NodeIdentity,
+		PlacementVersion: placement.Version,
+		LeaseTTL:         time.Minute,
+	})
+	if !errors.Is(err, sp.ErrNoAvailableNode) {
+		t.Fatalf("Transfer err = %v, want ErrNoAvailableNode", err)
+	}
+	stored, err := dir.Lookup(ctx, placement.GrainKey)
+	if err != nil {
+		t.Fatalf("Lookup after rejected transfer error: %v", err)
+	}
+	if stored.NodeIdentity != node1.NodeIdentity {
+		t.Fatalf("owner = %q, want %q", stored.NodeIdentity, node1.NodeIdentity)
+	}
+}
+
+func TestRedisRecoverLuaRejectsTargetUnregisteredBeforeEval(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	var dir *Directory
+	var err error
+	var once sync.Once
+	armed := false
+	client := evalHookClient{
+		UniversalClient: base,
+		beforeEval: func(script string) {
+			if script != mutationLua || !armed {
+				return
+			}
+			once.Do(func() {
+				if err := dir.UnregisterNode(ctx, "game/default/game-2", "session-b"); err != nil {
+					t.Fatalf("UnregisterNode in hook error: %v", err)
+				}
+			})
+		},
+	}
+	dir, err = NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node1 := registerTestNode(t, dir, "game-1", "session-a")
+	node2 := registerTestNode(t, dir, "game-2", "session-b")
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	if err := dir.Expire(ctx, sp.ExpireCommand{
+		GrainKey:     placement.GrainKey,
+		LeaseVersion: placement.Lease.Version,
+		Now:          placement.LeaseExpireAt.Add(time.Millisecond),
+	}); err != nil {
+		t.Fatalf("Expire error: %v", err)
+	}
+	expired, err := dir.getPlacement(ctx, placement.GrainKey)
+	if err != nil {
+		t.Fatalf("getPlacement after expire error: %v", err)
+	}
+	armed = true
+
+	_, err = dir.Recover(ctx, sp.RecoverCommand{
+		GrainKey:         placement.GrainKey,
+		NewNodeIdentity:  node2.NodeIdentity,
+		PlacementVersion: expired.Version,
+		LeaseTTL:         time.Minute,
+	})
+	if !errors.Is(err, sp.ErrNoAvailableNode) {
+		t.Fatalf("Recover err = %v, want ErrNoAvailableNode", err)
+	}
+	stored, err := dir.getPlacement(ctx, placement.GrainKey)
+	if err != nil {
+		t.Fatalf("getPlacement after rejected recover error: %v", err)
+	}
+	if *stored != *expired || stored.NodeIdentity != node1.NodeIdentity {
+		t.Fatalf("placement changed: got %+v, want %+v", stored, expired)
+	}
+}
+
+func TestRedisTransferRecoverLuaUsesTargetSessionReadDuringMutation(t *testing.T) {
+	for _, operation := range []string{"transfer", "recover"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			server := miniredis.RunT(t)
+			base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+			var dir *Directory
+			var err error
+			var once sync.Once
+			armed := false
+			client := evalHookClient{
+				UniversalClient: base,
+				beforeEval: func(script string) {
+					if script != mutationLua || !armed {
+						return
+					}
+					once.Do(func() {
+						replacement := sp.Node{
+							NodeType:      "game",
+							NodeGroup:     "default",
+							NodeName:      "game-2",
+							NodeIdentity:  "game/default/game-2",
+							NodeSessionID: "session-c",
+							Status:        sp.NodeStatusActive,
+						}
+						if _, err := dir.ReplaceNodeSession(ctx, replacement); err != nil {
+							t.Fatalf("ReplaceNodeSession in hook error: %v", err)
+						}
+					})
+				},
+			}
+			dir, err = NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			node1 := registerTestNode(t, dir, "game-1", "session-a")
+			node2 := registerTestNode(t, dir, "game-2", "session-b")
+			placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+				GrainID:         "10001",
+				Kind:            "Player",
+				TargetNodeType:  "game",
+				TargetNodeGroup: "default",
+				LeaseTTL:        time.Minute,
+			})
+			if err != nil {
+				t.Fatalf("Allocate error: %v", err)
+			}
+
+			var updated *sp.Placement
+			if operation == "transfer" {
+				armed = true
+				updated, err = dir.Transfer(ctx, sp.TransferCommand{
+					GrainKey:         placement.GrainKey,
+					FromNodeIdentity: node1.NodeIdentity,
+					ToNodeIdentity:   node2.NodeIdentity,
+					PlacementVersion: placement.Version,
+					LeaseTTL:         time.Minute,
+				})
+			} else {
+				if err := dir.Expire(ctx, sp.ExpireCommand{
+					GrainKey:     placement.GrainKey,
+					LeaseVersion: placement.Lease.Version,
+					Now:          placement.LeaseExpireAt.Add(time.Millisecond),
+				}); err != nil {
+					t.Fatalf("Expire error: %v", err)
+				}
+				expired, err := dir.getPlacement(ctx, placement.GrainKey)
+				if err != nil {
+					t.Fatalf("getPlacement after expire error: %v", err)
+				}
+				armed = true
+				updated, err = dir.Recover(ctx, sp.RecoverCommand{
+					GrainKey:         placement.GrainKey,
+					NewNodeIdentity:  node2.NodeIdentity,
+					PlacementVersion: expired.Version,
+					LeaseTTL:         time.Minute,
+				})
+			}
+			if err != nil {
+				t.Fatalf("%s error: %v", operation, err)
+			}
+			if updated.Lease.OwnerNodeSessionID != "session-c" {
+				t.Fatalf("returned session = %q, want session-c", updated.Lease.OwnerNodeSessionID)
+			}
+			stored, err := dir.getPlacement(ctx, placement.GrainKey)
+			if err != nil {
+				t.Fatalf("getPlacement error: %v", err)
+			}
+			if stored.Lease.OwnerNodeSessionID != "session-c" {
+				t.Fatalf("stored session = %q, want session-c", stored.Lease.OwnerNodeSessionID)
+			}
+		})
 	}
 }
 

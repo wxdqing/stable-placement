@@ -29,6 +29,9 @@ type mutationArgs struct {
 	checkNodeSession bool
 	nodeKey          string
 	nodeSessionID    string
+	checkTargetNode  bool
+	targetNodeKey    string
+	invalidNodesKey  string
 }
 
 type redisNode struct {
@@ -56,15 +59,21 @@ func (d *Directory) MarkNodeInvalid(ctx context.Context, nodeType string, nodeGr
 }
 
 func (d *Directory) RenewNode(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
-	node, err := d.getNode(ctx, nodeIdentity)
+	result, err := d.client.Eval(ctx, renewNodeLua, []string{NodeKey(nodeIdentity)},
+		nodeSessionID,
+		time.Now().Format(time.RFC3339Nano),
+	).Text()
 	if err != nil {
 		return err
 	}
-	if node.NodeSessionID != nodeSessionID {
+	switch result {
+	case "node_not_found":
+		return sp.ErrNodeNotFound
+	case "invalid_node_session":
 		return sp.ErrInvalidNodeSession
+	default:
+		return nil
 	}
-	node.LastHeartbeatAt = time.Now()
-	return d.setNode(ctx, *node)
 }
 
 func (d *Directory) UnregisterNode(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
@@ -282,14 +291,17 @@ func (d *Directory) Transfer(ctx context.Context, cmd sp.TransferCommand) (*sp.P
 		ExpireAt:           now.Add(ttl),
 	}
 	return d.mutateWithLua(ctx, mutationArgs{
-		oldRaw:        string(oldRaw),
-		placement:     *placement,
-		removeOldNode: true,
-		oldNodeKey:    oldNodeKey,
-		addNewNode:    true,
-		newNodeKey:    PlacementNodeKey(placement.NodeIdentity),
-		leaseMode:     "add",
-		eventType:     sp.EventPlacementTransferred,
+		oldRaw:          string(oldRaw),
+		placement:       *placement,
+		removeOldNode:   true,
+		oldNodeKey:      oldNodeKey,
+		addNewNode:      true,
+		newNodeKey:      PlacementNodeKey(placement.NodeIdentity),
+		leaseMode:       "add",
+		eventType:       sp.EventPlacementTransferred,
+		checkTargetNode: true,
+		targetNodeKey:   NodeKey(target.NodeIdentity),
+		invalidNodesKey: InvalidNodesKey(target.NodeType, target.NodeGroup),
 	})
 }
 
@@ -326,14 +338,17 @@ func (d *Directory) Recover(ctx context.Context, cmd sp.RecoverCommand) (*sp.Pla
 		ExpireAt:           now.Add(ttl),
 	}
 	return d.mutateWithLua(ctx, mutationArgs{
-		oldRaw:        string(oldRaw),
-		placement:     *placement,
-		removeOldNode: true,
-		oldNodeKey:    oldNodeKey,
-		addNewNode:    true,
-		newNodeKey:    PlacementNodeKey(placement.NodeIdentity),
-		leaseMode:     "add",
-		eventType:     sp.EventPlacementRecovered,
+		oldRaw:          string(oldRaw),
+		placement:       *placement,
+		removeOldNode:   true,
+		oldNodeKey:      oldNodeKey,
+		addNewNode:      true,
+		newNodeKey:      PlacementNodeKey(placement.NodeIdentity),
+		leaseMode:       "add",
+		eventType:       sp.EventPlacementRecovered,
+		checkTargetNode: true,
+		targetNodeKey:   NodeKey(target.NodeIdentity),
+		invalidNodesKey: InvalidNodesKey(target.NodeType, target.NodeGroup),
 	})
 }
 
@@ -607,6 +622,18 @@ func (d *Directory) mutateWithLua(ctx context.Context, args mutationArgs) (*sp.P
 	if nodeKey == "" {
 		nodeKey = NodeKey(args.placement.NodeIdentity)
 	}
+	checkTargetNode := "0"
+	if args.checkTargetNode {
+		checkTargetNode = "1"
+	}
+	targetNodeKey := args.targetNodeKey
+	if targetNodeKey == "" {
+		targetNodeKey = nodeKey
+	}
+	invalidNodesKey := args.invalidNodesKey
+	if invalidNodesKey == "" {
+		invalidNodesKey = targetNodeKey
+	}
 	result, err := d.client.Eval(ctx, mutationLua, []string{
 		PlacementKey(args.placement.GrainKey),
 		oldNodeKey,
@@ -615,6 +642,8 @@ func (d *Directory) mutateWithLua(ctx context.Context, args mutationArgs) (*sp.P
 		SequenceKey(),
 		EventsStreamKey(),
 		nodeKey,
+		targetNodeKey,
+		invalidNodesKey,
 	},
 		args.oldRaw,
 		string(value),
@@ -629,6 +658,7 @@ func (d *Directory) mutateWithLua(ctx context.Context, args mutationArgs) (*sp.P
 		strconv.FormatInt(args.placement.Lease.Version, 10),
 		checkNodeSession,
 		args.nodeSessionID,
+		checkTargetNode,
 	).Text()
 	if err != nil {
 		return nil, err
@@ -638,6 +668,9 @@ func (d *Directory) mutateWithLua(ctx context.Context, args mutationArgs) (*sp.P
 	}
 	if result == "conflict" {
 		return nil, sp.ErrVersionConflict
+	}
+	if result == "no_available_node" {
+		return nil, sp.ErrNoAvailableNode
 	}
 	var stored sp.Placement
 	if err := json.Unmarshal([]byte(result), &stored); err != nil {
@@ -821,14 +854,6 @@ func normalizeNode(node *sp.Node) error {
 		node.LastHeartbeatAt = time.Now()
 	}
 	return nil
-}
-
-func (d *Directory) setNode(ctx context.Context, node sp.Node) error {
-	value, err := marshalRedisNode(node)
-	if err != nil {
-		return err
-	}
-	return d.client.Set(ctx, NodeKey(node.NodeIdentity), value, 0).Err()
 }
 
 func parseCursorScore(cursor string) (int64, error) {
