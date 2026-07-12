@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -155,6 +156,9 @@ func (d *Directory) Lookup(ctx context.Context, key sp.GrainKey) (*sp.Placement,
 	if placement.Status != sp.PlacementStatusActive {
 		return nil, sp.ErrPlacementNotFound
 	}
+	if !placement.LeaseExpireAt.IsZero() && !time.Now().Before(placement.LeaseExpireAt) {
+		return nil, sp.ErrPlacementNotFound
+	}
 	return placement, nil
 }
 
@@ -163,33 +167,44 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 	if err != nil {
 		return nil, err
 	}
-	if existing, err := d.Lookup(ctx, key); err == nil {
-		return existing, nil
-	}
-
-	now := time.Now()
 	ttl := cmd.LeaseTTL
 	if ttl <= 0 {
 		ttl = time.Minute
 	}
-	placement := sp.Placement{
-		GrainID:       cmd.GrainID,
-		Kind:          cmd.Kind,
-		GrainKey:      key,
-		Status:        sp.PlacementStatusActive,
-		CreateTime:    now,
-		UpdateTime:    now,
-		LeaseExpireAt: now.Add(ttl),
-		Lease: sp.Lease{
-			Version:  1,
-			ExpireAt: now.Add(ttl),
-		},
+	for attempt := 0; attempt < 2; attempt++ {
+		oldRaw, existing, err := d.getPlacementRaw(ctx, key)
+		if err != nil && !errors.Is(err, sp.ErrPlacementNotFound) {
+			return nil, err
+		}
+		oldNodeKey := ""
+		if err == nil {
+			oldNodeKey = PlacementNodeKey(existing.NodeIdentity)
+			if existing.Status == sp.PlacementStatusActive &&
+				(existing.LeaseExpireAt.IsZero() || time.Now().Before(existing.LeaseExpireAt)) {
+				return existing, nil
+			}
+		}
+
+		now := time.Now()
+		placement := sp.Placement{
+			GrainID:       cmd.GrainID,
+			Kind:          cmd.Kind,
+			GrainKey:      key,
+			Status:        sp.PlacementStatusActive,
+			CreateTime:    now,
+			UpdateTime:    now,
+			LeaseExpireAt: now.Add(ttl),
+			Lease: sp.Lease{
+				Version:  1,
+				ExpireAt: now.Add(ttl),
+			},
+		}
+		stored, err := d.allocateWithLua(ctx, placement, cmd.TargetNodeType, cmd.TargetNodeGroup, string(oldRaw), oldNodeKey, now)
+		if !errors.Is(err, sp.ErrVersionConflict) || attempt == 1 {
+			return stored, err
+		}
 	}
-	stored, err := d.allocateWithLua(ctx, placement, cmd.TargetNodeType, cmd.TargetNodeGroup)
-	if err != nil {
-		return nil, err
-	}
-	return stored, nil
+	return nil, sp.ErrVersionConflict
 }
 
 func (d *Directory) Renew(ctx context.Context, cmd sp.RenewCommand) (*sp.Placement, error) {
@@ -534,7 +549,10 @@ func (d *Directory) addPlacementNodeIndex(ctx context.Context, nodeIdentity stri
 	return d.client.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: float64(score), Member: key.String()}).Err()
 }
 
-func (d *Directory) allocateWithLua(ctx context.Context, placement sp.Placement, nodeType string, nodeGroup string) (*sp.Placement, error) {
+func (d *Directory) allocateWithLua(ctx context.Context, placement sp.Placement, nodeType string, nodeGroup string, oldRaw string, oldNodeKey string, now time.Time) (*sp.Placement, error) {
+	if oldNodeKey == "" {
+		oldNodeKey = PlacementNodeKey("")
+	}
 	result, err := d.client.Eval(ctx, allocateLua, []string{
 		PlacementKey(placement.GrainKey),
 		NodesKey(nodeType, nodeGroup),
@@ -543,6 +561,7 @@ func (d *Directory) allocateWithLua(ctx context.Context, placement sp.Placement,
 		LeaseExpireKey(),
 		SequenceKey(),
 		EventsStreamKey(),
+		oldNodeKey,
 	},
 		placement.GrainID,
 		placement.Kind,
@@ -551,12 +570,17 @@ func (d *Directory) allocateWithLua(ctx context.Context, placement sp.Placement,
 		placement.LeaseExpireAt.Format(time.RFC3339Nano),
 		strconv.FormatInt(placement.LeaseExpireAt.UnixMilli(), 10),
 		string(sp.EventPlacementCreated),
+		strconv.FormatInt(now.UnixMilli(), 10),
+		oldRaw,
 	).Text()
 	if err != nil {
 		return nil, err
 	}
 	if result == "no_available_node" {
 		return nil, sp.ErrNoAvailableNode
+	}
+	if result == "conflict" {
+		return nil, sp.ErrVersionConflict
 	}
 	var stored sp.Placement
 	if err := json.Unmarshal([]byte(result), &stored); err != nil {

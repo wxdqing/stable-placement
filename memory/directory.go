@@ -51,6 +51,9 @@ func (d *Directory) Lookup(_ context.Context, key sp.GrainKey) (*sp.Placement, e
 	if !ok || placement.Status != sp.PlacementStatusActive {
 		return nil, sp.ErrPlacementNotFound
 	}
+	if !placement.LeaseExpireAt.IsZero() && !time.Now().Before(placement.LeaseExpireAt) {
+		return nil, sp.ErrPlacementNotFound
+	}
 	return copyPlacement(placement), nil
 }
 

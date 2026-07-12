@@ -41,6 +41,28 @@ func registerTestNode(t *testing.T, dir *Directory, name string, session string)
 	return node
 }
 
+func TestDirectoryLookupRejectsExpiredLease(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := newTestDirectory(t)
+	registerTestNode(t, dir, "game-1", "session-a")
+
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "expired-lookup",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	if _, err := dir.Lookup(ctx, placement.GrainKey); !errors.Is(err, sp.ErrPlacementNotFound) {
+		t.Fatalf("Lookup expired lease err = %v, want ErrPlacementNotFound", err)
+	}
+}
+
 func TestDirectoryAllocateLookupRenewTransferRelease(t *testing.T) {
 	ctx := context.Background()
 	dir, _ := newTestDirectory(t)

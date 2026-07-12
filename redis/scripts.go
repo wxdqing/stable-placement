@@ -13,12 +13,24 @@ const (
 const allocateLua = `
 local existing = redis.call("GET", KEYS[1])
 local next_version = 1
+local remove_old_node = false
 if existing then
 	local existing_placement = cjson.decode(existing)
 	if existing_placement["Status"] == "active" then
-		return existing
+		if ARGV[9] ~= "" and existing ~= ARGV[9] then
+			return "conflict"
+		end
+		local expire_at = redis.call("ZSCORE", KEYS[5], ARGV[3])
+		if not expire_at or tonumber(expire_at) > tonumber(ARGV[8]) then
+			return existing
+		end
+		remove_old_node = true
+	elseif existing ~= ARGV[9] then
+		return "conflict"
 	end
 	next_version = tonumber(existing_placement["Version"] or 0) + 1
+elseif ARGV[9] ~= "" then
+	return "conflict"
 end
 
 local candidate_keys = redis.call("SMEMBERS", KEYS[2])
@@ -57,6 +69,9 @@ local placement = {
 	},
 }
 local placement_raw = cjson.encode(placement)
+if remove_old_node then
+	redis.call("ZREM", KEYS[8], ARGV[3])
+end
 redis.call("SET", KEYS[1], placement_raw)
 redis.call("INCR", KEYS[4])
 local score = redis.call("INCR", KEYS[6])
