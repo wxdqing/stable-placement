@@ -99,7 +99,6 @@ func TestScaleUp_B5_ConcurrentAllocateUniqueGrain(t *testing.T) {
 				Kind:            "Player",
 				TargetNodeType:  h.nodeType,
 				TargetNodeGroup: h.nodeGroup,
-				LeaseTTL:        0,
 			})
 			errs <- err
 		}()

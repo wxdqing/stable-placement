@@ -40,25 +40,27 @@ func TestPlacement_D2_LookupMatchesAllocate(t *testing.T) {
 	}
 }
 
-func TestPlacement_D3_RenewAdvancesLeaseVersion(t *testing.T) {
+func TestPlacement_D3_RenewValidatesWithoutChangingPlacementOrNodeLease(t *testing.T) {
 	h := newHarness(t)
 	defer h.cleanup()
-	h.scenario("D3 Renew 推进 LeaseVersion")
+	h.scenario("D3 Renew 仅校验 Owner，不修改 Placement 或 Node Lease")
 
-	node := h.registerGame("game-1", "session-a")
+	h.registerGame("game-1", "session-a")
 	placement := h.allocate(h.grainID("d3"))
+	leaseBefore := h.listGameNodes()[0].Lease
 
 	renewed, err := h.dir.Renew(h.ctx, sp.RenewCommand{
 		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node.NodeIdentity,
-		NodeSessionID:    node.NodeSessionID,
+		NodeIdentity:     placement.NodeIdentity,
+		NodeSessionID:    placement.OwnerNodeSessionID,
 		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
-		ExtendTTL:        time.Minute,
 	})
 	h.must(err, "Renew")
-	if renewed.Lease.Version != placement.Lease.Version+1 {
-		t.Fatalf("lease version = %d", renewed.Lease.Version)
+	if renewed.Version != placement.Version || renewed.NodeIdentity != placement.NodeIdentity || renewed.OwnerNodeSessionID != placement.OwnerNodeSessionID {
+		t.Fatalf("renewed placement = %+v, want unchanged %+v", renewed, placement)
+	}
+	if leaseAfter := h.listGameNodes()[0].Lease; leaseAfter != leaseBefore {
+		t.Fatalf("Renew changed node lease: before=%+v after=%+v", leaseBefore, leaseAfter)
 	}
 }
 
@@ -76,8 +78,6 @@ func TestPlacement_D4_RenewRejectsWrongOwnerAndSession(t *testing.T) {
 		NodeIdentity:     node2.NodeIdentity,
 		NodeSessionID:    node2.NodeSessionID,
 		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
-		ExtendTTL:        time.Minute,
 	})
 	h.mustErrIs(err, sp.ErrInvalidOwner, "Renew wrong owner")
 
@@ -86,8 +86,6 @@ func TestPlacement_D4_RenewRejectsWrongOwnerAndSession(t *testing.T) {
 		NodeIdentity:     node1.NodeIdentity,
 		NodeSessionID:    "stale-session",
 		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
-		ExtendTTL:        time.Minute,
 	})
 	h.mustErrIs(err, sp.ErrInvalidNodeSession, "Renew stale session")
 }
@@ -97,16 +95,15 @@ func TestPlacement_D5_ReleaseThenReallocate(t *testing.T) {
 	defer h.cleanup()
 	h.scenario("D5 Release 后可重新 Allocate")
 
-	node := h.registerGame("game-1", "session-a")
+	h.registerGame("game-1", "session-a")
 	grainID := h.grainID("d5")
 	placement := h.allocate(grainID)
 
 	h.must(h.dir.Release(h.ctx, sp.ReleaseCommand{
 		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node.NodeIdentity,
-		NodeSessionID:    node.NodeSessionID,
+		NodeIdentity:     placement.NodeIdentity,
+		NodeSessionID:    placement.OwnerNodeSessionID,
 		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
 	}), "Release")
 
 	_, err := h.dir.Lookup(h.ctx, placement.GrainKey)
@@ -118,30 +115,29 @@ func TestPlacement_D5_ReleaseThenReallocate(t *testing.T) {
 	}
 }
 
-func TestPlacement_D6_RecoverRejectedAfterRelease(t *testing.T) {
+func TestPlacement_D6_RecoverRejectsHealthyOwner(t *testing.T) {
 	h := newHarness(t)
 	defer h.cleanup()
-	h.scenario("D6 Release 后 Recover 返回 NotRecoverable")
+	h.scenario("D6 健康 Owner 必须使用 Transfer，Recover 返回 NotRecoverable")
 
 	node1 := h.registerGame("game-1", "session-a")
 	node2 := h.registerGame("game-2", "session-b")
 	placement := h.allocate(h.grainID("d6"))
-
-	h.must(h.dir.Release(h.ctx, sp.ReleaseCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node1.NodeIdentity,
-		NodeSessionID:    node1.NodeSessionID,
-		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
-	}), "Release")
+	target := node2
+	if placement.NodeIdentity == node2.NodeIdentity {
+		target = node1
+	}
 
 	_, err := h.dir.Recover(h.ctx, sp.RecoverCommand{
 		GrainKey:         placement.GrainKey,
-		NewNodeIdentity:  node2.NodeIdentity,
-		PlacementVersion: placement.Version + 1,
-		LeaseTTL:         time.Minute,
+		NewNodeIdentity:  target.NodeIdentity,
+		PlacementVersion: placement.Version,
 	})
-	h.mustErrIs(err, sp.ErrPlacementNotRecoverable, "Recover after release")
+	h.mustErrIs(err, sp.ErrPlacementNotRecoverable, "Recover healthy owner")
+	retained := h.placementsOn(sp.Node{NodeIdentity: placement.NodeIdentity})
+	if len(retained) != 1 || retained[0].Version != placement.Version || retained[0].NodeIdentity != placement.NodeIdentity {
+		t.Fatalf("healthy Recover changed placement: %+v", retained)
+	}
 }
 
 func TestPlacement_D7_TransferChangesOwner(t *testing.T) {
@@ -158,10 +154,9 @@ func TestPlacement_D7_TransferChangesOwner(t *testing.T) {
 		FromNodeIdentity: placement.NodeIdentity,
 		ToNodeIdentity:   node2.NodeIdentity,
 		PlacementVersion: placement.Version,
-		LeaseTTL:         time.Minute,
 	})
 	h.must(err, "Transfer")
-	if transferred.NodeIdentity != node2.NodeIdentity || transferred.Version != placement.Version+1 {
+	if transferred.NodeIdentity != node2.NodeIdentity || transferred.OwnerNodeSessionID != node2.NodeSessionID || transferred.Version != placement.Version+1 {
 		t.Fatalf("transferred = %+v", transferred)
 	}
 	if len(h.placementsOn(node2)) != 1 {
@@ -169,50 +164,63 @@ func TestPlacement_D7_TransferChangesOwner(t *testing.T) {
 	}
 }
 
-func TestPlacement_D8_ExpireThenRecover(t *testing.T) {
-	h := newHarness(t)
+func TestPlacement_D8_NodeLeaseExpiryInvalidatesAllRoutesButRetainsPlacements(t *testing.T) {
+	h := newHarnessWithNodeLeaseConfig(t, sp.NodeLeaseConfig{TTL: 100 * time.Millisecond})
 	defer h.cleanup()
-	h.scenario("D8 Expire 后 Recover 恢复 Active")
+	h.scenario("D8 Node Lease 到期后同节点所有 Grain 逻辑失效，但 Placement 保留")
 
-	h.registerGame("game-1", "session-a")
-	node2 := h.registerGame("game-2", "session-b")
-	placement := h.allocateWithTTL(h.grainID("d8"), time.Second)
+	node := h.registerGame("game-1", "session-a")
+	placements := []*sp.Placement{
+		h.allocate(h.grainID("d8-1")),
+		h.allocate(h.grainID("d8-2")),
+	}
+	h.waitForLookupError(placements[0].GrainKey, sp.ErrPlacementNotFound)
 
-	h.must(h.dir.Expire(h.ctx, sp.ExpireCommand{
-		GrainKey:     placement.GrainKey,
-		LeaseVersion: placement.Lease.Version,
-		Now:          placement.LeaseExpireAt.Add(time.Millisecond),
-	}), "Expire")
-
-	_, err := h.dir.Lookup(h.ctx, placement.GrainKey)
-	h.mustErrIs(err, sp.ErrPlacementNotFound, "Lookup after expire")
-
-	recovered, err := h.dir.Recover(h.ctx, sp.RecoverCommand{
-		GrainKey:         placement.GrainKey,
-		NewNodeIdentity:  node2.NodeIdentity,
-		PlacementVersion: placement.Version + 1,
-		LeaseTTL:         time.Minute,
-	})
-	h.must(err, "Recover")
-	if recovered.Status != sp.PlacementStatusActive {
-		t.Fatalf("status = %s", recovered.Status)
+	want := make(map[sp.GrainKey]*sp.Placement, len(placements))
+	for _, placement := range placements {
+		want[placement.GrainKey] = placement
+		_, err := h.dir.Lookup(h.ctx, placement.GrainKey)
+		h.mustErrIs(err, sp.ErrPlacementNotFound, "Lookup after node lease expiry")
+		exists, err := h.dir.Exists(h.ctx, placement.GrainKey)
+		h.must(err, "Exists after node lease expiry")
+		if exists {
+			t.Fatalf("Exists(%s) = true after node lease expiry", placement.GrainKey)
+		}
+	}
+	retained := h.placementsOn(node)
+	if len(retained) != len(placements) {
+		t.Fatalf("retained placements = %+v, want %d", retained, len(placements))
+	}
+	for _, placement := range retained {
+		original := want[placement.GrainKey]
+		if original == nil || placement.Status != sp.PlacementStatusActive || placement.Version != original.Version || placement.OwnerNodeSessionID != original.OwnerNodeSessionID {
+			t.Fatalf("retained placement changed: %+v", placement)
+		}
 	}
 }
 
-func TestPlacement_D9_ExpireBeforeLeaseEndFails(t *testing.T) {
-	h := newHarness(t)
+func TestPlacement_D9_ExpiredSameSessionCanRelease(t *testing.T) {
+	h := newHarnessWithNodeLeaseConfig(t, sp.NodeLeaseConfig{TTL: 100 * time.Millisecond})
 	defer h.cleanup()
-	h.scenario("D9 Expire 租约未到期失败")
+	h.scenario("D9 Node Lease 已到期时，同 session 仍可安全 Release")
 
-	h.registerGame("game-1", "session-a")
+	node := h.registerGame("game-1", "session-a")
 	placement := h.allocate(h.grainID("d9"))
+	h.waitForLookupError(placement.GrainKey, sp.ErrPlacementNotFound)
 
-	err := h.dir.Expire(h.ctx, sp.ExpireCommand{
-		GrainKey:     placement.GrainKey,
-		LeaseVersion: placement.Lease.Version,
-		Now:          placement.LeaseExpireAt.Add(-time.Second),
-	})
-	h.mustErrIs(err, sp.ErrLeaseNotExpired, "Expire early")
+	retained := h.placementsOn(node)
+	if len(retained) != 1 {
+		t.Fatalf("FindByNode placements = %+v", retained)
+	}
+	h.must(h.dir.Release(h.ctx, sp.ReleaseCommand{
+		GrainKey:         retained[0].GrainKey,
+		NodeIdentity:     retained[0].NodeIdentity,
+		NodeSessionID:    retained[0].OwnerNodeSessionID,
+		PlacementVersion: retained[0].Version,
+	}), "Release expired same-session placement")
+	if got := h.placementsOn(node); len(got) != 0 {
+		t.Fatalf("placements after Release = %+v", got)
+	}
 }
 
 func TestPlacement_D10_ExistsOnlyForActive(t *testing.T) {
@@ -220,7 +228,7 @@ func TestPlacement_D10_ExistsOnlyForActive(t *testing.T) {
 	defer h.cleanup()
 	h.scenario("D10 Exists 仅对 Active Placement 为 true")
 
-	node := h.registerGame("game-1", "session-a")
+	h.registerGame("game-1", "session-a")
 	placement := h.allocate(h.grainID("d10"))
 
 	ok, err := h.dir.Exists(h.ctx, placement.GrainKey)
@@ -231,10 +239,9 @@ func TestPlacement_D10_ExistsOnlyForActive(t *testing.T) {
 
 	h.must(h.dir.Release(h.ctx, sp.ReleaseCommand{
 		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node.NodeIdentity,
-		NodeSessionID:    node.NodeSessionID,
+		NodeIdentity:     placement.NodeIdentity,
+		NodeSessionID:    placement.OwnerNodeSessionID,
 		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
 	}), "Release")
 
 	ok, err = h.dir.Exists(h.ctx, placement.GrainKey)

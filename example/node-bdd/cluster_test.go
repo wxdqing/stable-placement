@@ -40,17 +40,17 @@ func TestCluster_A2_NodeListSortedByIdentity(t *testing.T) {
 func TestCluster_A3_RenewNodeSessionValidation(t *testing.T) {
 	h := newHarness(t)
 	defer h.cleanup()
-	h.scenario("A3 RenewNode 刷新心跳，错误 session 被拒绝")
+	h.scenario("A3 RenewNode 推进 Node Lease，错误 session 被拒绝")
 
 	node := h.registerGame("game-1", "session-a")
-	before := h.listGameNodes()[0].LastHeartbeatAt
+	before := h.listGameNodes()[0].Lease
 
 	h.step("When RenewNode 正确 session")
 	time.Sleep(time.Millisecond)
 	h.must(h.dir.RenewNode(h.ctx, node.NodeIdentity, node.NodeSessionID), "RenewNode")
-	after := h.listGameNodes()[0].LastHeartbeatAt
-	if !after.After(before) {
-		t.Fatalf("LastHeartbeatAt = %v, want after %v", after, before)
+	after := h.listGameNodes()[0].Lease
+	if after.Version != before.Version+1 || after.ExpireAtUnixMilli <= before.ExpireAtUnixMilli {
+		t.Fatalf("renewed lease = %+v, want version after %+v and later expiry", after, before)
 	}
 
 	h.step("Then 错误 session 返回 ErrInvalidNodeSession")

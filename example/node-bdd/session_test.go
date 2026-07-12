@@ -4,7 +4,6 @@ package nodebdd_test
 
 import (
 	"testing"
-	"time"
 
 	sp "github.com/wxdqing/stable-placement"
 )
@@ -26,16 +25,14 @@ func TestSession_E1_OldSessionRenewFailsAfterReplace(t *testing.T) {
 		NodeIdentity:     node.NodeIdentity,
 		NodeSessionID:    "session-a",
 		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
-		ExtendTTL:        time.Minute,
 	})
 	h.mustErrIs(err, sp.ErrInvalidNodeSession, "Renew old session")
 }
 
-func TestSession_E2_OldSessionReleaseFailsAfterReplace(t *testing.T) {
+func TestSession_E2_NewSessionDoesNotInheritOldPlacement(t *testing.T) {
 	h := newHarness(t)
 	defer h.cleanup()
-	h.scenario("E2 ReplaceNodeSession 后旧 session Release 失败")
+	h.scenario("E2 ReplaceNodeSession 后新 session 不继承旧 Placement")
 
 	node := h.registerGame("game-1", "session-a")
 	placement := h.allocate(h.grainID("e2"))
@@ -47,13 +44,19 @@ func TestSession_E2_OldSessionReleaseFailsAfterReplace(t *testing.T) {
 		NodeIdentity:     node.NodeIdentity,
 		NodeSessionID:    "session-a",
 		PlacementVersion: placement.Version,
-		LeaseVersion:     placement.Lease.Version,
 	})
 	h.mustErrIs(err, sp.ErrInvalidNodeSession, "Release old session")
 
-	found := h.lookup(placement.GrainKey)
-	if found.Status != sp.PlacementStatusActive {
-		t.Fatalf("placement released by stale session: %+v", found)
+	_, err = h.dir.Lookup(h.ctx, placement.GrainKey)
+	h.mustErrIs(err, sp.ErrPlacementNotFound, "Lookup after session replace")
+	exists, err := h.dir.Exists(h.ctx, placement.GrainKey)
+	h.must(err, "Exists after session replace")
+	if exists {
+		t.Fatal("new session inherited old placement")
+	}
+	retained := h.placementsOn(node)
+	if len(retained) != 1 || retained[0].OwnerNodeSessionID != "session-a" || retained[0].Version != placement.Version {
+		t.Fatalf("retained placement = %+v, want old session placement", retained)
 	}
 }
 

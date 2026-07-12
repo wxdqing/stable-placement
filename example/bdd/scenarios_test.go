@@ -36,7 +36,7 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 		}
 	})
 
-	t.Run("Owner 续约推进 LeaseVersion", func(t *testing.T) {
+	t.Run("Owner Renew 只校验当前 Placement", func(t *testing.T) {
 		s := newSuite(t)
 		defer s.cleanup()
 		s.scenario("Owner 续约")
@@ -44,22 +44,24 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 
 		grainID := s.grainID("renew")
 		placement := s.allocate(grainID)
+		leaseBefore := s.dirNode(node.NodeIdentity).Lease
 
 		s.step("When Renew")
 		renewed, err := s.dir.Renew(s.ctx, sp.RenewCommand{
 			GrainKey:         placement.GrainKey,
-			NodeIdentity:     node.NodeIdentity,
-			NodeSessionID:    node.NodeSessionID,
+			NodeIdentity:     placement.NodeIdentity,
+			NodeSessionID:    placement.OwnerNodeSessionID,
 			PlacementVersion: placement.Version,
-			LeaseVersion:     placement.Lease.Version,
-			ExtendTTL:        time.Minute,
 		})
 		if err != nil {
 			t.Fatalf("Renew error: %v", err)
 		}
-		s.step("Then LeaseVersion +1")
-		if renewed.Lease.Version != placement.Lease.Version+1 {
-			t.Fatalf("lease version = %d, want %d", renewed.Lease.Version, placement.Lease.Version+1)
+		s.step("Then Placement 与 Node Lease 均不变")
+		if renewed.Version != placement.Version || renewed.OwnerNodeSessionID != placement.OwnerNodeSessionID {
+			t.Fatalf("renewed = %+v, want unchanged %+v", renewed, placement)
+		}
+		if leaseAfter := s.dirNode(node.NodeIdentity).Lease; leaseAfter != leaseBefore {
+			t.Fatalf("Renew changed Node Lease: before=%+v after=%+v", leaseBefore, leaseAfter)
 		}
 	})
 
@@ -67,7 +69,7 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 		s := newSuite(t)
 		defer s.cleanup()
 		s.scenario("Release 后 Recover 应失败")
-		node := s.registerNode("game-1", "session-a")
+		s.registerNode("game-1", "session-a")
 		node2 := s.registerNode("game-2", "session-b")
 
 		grainID := s.grainID("release-recover")
@@ -76,10 +78,9 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 		s.step("When Release")
 		if err := s.dir.Release(s.ctx, sp.ReleaseCommand{
 			GrainKey:         placement.GrainKey,
-			NodeIdentity:     node.NodeIdentity,
-			NodeSessionID:    node.NodeSessionID,
+			NodeIdentity:     placement.NodeIdentity,
+			NodeSessionID:    placement.OwnerNodeSessionID,
 			PlacementVersion: placement.Version,
-			LeaseVersion:     placement.Lease.Version,
 		}); err != nil {
 			t.Fatalf("Release error: %v", err)
 		}
@@ -89,44 +90,59 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 			GrainKey:         placement.GrainKey,
 			NewNodeIdentity:  node2.NodeIdentity,
 			PlacementVersion: placement.Version + 1,
-			LeaseTTL:         time.Minute,
 		})
 		if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
 			t.Fatalf("Recover err = %v, want ErrPlacementNotRecoverable", err)
 		}
 	})
 
-	t.Run("过期后可 Recover", func(t *testing.T) {
+	t.Run("Node Lease 到期使同节点所有 Grain 逻辑失效但保留 Placement", func(t *testing.T) {
+		s := newSuiteWithNodeLeaseConfig(t, sp.NodeLeaseConfig{TTL: 100 * time.Millisecond})
+		defer s.cleanup()
+		s.scenario("一个 Node Lease 控制该 session 的全部 Grain 路由")
+		node := s.registerNode("game-1", "session-a")
+		placements := []*sp.Placement{
+			s.allocate(s.grainID("node-lease-1")),
+			s.allocate(s.grainID("node-lease-2")),
+		}
+		s.waitForLookupError(placements[0].GrainKey, sp.ErrPlacementNotFound)
+
+		for _, placement := range placements {
+			_, err := s.dir.Lookup(s.ctx, placement.GrainKey)
+			if !errors.Is(err, sp.ErrPlacementNotFound) {
+				t.Fatalf("Lookup %s err = %v, want ErrPlacementNotFound", placement.GrainKey, err)
+			}
+			exists, err := s.dir.Exists(s.ctx, placement.GrainKey)
+			if err != nil || exists {
+				t.Fatalf("Exists %s = %v, err=%v", placement.GrainKey, exists, err)
+			}
+		}
+		page, err := s.dir.FindByNode(s.ctx, sp.FindByNodeQuery{NodeIdentity: node.NodeIdentity, Limit: 10})
+		if err != nil || len(page.Placements) != len(placements) {
+			t.Fatalf("FindByNode = %+v, err=%v", page, err)
+		}
+		for _, placement := range page.Placements {
+			if placement.Status != sp.PlacementStatusActive || placement.OwnerNodeSessionID != node.NodeSessionID {
+				t.Fatalf("retained placement = %+v", placement)
+			}
+		}
+	})
+
+	t.Run("健康 Owner 拒绝 Recover", func(t *testing.T) {
 		s := newSuite(t)
 		defer s.cleanup()
-		s.scenario("Expire 后 Recover 恢复 Active")
+		s.scenario("健康 Owner 只能通过 Transfer 显式迁移")
 		s.registerNode("game-1", "session-a")
 		node2 := s.registerNode("game-2", "session-b")
+		placement := s.allocate(s.grainID("healthy-recover"))
 
-		grainID := s.grainID("expire-recover")
-		placement := s.allocate(grainID)
-
-		s.step("When Expire")
-		if err := s.dir.Expire(s.ctx, sp.ExpireCommand{
-			GrainKey:     placement.GrainKey,
-			LeaseVersion: placement.Lease.Version,
-			Now:          placement.LeaseExpireAt.Add(time.Millisecond),
-		}); err != nil {
-			t.Fatalf("Expire error: %v", err)
-		}
-
-		s.step("Then Recover 到新节点")
-		recovered, err := s.dir.Recover(s.ctx, sp.RecoverCommand{
+		_, err := s.dir.Recover(s.ctx, sp.RecoverCommand{
 			GrainKey:         placement.GrainKey,
 			NewNodeIdentity:  node2.NodeIdentity,
-			PlacementVersion: placement.Version + 1,
-			LeaseTTL:         time.Minute,
+			PlacementVersion: placement.Version,
 		})
-		if err != nil {
-			t.Fatalf("Recover error: %v", err)
-		}
-		if recovered.Status != sp.PlacementStatusActive || recovered.NodeIdentity != node2.NodeIdentity {
-			t.Fatalf("recovered = %+v", recovered)
+		if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
+			t.Fatalf("Recover err = %v, want ErrPlacementNotRecoverable", err)
 		}
 	})
 
@@ -167,7 +183,6 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 			FromNodeIdentity: placement.NodeIdentity,
 			ToNodeIdentity:   node2.NodeIdentity,
 			PlacementVersion: placement.Version,
-			LeaseTTL:         time.Minute,
 		})
 		if err != nil {
 			t.Fatalf("Transfer error: %v", err)
@@ -198,7 +213,6 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 					Kind:            "Player",
 					TargetNodeType:  s.nodeType,
 					TargetNodeGroup: s.nodeGroup,
-					LeaseTTL:        time.Minute,
 				})
 				errs <- err
 			}()

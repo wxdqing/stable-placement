@@ -28,11 +28,14 @@ type harness struct {
 	nodeType  string
 	nodeGroup string
 
-	nodes    map[string]sp.Node
-	grainIDs []string
+	nodes map[string]sp.Node
 }
 
 func newHarness(t *testing.T) *harness {
+	return newHarnessWithNodeLeaseConfig(t, sp.DefaultNodeLeaseConfig())
+}
+
+func newHarnessWithNodeLeaseConfig(t *testing.T, config sp.NodeLeaseConfig) *harness {
 	t.Helper()
 	addr := os.Getenv("STABLE_PLACEMENT_REDIS_ADDR")
 	if addr == "" {
@@ -46,7 +49,7 @@ func newHarness(t *testing.T) *harness {
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("redis %s not available: %v", addr, err)
 	}
-	dir, err := redis.NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+	dir, err := redis.NewDirectory(client, sp.StrategyModeRedisRoundRobin, config)
 	if err != nil {
 		t.Fatalf("NewDirectory error: %v", err)
 	}
@@ -64,46 +67,16 @@ func newHarness(t *testing.T) *harness {
 }
 
 func (h *harness) cleanup() {
-	for _, grainID := range h.grainIDs {
-		key, err := sp.NewGrainKey("Player", grainID)
-		if err != nil {
+	seen := make(map[string]struct{}, len(h.nodes))
+	for _, node := range h.nodes {
+		if _, ok := seen[node.NodeIdentity]; ok {
 			continue
 		}
-		placement, err := h.dir.Lookup(h.ctx, key)
-		if err != nil {
-			continue
-		}
-		err = h.dir.Release(h.ctx, sp.ReleaseCommand{
-			GrainKey:         key,
-			NodeIdentity:     placement.NodeIdentity,
-			NodeSessionID:    placement.Lease.OwnerNodeSessionID,
-			PlacementVersion: placement.Version,
-			LeaseVersion:     placement.Lease.Version,
-		})
-		if err == nil {
-			continue
-		}
-
-		// 节点 session 被替换后，旧 Owner 无法 Release。先用当前节点
-		// session 接管 Placement，再执行 Release，避免遗留 Redis 测试数据。
-		recovered, recoverErr := h.dir.Recover(h.ctx, sp.RecoverCommand{
-			GrainKey:         key,
-			NewNodeIdentity:  placement.NodeIdentity,
-			PlacementVersion: placement.Version,
-			LeaseTTL:         time.Minute,
-		})
-		if recoverErr != nil {
-			h.t.Errorf("cleanup Release %s failed: %v; Recover failed: %v", key, err, recoverErr)
-			continue
-		}
-		if releaseErr := h.dir.Release(h.ctx, sp.ReleaseCommand{
-			GrainKey:         key,
-			NodeIdentity:     recovered.NodeIdentity,
-			NodeSessionID:    recovered.Lease.OwnerNodeSessionID,
-			PlacementVersion: recovered.Version,
-			LeaseVersion:     recovered.Lease.Version,
-		}); releaseErr != nil {
-			h.t.Errorf("cleanup Release recovered %s failed: %v", key, releaseErr)
+		seen[node.NodeIdentity] = struct{}{}
+		for _, placement := range h.placementsOn(node) {
+			if err := h.releasePlacement(placement); err != nil {
+				h.t.Errorf("cleanup Release %s failed: %v", placement.GrainKey, err)
+			}
 		}
 	}
 	for _, node := range h.nodes {
@@ -118,6 +91,35 @@ func (h *harness) cleanup() {
 	if err := h.client.Close(); err != nil {
 		h.t.Errorf("cleanup Redis client close failed: %v", err)
 	}
+}
+
+func (h *harness) releasePlacement(placement sp.Placement) error {
+	err := h.dir.Release(h.ctx, sp.ReleaseCommand{
+		GrainKey:         placement.GrainKey,
+		NodeIdentity:     placement.NodeIdentity,
+		NodeSessionID:    placement.OwnerNodeSessionID,
+		PlacementVersion: placement.Version,
+	})
+	if err == nil {
+		return nil
+	}
+	for _, node := range h.nodes {
+		recovered, recoverErr := h.dir.Recover(h.ctx, sp.RecoverCommand{
+			GrainKey:         placement.GrainKey,
+			NewNodeIdentity:  node.NodeIdentity,
+			PlacementVersion: placement.Version,
+		})
+		if recoverErr != nil {
+			continue
+		}
+		return h.dir.Release(h.ctx, sp.ReleaseCommand{
+			GrainKey:         recovered.GrainKey,
+			NodeIdentity:     recovered.NodeIdentity,
+			NodeSessionID:    recovered.OwnerNodeSessionID,
+			PlacementVersion: recovered.Version,
+		})
+	}
+	return err
 }
 
 func (h *harness) scenario(name string) {
@@ -175,9 +177,7 @@ func (h *harness) replaceSession(name string, newSession string) sp.Node {
 }
 
 func (h *harness) grainID(suffix string) string {
-	id := fmt.Sprintf("%s-%s", h.runID, suffix)
-	h.grainIDs = append(h.grainIDs, id)
-	return id
+	return fmt.Sprintf("%s-%s", h.runID, suffix)
 }
 
 func (h *harness) allocate(grainID string) *sp.Placement {
@@ -187,30 +187,32 @@ func (h *harness) allocate(grainID string) *sp.Placement {
 		Kind:            "Player",
 		TargetNodeType:  h.nodeType,
 		TargetNodeGroup: h.nodeGroup,
-		LeaseTTL:        time.Minute,
 	})
 	h.must(err, "Allocate "+grainID)
 	return placement
 }
 
-func (h *harness) allocateWithTTL(grainID string, ttl time.Duration) *sp.Placement {
-	h.t.Helper()
-	placement, err := h.dir.Allocate(h.ctx, sp.AllocateCommand{
-		GrainID:         grainID,
-		Kind:            "Player",
-		TargetNodeType:  h.nodeType,
-		TargetNodeGroup: h.nodeGroup,
-		LeaseTTL:        ttl,
-	})
-	h.must(err, "Allocate "+grainID)
-	return placement
-}
-
-func (h *harness) lookup(key sp.GrainKey) *sp.Placement {
+func (h *harness) lookup(key sp.GrainKey) *sp.PlacementRoute {
 	h.t.Helper()
 	placement, err := h.dir.Lookup(h.ctx, key)
 	h.must(err, "Lookup "+key.String())
 	return placement
+}
+
+func (h *harness) waitForLookupError(key sp.GrainKey, target error) {
+	h.t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := h.dir.Lookup(h.ctx, key)
+		if errors.Is(err, target) {
+			return
+		}
+		if err != nil {
+			h.t.Fatalf("Lookup %s: err=%v want=%v", key, err, target)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.t.Fatalf("Lookup %s did not return %v before deadline", key, target)
 }
 
 func (h *harness) listGameNodes() []sp.Node {
@@ -285,7 +287,6 @@ func (h *harness) transferAll(from sp.Node, to sp.Node) {
 				FromNodeIdentity: from.NodeIdentity,
 				ToNodeIdentity:   to.NodeIdentity,
 				PlacementVersion: p.Version,
-				LeaseTTL:         time.Minute,
 			})
 			h.must(err, "Transfer "+p.GrainKey.String())
 		}
