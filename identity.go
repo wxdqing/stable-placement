@@ -2,17 +2,19 @@ package stableplacement
 
 import (
 	"errors"
+	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 type GrainKey string
 
 func NewGrainKey(kind string, grainID string) (GrainKey, error) {
-	if kind == "" {
-		return "", errors.New("kind is empty")
+	if err := ValidateIdentityPart(kind, 128); err != nil {
+		return "", fmt.Errorf("kind: %w", err)
 	}
-	if grainID == "" {
-		return "", errors.New("grain id is empty")
+	if err := ValidateIdentityPart(grainID, 256); err != nil {
+		return "", fmt.Errorf("grain id: %w", err)
 	}
 	return GrainKey(kind + "/" + grainID), nil
 }
@@ -24,16 +26,37 @@ func (k GrainKey) String() string {
 type NodeIdentity string
 
 func NewNodeIdentity(nodeType string, nodeGroup string, nodeName string) (NodeIdentity, error) {
-	if nodeType == "" {
-		return "", errors.New("node type is empty")
+	if err := ValidateIdentityPart(nodeType, 128); err != nil {
+		return "", fmt.Errorf("node type: %w", err)
 	}
-	if nodeGroup == "" {
-		return "", errors.New("node group is empty")
+	if err := ValidateIdentityPart(nodeGroup, 128); err != nil {
+		return "", fmt.Errorf("node group: %w", err)
 	}
-	if nodeName == "" {
-		return "", errors.New("node name is empty")
+	if err := ValidateIdentityPart(nodeName, 128); err != nil {
+		return "", fmt.Errorf("node name: %w", err)
 	}
 	return NodeIdentity(nodeType + "/" + nodeGroup + "/" + nodeName), nil
+}
+
+func ValidateIdentityPart(value string, maxBytes int) error {
+	if value == "" {
+		return errors.New("value is empty")
+	}
+	if maxBytes <= 0 || len(value) > maxBytes {
+		return fmt.Errorf("value exceeds %d bytes", maxBytes)
+	}
+	if !utf8.ValidString(value) {
+		return errors.New("value is not valid UTF-8")
+	}
+	if strings.TrimSpace(value) != value {
+		return errors.New("value has surrounding whitespace")
+	}
+	for _, r := range value {
+		if r == '/' || r <= 0x1f || r == 0x7f {
+			return errors.New("value contains a reserved character")
+		}
+	}
+	return nil
 }
 
 func (i NodeIdentity) String() string {

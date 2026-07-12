@@ -16,4 +16,5 @@ var (
 	ErrNodeHasPlacements         = errors.New("node still has active placements")
 	ErrNodeNotInvalid            = errors.New("node is not marked invalid")
 	ErrUnsupportedStrategyMode   = errors.New("unsupported strategy mode")
+	ErrPlacementConfigInvalid    = errors.New("placement config invalid")
 )
