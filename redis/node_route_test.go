@@ -135,11 +135,20 @@ func TestRedisDirectoryRecoverReleasedReturnsNotRecoverableV2(t *testing.T) {
 	released.Version++
 	want := captureRouteMutationSnapshot(t, ctx, client, released, a.NodeIdentity, b.NodeIdentity)
 
-	_, err = dir.Recover(ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: released.Version})
-	if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
-		t.Fatalf("Recover released placement err = %v, want ErrPlacementNotRecoverable", err)
-	}
-	requireRouteMutationSnapshot(t, ctx, client, released, want, a.NodeIdentity, b.NodeIdentity)
+	t.Run("current version", func(t *testing.T) {
+		_, err := dir.Recover(ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: released.Version})
+		if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
+			t.Fatalf("Recover released placement err = %v, want ErrPlacementNotRecoverable", err)
+		}
+		requireRouteMutationSnapshot(t, ctx, client, released, want, a.NodeIdentity, b.NodeIdentity)
+	})
+	t.Run("stale version", func(t *testing.T) {
+		_, err := dir.Recover(ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
+		if !errors.Is(err, sp.ErrVersionConflict) {
+			t.Fatalf("Recover released placement with stale version err = %v, want ErrVersionConflict", err)
+		}
+		requireRouteMutationSnapshot(t, ctx, client, released, want, a.NodeIdentity, b.NodeIdentity)
+	})
 }
 
 type delayedEvalClient struct {
