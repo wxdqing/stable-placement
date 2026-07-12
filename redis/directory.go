@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -16,6 +17,9 @@ import (
 type Directory struct {
 	client goredis.UniversalClient
 	mode   sp.StrategyMode
+
+	heartbeatMu  sync.RWMutex
+	heartbeatTTL time.Duration
 }
 
 type mutationArgs struct {
@@ -47,7 +51,7 @@ func NewDirectory(client goredis.UniversalClient, mode sp.StrategyMode) (*Direct
 	if mode != sp.StrategyModeRedisRoundRobin {
 		return nil, sp.ErrUnsupportedStrategyMode
 	}
-	return &Directory{client: client, mode: mode}, nil
+	return &Directory{client: client, mode: mode, heartbeatTTL: time.Minute}, nil
 }
 
 func (d *Directory) RegisterNode(ctx context.Context, node sp.Node) error {
@@ -63,9 +67,19 @@ func (d *Directory) MarkNodeInvalid(ctx context.Context, nodeType string, nodeGr
 }
 
 func (d *Directory) RenewNode(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
-	result, err := d.client.Eval(ctx, renewNodeLua, []string{NodeKey(nodeIdentity)},
+	node, err := d.getNode(ctx, nodeIdentity)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	result, err := d.client.Eval(ctx, renewNodeLua, []string{
+		NodeKey(nodeIdentity),
+		NodeHeartbeatKey(node.NodeType, node.NodeGroup),
+	},
 		nodeSessionID,
-		time.Now().Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano),
+		strconv.FormatInt(now.UnixMilli(), 10),
+		NodeKey(nodeIdentity),
 	).Text()
 	if err != nil {
 		return err
@@ -728,6 +742,7 @@ func (d *Directory) registerNodeWithLua(ctx context.Context, node sp.Node, event
 		NodeKey(node.NodeIdentity),
 		NodesKey(node.NodeType, node.NodeGroup),
 		EventsStreamKey(),
+		NodeHeartbeatKey(node.NodeType, node.NodeGroup),
 	},
 		string(value),
 		node.NodeIdentity,
@@ -736,6 +751,7 @@ func (d *Directory) registerNodeWithLua(ctx context.Context, node sp.Node, event
 		node.NodeGroup,
 		node.NodeName,
 		NodeKey(node.NodeIdentity),
+		strconv.FormatInt(node.LastHeartbeatAt.UnixMilli(), 10),
 	).Err()
 }
 
@@ -748,6 +764,7 @@ func (d *Directory) replaceNodeSessionWithLua(ctx context.Context, node sp.Node)
 		NodeKey(node.NodeIdentity),
 		NodesKey(node.NodeType, node.NodeGroup),
 		EventsStreamKey(),
+		NodeHeartbeatKey(node.NodeType, node.NodeGroup),
 	},
 		string(value),
 		node.NodeIdentity,
@@ -756,6 +773,7 @@ func (d *Directory) replaceNodeSessionWithLua(ctx context.Context, node sp.Node)
 		node.NodeGroup,
 		node.NodeName,
 		NodeKey(node.NodeIdentity),
+		strconv.FormatInt(node.LastHeartbeatAt.UnixMilli(), 10),
 	).Text()
 	if err != nil {
 		return nil, err
@@ -827,6 +845,7 @@ func (d *Directory) unregisterNodeWithLua(ctx context.Context, node sp.Node, nod
 		NodesKey(node.NodeType, node.NodeGroup),
 		EventsStreamKey(),
 		PlacementNodeKey(node.NodeIdentity),
+		NodeHeartbeatKey(node.NodeType, node.NodeGroup),
 	},
 		nodeSessionID,
 		string(sp.EventNodeUnregistered),

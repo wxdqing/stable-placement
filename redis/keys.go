@@ -29,6 +29,10 @@ func InvalidNodesKey(nodeType string, nodeGroup string) string {
 	return "sp:" + hashTag + ":invalid_nodes:" + encode(nodeType) + ":" + encode(nodeGroup)
 }
 
+func NodeHeartbeatKey(nodeType string, nodeGroup string) string {
+	return "sp:" + hashTag + ":node_heartbeat:" + encode(nodeType) + ":" + encode(nodeGroup)
+}
+
 func EventsStreamKey() string {
 	return "sp:" + hashTag + ":events:stream"
 }

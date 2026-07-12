@@ -15,6 +15,7 @@ func TestKeysUseStablePlacementHashTag(t *testing.T) {
 		NodesKey("game", "default"),
 		NodeKey("game/default/game-1"),
 		InvalidNodesKey("game", "default"),
+		NodeHeartbeatKey("game", "default"),
 		EventsStreamKey(),
 		EventsPubSubChannelKey(),
 		AuditStreamKey(),

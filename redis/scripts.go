@@ -174,6 +174,17 @@ return ARGV[2]
 `
 
 const renewNodeLua = `
+local function expect_type(key, expected, label)
+	local actual = redis.call("TYPE", key)
+	if type(actual) == "table" then actual = actual["ok"] end
+	if actual ~= "none" and actual ~= expected then
+		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
+	end
+	return nil
+end
+local type_error = expect_type(KEYS[1], "string", "node")
+	or expect_type(KEYS[2], "zset", "node_heartbeat")
+if type_error then return type_error end
 local raw = redis.call("GET", KEYS[1])
 if not raw then return "node_not_found" end
 local node = cjson.decode(raw)
@@ -181,6 +192,7 @@ if node["NodeSessionID"] ~= ARGV[1] then return "invalid_node_session" end
 node["LastHeartbeatAt"] = ARGV[2]
 local updated = cjson.encode(node)
 redis.call("SET", KEYS[1], updated)
+redis.call("ZADD", KEYS[2], ARGV[3], ARGV[4])
 return updated
 `
 
@@ -244,8 +256,22 @@ return updated_placement
 `
 
 const registerNodeLua = `
+local function expect_type(key, expected, label)
+	local actual = redis.call("TYPE", key)
+	if type(actual) == "table" then actual = actual["ok"] end
+	if actual ~= "none" and actual ~= expected then
+		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
+	end
+	return nil
+end
+local type_error = expect_type(KEYS[1], "string", "node")
+	or expect_type(KEYS[2], "set", "nodes")
+	or expect_type(KEYS[3], "stream", "events")
+	or expect_type(KEYS[4], "zset", "node_heartbeat")
+if type_error then return type_error end
 redis.call("SET", KEYS[1], ARGV[1])
 redis.call("SADD", KEYS[2], ARGV[7])
+redis.call("ZADD", KEYS[4], ARGV[8], ARGV[7])
 redis.call("XADD", KEYS[3], "*",
 	"type", ARGV[3],
 	"node_identity", ARGV[2],
@@ -256,9 +282,23 @@ return ARGV[1]
 `
 
 const replaceNodeSessionLua = `
+local function expect_type(key, expected, label)
+	local actual = redis.call("TYPE", key)
+	if type(actual) == "table" then actual = actual["ok"] end
+	if actual ~= "none" and actual ~= expected then
+		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
+	end
+	return nil
+end
+local type_error = expect_type(KEYS[1], "string", "node")
+	or expect_type(KEYS[2], "set", "nodes")
+	or expect_type(KEYS[3], "stream", "events")
+	or expect_type(KEYS[4], "zset", "node_heartbeat")
+if type_error then return type_error end
 local old = redis.call("GET", KEYS[1])
 redis.call("SET", KEYS[1], ARGV[1])
 redis.call("SADD", KEYS[2], ARGV[7])
+redis.call("ZADD", KEYS[4], ARGV[8], ARGV[7])
 redis.call("XADD", KEYS[3], "*",
 	"type", ARGV[3],
 	"node_identity", ARGV[2],
@@ -312,6 +352,20 @@ return updated
 `
 
 const unregisterNodeLua = `
+local function expect_type(key, expected, label)
+	local actual = redis.call("TYPE", key)
+	if type(actual) == "table" then actual = actual["ok"] end
+	if actual ~= "none" and actual ~= expected then
+		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
+	end
+	return nil
+end
+local type_error = expect_type(KEYS[1], "string", "node")
+	or expect_type(KEYS[2], "set", "nodes")
+	or expect_type(KEYS[3], "stream", "events")
+	or expect_type(KEYS[4], "zset", "node_placements")
+	or expect_type(KEYS[5], "zset", "node_heartbeat")
+if type_error then return type_error end
 local node_raw = redis.call("GET", KEYS[1])
 if not node_raw then
 	return "node_not_found"
@@ -325,6 +379,7 @@ if ARGV[3] == "1" and redis.call("ZCARD", KEYS[4]) > 0 then
 end
 redis.call("DEL", KEYS[1])
 redis.call("SREM", KEYS[2], KEYS[1])
+redis.call("ZREM", KEYS[5], KEYS[1])
 redis.call("XADD", KEYS[3], "*",
 	"type", ARGV[2],
 	"node_identity", node["NodeIdentity"],
@@ -332,6 +387,47 @@ redis.call("XADD", KEYS[3], "*",
 	"node_group", node["NodeGroup"],
 	"node_name", node["NodeName"])
 return "ok"
+`
+
+const expireHeartbeatLua = `
+local function expect_type(key, expected, label)
+	local actual = redis.call("TYPE", key)
+	if type(actual) == "table" then actual = actual["ok"] end
+	if actual ~= "none" and actual ~= expected then
+		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
+	end
+	return nil
+end
+local type_error = expect_type(KEYS[1], "string", "node")
+	or expect_type(KEYS[2], "zset", "node_heartbeat")
+	or expect_type(KEYS[3], "stream", "events")
+if type_error then return type_error end
+
+local score = redis.call("ZSCORE", KEYS[2], ARGV[1])
+if not score or tonumber(score) ~= tonumber(ARGV[2]) or tonumber(score) > tonumber(ARGV[3]) then
+	return 0
+end
+local raw = redis.call("GET", KEYS[1])
+if not raw then
+	redis.call("ZREM", KEYS[2], ARGV[1])
+	return 0
+end
+if raw ~= ARGV[4] then return 0 end
+local node = cjson.decode(raw)
+if node["Status"] ~= "active" or node["NodeSessionID"] ~= ARGV[5]
+	or node["NodeType"] ~= ARGV[6] or node["NodeGroup"] ~= ARGV[7] then
+	return 0
+end
+node["Status"] = "offline"
+redis.call("SET", KEYS[1], cjson.encode(node))
+redis.call("ZREM", KEYS[2], ARGV[1])
+redis.call("XADD", KEYS[3], "*",
+	"type", ARGV[8],
+	"node_identity", node["NodeIdentity"],
+	"node_type", node["NodeType"],
+	"node_group", node["NodeGroup"],
+	"node_name", node["NodeName"])
+return 1
 `
 
 type ScriptSpec struct {
