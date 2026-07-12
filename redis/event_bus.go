@@ -151,6 +151,47 @@ func (b *EventBus) CleanupConsumerGroup(ctx context.Context, consumer StreamCons
 	return err
 }
 
+// ReplaceConsumer removes an idle previous session group before creating this bus's group.
+func (b *EventBus) ReplaceConsumer(ctx context.Context, old StreamConsumer) error {
+	if old.Group != ConsumerGroupName(old.NodeIdentity, old.NodeSessionID) {
+		b.setDegraded()
+		return ErrSharedConsumerGroup
+	}
+	pending, err := b.client.XPending(ctx, b.stream, old.Group).Result()
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			b.setDegraded()
+		}
+		return err
+	}
+	if pending.Count > 0 {
+		b.setDegraded()
+		return ErrPendingMessages
+	}
+	if err := b.CleanupConsumerGroup(ctx, old); err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			b.setDegraded()
+		}
+		return err
+	}
+	if err := b.EnsureConsumerGroup(ctx); err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			b.setDegraded()
+		}
+		return err
+	}
+	return nil
+}
+
+// Close removes this bus's session-specific consumer group.
+func (b *EventBus) Close(ctx context.Context) error {
+	err := b.DeleteConsumerGroup(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		b.setDegraded()
+	}
+	return err
+}
+
 // CheckPending enters degraded mode when this consumer group has messages idle beyond threshold.
 func (b *EventBus) CheckPending(ctx context.Context, threshold time.Duration) error {
 	pending, err := b.client.XPendingExt(ctx, &goredis.XPendingExtArgs{
