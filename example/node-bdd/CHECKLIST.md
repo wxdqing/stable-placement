@@ -79,6 +79,21 @@ STABLE_PLACEMENT_REDIS_ADDR=127.0.0.1:6379 \
 | F4 | Version 冲突时 Renew/Release 失败 | 并发校验 | `negative_test.go` | [x] |
 | F5 | Owner 不可用时 Allocate 不自动重分配 | Allocate | `negative_test.go` | [x] |
 
+## G. ResolveRoute Owner 生命周期（Memory + Redis）
+
+以下每个场景均由同一公共 API 测试分别驱动 Memory 和真实 Redis backend。
+
+| ID | 场景 | 规则来源 | 测试文件 | 状态 |
+|----|------|----------|----------|------|
+| G1 | 首次请求在目标组健康节点 Allocate | ResolveRoute | `route_resolve_test.go` | [x] |
+| G2 | 100 个并发请求只得到一个 Owner Session | 原子唯一归属 | `route_resolve_test.go` | [x] |
+| G3 | 扩容后已有 Owner 不变，新 Grain 可分配到新节点 | 稳定放置 | `route_resolve_test.go` | [x] |
+| G4 | 同 NodeIdentity 新 Session 自动 Recover 并推进 Version | Session Recover | `route_resolve_test.go` | [x] |
+| G5 | Owner Offline 且未 Invalid 时返回 OwnerUnavailable，Placement 保留 | 人工迁移边界 | `route_resolve_test.go` | [x] |
+| G6 | 人工 Invalid 后 Recover 到同组其他节点 | Invalid Recover | `route_resolve_test.go` | [x] |
+| G7 | healthy+Invalid 不隐式迁移，显式 Transfer 才迁移 | 显式迁移 | `route_resolve_test.go` | [x] |
+| G8 | 请求目标组变化返回 TargetMismatch | 分组隔离 | `route_resolve_test.go` | [x] |
+
 ---
 
 ## 可靠性保障
@@ -91,7 +106,7 @@ STABLE_PLACEMENT_REDIS_ADDR=127.0.0.1:6379 \
 
 ## 验收
 
-- [x] 2026-07-13：真实 Redis 7.0.15，`-race -tags=integration ./example/node-bdd`，34 个 top-level 场景通过，0 Skip
+- [x] 2026-07-13：真实 Redis 7.0.15，`-race -tags=integration ./example/node-bdd`，原 34 个 top-level 场景及 ResolveRoute 8 场景 x 2 backend 通过，0 Skip
 
 ## Node Lease v2 部署门禁
 
