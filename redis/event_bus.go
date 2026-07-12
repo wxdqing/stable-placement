@@ -145,7 +145,7 @@ func (b *EventBus) CheckPending(ctx context.Context, threshold time.Duration) er
 	return nil
 }
 
-// Trim shortens the Stream only when no consumer group has pending messages.
+// Trim shortens the Stream only when every consumer group is caught up and has no pending messages.
 func (b *EventBus) Trim(ctx context.Context, maxLen int64) error {
 	groups, err := b.client.XInfoGroups(ctx, b.stream).Result()
 	if err != nil {
@@ -155,7 +155,7 @@ func (b *EventBus) Trim(ctx context.Context, maxLen int64) error {
 		return err
 	}
 	for _, group := range groups {
-		if group.Pending > 0 {
+		if group.Pending > 0 || group.Lag != 0 {
 			return nil
 		}
 	}
@@ -195,31 +195,48 @@ func (b *EventBus) CheckContinuity(ctx context.Context) error {
 		if strings.Contains(err.Error(), "no such key") {
 			return nil
 		}
-		b.setDegraded()
+		if ctx.Err() == nil {
+			b.setDegraded()
+		}
 		return err
 	}
+	firstEntryID := info.FirstEntry.ID
+	if firstEntryID == "" && info.Length > 0 {
+		messages, err := b.client.XRangeN(ctx, b.stream, "-", "+", 1).Result()
+		if err != nil {
+			if ctx.Err() == nil {
+				b.setDegraded()
+			}
+			return err
+		}
+		if len(messages) > 0 {
+			firstEntryID = messages[0].ID
+		}
+	}
 	trimmed := info.MaxDeletedEntryID != "" && info.MaxDeletedEntryID != "0-0"
-	trimmed = trimmed || (info.EntriesAdded > info.Length && info.Length > 0)
-	trimmed = trimmed || (info.FirstEntry.ID == "" && info.Length > 0)
+	trimmed = trimmed || (info.EntriesAdded > 0 && info.EntriesAdded > info.Length)
+	if !trimmed && info.MaxDeletedEntryID == "" && info.EntriesAdded == 0 && firstEntryID != "" {
+		firstTime, firstSequence := splitRedisStreamID(firstEntryID)
+		lastTime, _ := splitRedisStreamID(info.LastGeneratedID)
+		trimmed = firstTime == lastTime && firstSequence > 0
+	}
 	if !trimmed {
 		return nil
 	}
 	groups, err := b.client.XInfoGroups(ctx, b.stream).Result()
 	if err != nil {
-		b.setDegraded()
+		if ctx.Err() == nil {
+			b.setDegraded()
+		}
 		return err
 	}
 	for _, group := range groups {
 		if group.Name != b.consumer.Group {
 			continue
 		}
-		if info.FirstEntry.ID == "" && group.Lag > 0 && compareRedisStreamID(info.LastGeneratedID, group.LastDeliveredID) > 0 {
-			b.setDegraded()
-			return ErrStreamGap
-		}
 		gapID := info.MaxDeletedEntryID
 		if gapID == "" || gapID == "0-0" {
-			gapID = info.FirstEntry.ID
+			gapID = firstEntryID
 		}
 		if compareRedisStreamID(gapID, group.LastDeliveredID) > 0 {
 			b.setDegraded()
@@ -231,7 +248,12 @@ func (b *EventBus) CheckContinuity(ctx context.Context) error {
 
 func (b *EventBus) Subscribe(ctx context.Context, handler func(sp.PlacementEvent) error) error {
 	if err := b.EnsureConsumerGroup(ctx); err != nil {
-		b.setDegraded()
+		if ctx.Err() == nil {
+			b.setDegraded()
+		}
+		return err
+	}
+	if err := b.CheckContinuity(ctx); err != nil {
 		return err
 	}
 	if err := b.consume(ctx, "0", handler); err != nil {
