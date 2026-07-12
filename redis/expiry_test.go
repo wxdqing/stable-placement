@@ -24,10 +24,10 @@ type blockingZRangeClient struct {
 	started chan struct{}
 }
 
-func (c blockingZRangeClient) ZRangeByScore(ctx context.Context, key string, opt *goredis.ZRangeBy) *goredis.StringSliceCmd {
+func (c blockingZRangeClient) ZRangeByScoreWithScores(ctx context.Context, key string, opt *goredis.ZRangeBy) *goredis.ZSliceCmd {
 	close(c.started)
 	<-ctx.Done()
-	return goredis.NewStringSliceResult(nil, ctx.Err())
+	return goredis.NewZSliceCmdResult(nil, ctx.Err())
 }
 
 func (c getHookClient) Get(ctx context.Context, key string) *goredis.StringCmd {
@@ -166,6 +166,82 @@ func TestRedisDirectoryAllocateRetriesExpiredPlacementConflict(t *testing.T) {
 	}
 }
 
+func TestRedisDirectoryAllocateRetriesConcurrentExpiredCreationAfterMissingPreRead(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	dir, err := NewDirectory(base, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldNode := registerTestNode(t, dir, "game-1", "session-a")
+	newNode := registerTestNode(t, dir, "game-2", "session-b")
+	key, _ := sp.NewGrainKey("Player", "concurrent-expired-create")
+	now := time.Now()
+	concurrent := sp.Placement{
+		GrainID:       "concurrent-expired-create",
+		Kind:          "Player",
+		GrainKey:      key,
+		NodeIdentity:  oldNode.NodeIdentity,
+		Version:       7,
+		Status:        sp.PlacementStatusActive,
+		CreateTime:    now.Add(-time.Minute),
+		UpdateTime:    now.Add(-time.Minute),
+		LeaseExpireAt: now.Add(-time.Second),
+		Lease: sp.Lease{
+			OwnerNodeIdentity:  oldNode.NodeIdentity,
+			OwnerNodeSessionID: oldNode.NodeSessionID,
+			Version:            3,
+			ExpireAt:           now.Add(-time.Second),
+		},
+	}
+	concurrentRaw, err := json.Marshal(concurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var injected atomic.Bool
+	var reads atomic.Int64
+	dir.client = evalHookClient{
+		UniversalClient: getHookClient{
+			UniversalClient: base,
+			afterGet: func(gotKey string) {
+				if gotKey == PlacementKey(key) {
+					reads.Add(1)
+				}
+			},
+		},
+		beforeEval: func(script string) {
+			if script != allocateLua || !injected.CompareAndSwap(false, true) {
+				return
+			}
+			base.Set(ctx, PlacementKey(key), concurrentRaw, 0)
+			base.ZAdd(ctx, PlacementNodeKey(oldNode.NodeIdentity), goredis.Z{Score: 99, Member: key.String()})
+			base.ZAdd(ctx, LeaseExpireKey(), goredis.Z{Score: float64(concurrent.LeaseExpireAt.UnixMilli()), Member: key.String()})
+			base.Set(ctx, StrategyRoundRobinKey("game", "default"), "1", 0)
+		},
+	}
+
+	stored, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         concurrent.GrainID,
+		Kind:            concurrent.Kind,
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	if reads.Load() != 2 {
+		t.Fatalf("placement pre-reads = %d, want 2 after conflict retry", reads.Load())
+	}
+	if stored.Version != concurrent.Version+1 || stored.NodeIdentity != newNode.NodeIdentity {
+		t.Fatalf("replacement = %+v, want version %d on %q", stored, concurrent.Version+1, newNode.NodeIdentity)
+	}
+	if _, err := base.ZScore(ctx, PlacementNodeKey(oldNode.NodeIdentity), key.String()).Result(); !errors.Is(err, goredis.Nil) {
+		t.Fatalf("old node index err = %v, want redis.Nil", err)
+	}
+}
+
 func TestRedisDirectoryAllocateKeepsExpiredPlacementIndexWhenNoNodeAvailable(t *testing.T) {
 	ctx := context.Background()
 	dir, client := newTestDirectory(t)
@@ -195,6 +271,87 @@ func TestRedisDirectoryAllocateKeepsExpiredPlacementIndexWhenNoNodeAvailable(t *
 	}
 	if _, err := client.ZScore(ctx, PlacementNodeKey(node.NodeIdentity), old.GrainKey.String()).Result(); err != nil {
 		t.Fatalf("old node index removed without a replacement: %v", err)
+	}
+}
+
+func TestRedisDirectoryAllocateWrongTypePreflightKeepsAllState(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		corrupt func(context.Context, *goredis.Client, sp.Node)
+		assert  func(*testing.T, context.Context, *goredis.Client, sp.Node, int64)
+	}{
+		{
+			name: "events stream",
+			corrupt: func(ctx context.Context, client *goredis.Client, _ sp.Node) {
+				client.Del(ctx, EventsStreamKey())
+				client.Set(ctx, EventsStreamKey(), "wrong-type-events", 0)
+			},
+			assert: func(t *testing.T, ctx context.Context, client *goredis.Client, _ sp.Node, _ int64) {
+				t.Helper()
+				if value := client.Get(ctx, EventsStreamKey()).Val(); value != "wrong-type-events" {
+					t.Fatalf("events key = %q, want unchanged marker", value)
+				}
+			},
+		},
+		{
+			name: "new node index",
+			corrupt: func(ctx context.Context, client *goredis.Client, newNode sp.Node) {
+				client.Set(ctx, PlacementNodeKey(newNode.NodeIdentity), "wrong-type-index", 0)
+			},
+			assert: func(t *testing.T, ctx context.Context, client *goredis.Client, newNode sp.Node, eventsBefore int64) {
+				t.Helper()
+				if value := client.Get(ctx, PlacementNodeKey(newNode.NodeIdentity)).Val(); value != "wrong-type-index" {
+					t.Fatalf("new node index = %q, want unchanged marker", value)
+				}
+				if events := client.XLen(ctx, EventsStreamKey()).Val(); events != eventsBefore {
+					t.Fatalf("outbox length = %d, want %d", events, eventsBefore)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir, client := newTestDirectory(t)
+			oldNode := registerTestNode(t, dir, "game-1", "session-a")
+			newNode := registerTestNode(t, dir, "game-2", "session-b")
+			old := allocateExpiringPlacement(t, dir, "wrong-type-"+test.name)
+			waitUntilExpired(old.LeaseExpireAt)
+
+			oldRaw := client.Get(ctx, PlacementKey(old.GrainKey)).Val()
+			oldNodeScore := client.ZScore(ctx, PlacementNodeKey(oldNode.NodeIdentity), old.GrainKey.String()).Val()
+			leaseScore := client.ZScore(ctx, LeaseExpireKey(), old.GrainKey.String()).Val()
+			roundRobin := client.Get(ctx, StrategyRoundRobinKey("game", "default")).Val()
+			sequence := client.Get(ctx, SequenceKey()).Val()
+			eventsBefore := client.XLen(ctx, EventsStreamKey()).Val()
+			test.corrupt(ctx, client, newNode)
+
+			_, err := dir.Allocate(ctx, sp.AllocateCommand{
+				GrainID:         old.GrainID,
+				Kind:            old.Kind,
+				TargetNodeType:  "game",
+				TargetNodeGroup: "default",
+				LeaseTTL:        time.Minute,
+			})
+			if err == nil {
+				t.Fatal("Allocate error = nil, want WRONGTYPE preflight error")
+			}
+			if raw := client.Get(ctx, PlacementKey(old.GrainKey)).Val(); raw != oldRaw {
+				t.Fatalf("placement raw changed after error")
+			}
+			if score := client.ZScore(ctx, PlacementNodeKey(oldNode.NodeIdentity), old.GrainKey.String()).Val(); score != oldNodeScore {
+				t.Fatalf("old node score = %v, want %v", score, oldNodeScore)
+			}
+			if score := client.ZScore(ctx, LeaseExpireKey(), old.GrainKey.String()).Val(); score != leaseScore {
+				t.Fatalf("lease score = %v, want %v", score, leaseScore)
+			}
+			if value := client.Get(ctx, StrategyRoundRobinKey("game", "default")).Val(); value != roundRobin {
+				t.Fatalf("round-robin cursor = %q, want %q", value, roundRobin)
+			}
+			if value := client.Get(ctx, SequenceKey()).Val(); value != sequence {
+				t.Fatalf("sequence = %q, want %q", value, sequence)
+			}
+			test.assert(t, ctx, client, newNode, eventsBefore)
+		})
 	}
 }
 
@@ -232,6 +389,121 @@ func TestRedisDirectoryExpireDueHonorsBatch(t *testing.T) {
 	}
 	if remaining := client.ZCount(ctx, LeaseExpireKey(), "-inf", "("+formatUnixMilli(now)).Val(); remaining != 1 {
 		t.Fatalf("remaining due lease members = %d, want 1", remaining)
+	}
+}
+
+func TestRedisDirectoryExpireDueCleansStaleMembersAndFillsBatch(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	node := registerTestNode(t, dir, "game-1", "session-a")
+
+	nonActive, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "released-stale-member",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.Release(ctx, sp.ReleaseCommand{
+		GrainKey:         nonActive.GrainKey,
+		NodeIdentity:     node.NodeIdentity,
+		NodeSessionID:    node.NodeSessionID,
+		PlacementVersion: nonActive.Version,
+		LeaseVersion:     nonActive.Lease.Version,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	due := allocateExpiringPlacement(t, dir, "real-due-after-stale")
+	now := due.LeaseExpireAt.Add(time.Millisecond)
+	missingKey, _ := sp.NewGrainKey("Player", "missing-stale-member")
+	if err := client.ZAdd(ctx, LeaseExpireKey(),
+		goredis.Z{Score: float64(now.Add(-3 * time.Second).UnixMilli()), Member: missingKey.String()},
+		goredis.Z{Score: float64(now.Add(-2 * time.Second).UnixMilli()), Member: nonActive.GrainKey.String()},
+	).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := dir.ExpireDue(ctx, now, 1)
+	if err != nil {
+		t.Fatalf("ExpireDue error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("ExpireDue count = %d, want 1", count)
+	}
+	stored, err := dir.getPlacement(ctx, due.GrainKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != sp.PlacementStatusExpired {
+		t.Fatalf("due status = %q, want expired", stored.Status)
+	}
+	for _, key := range []sp.GrainKey{missingKey, nonActive.GrainKey} {
+		if _, err := client.ZScore(ctx, LeaseExpireKey(), key.String()).Result(); !errors.Is(err, goredis.Nil) {
+			t.Fatalf("stale member %q err = %v, want redis.Nil", key, err)
+		}
+	}
+}
+
+func TestRedisDirectoryExpireDueStaleCleanupKeepsChangedLeaseScore(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	dir, err := NewDirectory(base, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := registerTestNode(t, dir, "game-1", "session-a")
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "stale-score-changed",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.Release(ctx, sp.ReleaseCommand{
+		GrainKey:         placement.GrainKey,
+		NodeIdentity:     node.NodeIdentity,
+		NodeSessionID:    node.NodeSessionID,
+		PlacementVersion: placement.Version,
+		LeaseVersion:     placement.Lease.Version,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	observedScore := now.Add(-time.Second).UnixMilli()
+	changedScore := now.Add(time.Minute).UnixMilli()
+	if err := base.ZAdd(ctx, LeaseExpireKey(), goredis.Z{Score: float64(observedScore), Member: placement.GrainKey.String()}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	var changed atomic.Bool
+	dir.client = evalHookClient{
+		UniversalClient: base,
+		beforeEval: func(script string) {
+			if script != cleanupStaleLeaseLua || !changed.CompareAndSwap(false, true) {
+				return
+			}
+			base.ZAdd(ctx, LeaseExpireKey(), goredis.Z{Score: float64(changedScore), Member: placement.GrainKey.String()})
+		},
+	}
+
+	count, err := dir.ExpireDue(ctx, now, 1)
+	if err != nil {
+		t.Fatalf("ExpireDue error: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("ExpireDue count = %d, want 0", count)
+	}
+	if !changed.Load() {
+		t.Fatal("cleanup hook was not called")
+	}
+	if score := base.ZScore(ctx, LeaseExpireKey(), placement.GrainKey.String()).Val(); score != float64(changedScore) {
+		t.Fatalf("lease score = %v, want changed score %d", score, changedScore)
 	}
 }
 
@@ -345,6 +617,35 @@ func TestRedisDirectoryRunExpireLoopStopsOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("RunExpireLoop did not stop after context cancellation")
+	}
+}
+
+func TestRedisDirectoryRunExpireLoopPreCanceledNonPositiveInterval(t *testing.T) {
+	dir, _ := newTestDirectory(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := dir.RunExpireLoop(ctx, 0, 10); err != nil {
+		t.Fatalf("RunExpireLoop error: %v", err)
+	}
+}
+
+func TestRedisDirectoryRunExpireLoopNonPositiveIntervalRunsOnce(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := newTestDirectory(t)
+	registerTestNode(t, dir, "game-1", "session-a")
+	placement := allocateExpiringPlacement(t, dir, "single-expire-scan")
+	waitUntilExpired(placement.LeaseExpireAt)
+
+	if err := dir.RunExpireLoop(ctx, 0, 10); err != nil {
+		t.Fatalf("RunExpireLoop error: %v", err)
+	}
+	stored, err := dir.getPlacement(ctx, placement.GrainKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != sp.PlacementStatusExpired {
+		t.Fatalf("placement status = %q, want expired", stored.Status)
 	}
 }
 

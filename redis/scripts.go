@@ -11,6 +11,29 @@ const (
 )
 
 const allocateLua = `
+local function expect_type(key, expected, label)
+	local actual = redis.call("TYPE", key)
+	if type(actual) == "table" then
+		actual = actual["ok"]
+	end
+	if actual ~= "none" and actual ~= expected then
+		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
+	end
+	return nil
+end
+
+local type_error = expect_type(KEYS[1], "string", "placement")
+	or expect_type(KEYS[2], "set", "nodes")
+	or expect_type(KEYS[3], "set", "invalid_nodes")
+	or expect_type(KEYS[4], "string", "round_robin")
+	or expect_type(KEYS[5], "zset", "lease_expire")
+	or expect_type(KEYS[6], "string", "sequence")
+	or expect_type(KEYS[7], "stream", "events")
+	or expect_type(KEYS[8], "zset", "old_node_index")
+if type_error then
+	return type_error
+end
+
 local existing = redis.call("GET", KEYS[1])
 local next_version = 1
 local remove_old_node = false
@@ -23,6 +46,9 @@ if existing then
 		local expire_at = redis.call("ZSCORE", KEYS[5], ARGV[3])
 		if not expire_at or tonumber(expire_at) > tonumber(ARGV[8]) then
 			return existing
+		end
+		if existing ~= ARGV[9] then
+			return "conflict"
 		end
 		remove_old_node = true
 	elseif existing ~= ARGV[9] then
@@ -51,6 +77,10 @@ end
 
 local cursor = tonumber(redis.call("GET", KEYS[4]) or "0")
 local chosen = effective[(cursor % #effective) + 1]
+type_error = expect_type(chosen["PlacementNodeKey"], "zset", "new_node_index")
+if type_error then
+	return type_error
+end
 local placement = {
 	GrainID = ARGV[1],
 	Kind = ARGV[2],
