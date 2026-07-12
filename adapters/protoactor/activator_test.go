@@ -1,0 +1,52 @@
+package protoactor
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/asynkron/protoactor-go/actor"
+	"github.com/asynkron/protoactor-go/service/cluster"
+	sp "github.com/wxdqing/stable-placement"
+)
+
+func TestSerialActivatorCreatesOnePIDForConcurrentRequests(t *testing.T) {
+	lookup := &resolverDirectory{route: sp.PlacementRoute{GrainKey: "player/acct-1", NodeIdentity: "game/server-1/game-1", OwnerNodeSessionID: "s", Version: 1, Status: sp.PlacementStatusActive, ValidUntil: time.Now().Add(time.Minute)}}
+	var mu sync.Mutex
+	spawnCalls := 0
+	activator := NewSerialActivator(lookup, "game/server-1/game-1", "s", "local", func(context.Context, *cluster.ClusterIdentity) (*actor.PID, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		spawnCalls++
+		return actor.NewPID("local", "player-acct-1"), nil
+	})
+	route := lookup.route
+	identity := cluster.NewClusterIdentity("acct-1", "player")
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := activator.Activate(context.Background(), identity, route); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if spawnCalls != 1 {
+		t.Fatalf("spawn calls = %d", spawnCalls)
+	}
+}
+
+func TestSerialActivatorRejectsExpectedRouteMismatch(t *testing.T) {
+	lookup := &resolverDirectory{route: sp.PlacementRoute{GrainKey: "player/acct-1", NodeIdentity: "game/server-1/game-1", OwnerNodeSessionID: "s", Version: 2, Status: sp.PlacementStatusActive, ValidUntil: time.Now().Add(time.Minute)}}
+	activator := NewSerialActivator(lookup, "game/server-1/game-1", "s", "local", func(context.Context, *cluster.ClusterIdentity) (*actor.PID, error) {
+		return actor.NewPID("local", "p"), nil
+	})
+	stale := lookup.route
+	stale.Version = 1
+	if _, err := activator.Activate(context.Background(), cluster.NewClusterIdentity("acct-1", "player"), stale); err == nil {
+		t.Fatal("stale activation succeeded")
+	}
+}
