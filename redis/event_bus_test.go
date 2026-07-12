@@ -3,6 +3,10 @@ package redis
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +14,103 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 	sp "github.com/wxdqing/stable-placement"
 )
+
+type trimRaceClient struct {
+	goredis.UniversalClient
+	once        sync.Once
+	mutate      func(context.Context) error
+	mutationErr error
+}
+
+type xAckErrorClient struct {
+	goredis.UniversalClient
+	err error
+}
+
+type limitedPendingReadClient struct {
+	goredis.UniversalClient
+}
+
+type continuityMetadataClient struct {
+	goredis.UniversalClient
+	entriesAdded int64
+	entriesRead  int64
+	lag          int64
+	maxDeletedID string
+	pending      *goredis.XPending
+}
+
+func (c continuityMetadataClient) XInfoStream(ctx context.Context, stream string) *goredis.XInfoStreamCmd {
+	info, err := c.UniversalClient.XInfoStream(ctx, stream).Result()
+	if err == nil {
+		info.EntriesAdded = c.entriesAdded
+		info.MaxDeletedEntryID = c.maxDeletedID
+	}
+	cmd := goredis.NewXInfoStreamCmd(ctx, stream)
+	cmd.SetVal(info)
+	cmd.SetErr(err)
+	return cmd
+}
+
+func (c continuityMetadataClient) XInfoGroups(ctx context.Context, stream string) *goredis.XInfoGroupsCmd {
+	groups, err := c.UniversalClient.XInfoGroups(ctx, stream).Result()
+	if err == nil {
+		for i := range groups {
+			groups[i].EntriesRead = c.entriesRead
+			groups[i].Lag = c.lag
+		}
+	}
+	cmd := goredis.NewXInfoGroupsCmd(ctx, stream)
+	cmd.SetVal(groups)
+	cmd.SetErr(err)
+	return cmd
+}
+
+func (c continuityMetadataClient) XPending(ctx context.Context, stream, group string) *goredis.XPendingCmd {
+	if c.pending == nil {
+		return c.UniversalClient.XPending(ctx, stream, group)
+	}
+	cmd := goredis.NewXPendingCmd(ctx, "xpending", stream, group)
+	cmd.SetVal(c.pending)
+	return cmd
+}
+
+func (c limitedPendingReadClient) XReadGroup(ctx context.Context, args *goredis.XReadGroupArgs) *goredis.XStreamSliceCmd {
+	streams, err := c.UniversalClient.XReadGroup(ctx, args).Result()
+	if err == nil && len(args.Streams) == 2 && args.Streams[1] == "0" && len(streams) > 0 && int64(len(streams[0].Messages)) > args.Count {
+		streams[0].Messages = streams[0].Messages[:args.Count]
+	}
+	return goredis.NewXStreamSliceCmdResult(streams, err)
+}
+
+func (c xAckErrorClient) XAck(context.Context, string, string, ...string) *goredis.IntCmd {
+	return goredis.NewIntResult(0, c.err)
+}
+
+func (c *trimRaceClient) trigger(ctx context.Context) error {
+	c.once.Do(func() {
+		c.mutationErr = c.mutate(ctx)
+	})
+	return c.mutationErr
+}
+
+func (c *trimRaceClient) XInfoGroups(ctx context.Context, stream string) *goredis.XInfoGroupsCmd {
+	groups, err := c.UniversalClient.XInfoGroups(ctx, stream).Result()
+	if err == nil {
+		err = c.trigger(ctx)
+	}
+	cmd := goredis.NewXInfoGroupsCmd(ctx, stream)
+	cmd.SetVal(groups)
+	cmd.SetErr(err)
+	return cmd
+}
+
+func (c *trimRaceClient) Eval(ctx context.Context, script string, keys []string, args ...interface{}) *goredis.Cmd {
+	if err := c.trigger(ctx); err != nil {
+		return goredis.NewCmdResult(nil, err)
+	}
+	return c.UniversalClient.Eval(ctx, script, keys, args...)
+}
 
 func TestRedisEventBusBroadcastsToUniqueConsumerGroups(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -148,6 +249,120 @@ func TestRedisEventBusRetriesPendingMessage(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("pending event was not retried")
+	}
+}
+
+func TestRedisEventBusDrainsAllPendingBeforeNewMessages(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(client, consumer)
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	for i := 0; i < 12; i++ {
+		event := sp.PlacementEvent{Type: sp.EventPlacementReleased, GrainKey: sp.GrainKey("Player/" + strconv.Itoa(i))}
+		if err := bus.Publish(ctx, event); err != nil {
+			t.Fatalf("Publish pending %d error: %v", i, err)
+		}
+	}
+	if err := client.XReadGroup(ctx, &goredis.XReadGroupArgs{
+		Group: consumer.Group, Consumer: consumer.NodeSessionID,
+		Streams: []string{bus.StreamKey(), ">"}, Count: 12,
+	}).Err(); err != nil {
+		t.Fatalf("create pending error: %v", err)
+	}
+	if err := bus.Publish(ctx, sp.PlacementEvent{
+		Type: sp.EventPlacementTransferred, GrainKey: sp.GrainKey("Player/new"),
+	}); err != nil {
+		t.Fatalf("Publish new error: %v", err)
+	}
+	bus.client = limitedPendingReadClient{UniversalClient: client}
+
+	stop := errors.New("new message reached")
+	var got []sp.GrainKey
+	err = bus.Subscribe(ctx, func(event sp.PlacementEvent) error {
+		got = append(got, event.GrainKey)
+		if event.GrainKey == sp.GrainKey("Player/new") {
+			return stop
+		}
+		return nil
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("Subscribe err = %v, want stop", err)
+	}
+	if len(got) != 13 {
+		t.Fatalf("handled messages = %d, want 13: %v", len(got), got)
+	}
+	for i := 0; i < 12; i++ {
+		want := sp.GrainKey("Player/" + strconv.Itoa(i))
+		if got[i] != want {
+			t.Fatalf("handled message %d = %q, want pending %q", i, got[i], want)
+		}
+	}
+}
+
+func TestRedisEventBusHandlerCancellationKeepsMessagePendingWithoutDegrading(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(client, consumer)
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	if err := bus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+		t.Fatalf("Publish error: %v", err)
+	}
+
+	if err := bus.Subscribe(ctx, func(sp.PlacementEvent) error {
+		cancel()
+		return nil
+	}); err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+	if bus.IsDegraded() {
+		t.Fatal("handler cancellation put bus in degraded mode")
+	}
+	pending, err := client.XPending(context.Background(), bus.StreamKey(), consumer.Group).Result()
+	if err != nil {
+		t.Fatalf("XPending error: %v", err)
+	}
+	if pending.Count != 1 {
+		t.Fatalf("pending count = %d, want 1", pending.Count)
+	}
+}
+
+func TestRedisEventBusAckCancellationDoesNotDegrade(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(base, consumer)
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	if err := bus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+		t.Fatalf("Publish error: %v", err)
+	}
+	bus.client = xAckErrorClient{UniversalClient: base, err: context.DeadlineExceeded}
+
+	if err := bus.Subscribe(ctx, func(sp.PlacementEvent) error { return nil }); err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+	if bus.IsDegraded() {
+		t.Fatal("ack deadline put bus in degraded mode")
 	}
 }
 
@@ -382,6 +597,73 @@ func TestRedisEventBusTrimKeepsUndeliveredMessages(t *testing.T) {
 	}
 }
 
+func TestRedisEventBusTrimAtomicallyKeepsNewPendingMessage(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(base, consumer)
+	for i := 0; i < 2; i++ {
+		if err := bus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+			t.Fatalf("Publish error: %v", err)
+		}
+	}
+	hooked := &trimRaceClient{UniversalClient: base}
+	hooked.mutate = func(ctx context.Context) error {
+		if err := base.XGroupCreate(ctx, bus.StreamKey(), consumer.Group, "0").Err(); err != nil {
+			return err
+		}
+		return base.XReadGroup(ctx, &goredis.XReadGroupArgs{
+			Group: consumer.Group, Consumer: consumer.NodeSessionID,
+			Streams: []string{bus.StreamKey(), ">"}, Count: 1,
+		}).Err()
+	}
+	bus.client = hooked
+
+	if err := bus.Trim(ctx, 1); err != nil {
+		t.Fatalf("Trim error: %v", err)
+	}
+	if length := base.XLen(ctx, bus.StreamKey()).Val(); length != 2 {
+		t.Fatalf("stream len after pending race = %d, want 2", length)
+	}
+}
+
+func TestRedisEventBusTrimAtomicallyKeepsNewUndeliveredMessage(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(base, consumer)
+	for i := 0; i < 2; i++ {
+		if err := bus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+			t.Fatalf("Publish error: %v", err)
+		}
+	}
+	hooked := &trimRaceClient{UniversalClient: base}
+	hooked.mutate = func(ctx context.Context) error {
+		if err := base.XGroupCreate(ctx, bus.StreamKey(), consumer.Group, "$").Err(); err != nil {
+			return err
+		}
+		return base.XAdd(ctx, &goredis.XAddArgs{
+			Stream: bus.StreamKey(), Values: eventValues(sp.PlacementEvent{Type: sp.EventManualCacheClear}),
+		}).Err()
+	}
+	bus.client = hooked
+
+	if err := bus.Trim(ctx, 1); err != nil {
+		t.Fatalf("Trim error: %v", err)
+	}
+	if length := base.XLen(ctx, bus.StreamKey()).Val(); length != 3 {
+		t.Fatalf("stream len after lag race = %d, want 3", length)
+	}
+}
+
 func TestRedisEventBusTrimGapEntersDegraded(t *testing.T) {
 	ctx := context.Background()
 	server := miniredis.RunT(t)
@@ -403,12 +685,317 @@ func TestRedisEventBusTrimGapEntersDegraded(t *testing.T) {
 	if err := client.XTrimMaxLen(ctx, EventsStreamKey(), 1).Err(); err != nil {
 		t.Fatalf("force trim error: %v", err)
 	}
+	bus.client = continuityMetadataClient{
+		UniversalClient: client, entriesAdded: 2, entriesRead: 0, lag: 1,
+	}
 	if err := bus.CheckContinuity(ctx); err == nil {
 		t.Fatal("CheckContinuity succeeded, want trim gap error")
 	}
 	if !bus.IsDegraded() {
 		t.Fatal("bus did not enter degraded mode")
 	}
+}
+
+func TestRedisEventBusContinuityDetectsDeletedPendingAtMaxDeleted(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(base, consumer)
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	for _, id := range []string{"1000-0", "2000-0"} {
+		if err := base.XAdd(ctx, &goredis.XAddArgs{
+			Stream: bus.StreamKey(), ID: id, Values: eventValues(sp.PlacementEvent{Type: sp.EventManualCacheClear}),
+		}).Err(); err != nil {
+			t.Fatalf("XAdd %s error: %v", id, err)
+		}
+	}
+	if err := base.XReadGroup(ctx, &goredis.XReadGroupArgs{
+		Group: consumer.Group, Consumer: consumer.NodeSessionID,
+		Streams: []string{bus.StreamKey(), ">"}, Count: 2,
+	}).Err(); err != nil {
+		t.Fatalf("create pending error: %v", err)
+	}
+	if err := base.XDel(ctx, bus.StreamKey(), "1000-0").Err(); err != nil {
+		t.Fatalf("XDel error: %v", err)
+	}
+	bus.client = continuityMetadataClient{
+		UniversalClient: base, entriesAdded: 2, entriesRead: 2, lag: 0, maxDeletedID: "1000-0",
+		pending: &goredis.XPending{Count: 2, Lower: "1000-0", Higher: "2000-0"},
+	}
+
+	if err := bus.CheckContinuity(ctx); !errors.Is(err, ErrStreamGap) {
+		t.Fatalf("CheckContinuity err = %v, want ErrStreamGap", err)
+	}
+}
+
+func TestRedisEventBusContinuityDetectsPendingBeforeFirstEntry(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(client, consumer)
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	for _, id := range []string{"1000-0", "2000-0"} {
+		if err := client.XAdd(ctx, &goredis.XAddArgs{
+			Stream: bus.StreamKey(), ID: id, Values: eventValues(sp.PlacementEvent{Type: sp.EventManualCacheClear}),
+		}).Err(); err != nil {
+			t.Fatalf("XAdd %s error: %v", id, err)
+		}
+	}
+	if err := client.XReadGroup(ctx, &goredis.XReadGroupArgs{
+		Group: consumer.Group, Consumer: consumer.NodeSessionID,
+		Streams: []string{bus.StreamKey(), ">"}, Count: 1,
+	}).Err(); err != nil {
+		t.Fatalf("create pending error: %v", err)
+	}
+	if err := client.XTrimMaxLen(ctx, bus.StreamKey(), 1).Err(); err != nil {
+		t.Fatalf("force trim error: %v", err)
+	}
+	bus.client = continuityMetadataClient{
+		UniversalClient: client,
+		pending:         &goredis.XPending{Count: 1, Lower: "1000-0", Higher: "1000-0"},
+	}
+
+	if err := bus.CheckContinuity(ctx); !errors.Is(err, ErrStreamGap) {
+		t.Fatalf("CheckContinuity err = %v, want ErrStreamGap", err)
+	}
+}
+
+func TestRedisEventBusContinuityDetectsPendingWhenStreamEmpty(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(client, consumer)
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	if err := bus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+		t.Fatalf("Publish error: %v", err)
+	}
+	if err := client.XReadGroup(ctx, &goredis.XReadGroupArgs{
+		Group: consumer.Group, Consumer: consumer.NodeSessionID,
+		Streams: []string{bus.StreamKey(), ">"}, Count: 1,
+	}).Err(); err != nil {
+		t.Fatalf("create pending error: %v", err)
+	}
+	if err := client.XTrimMaxLen(ctx, bus.StreamKey(), 0).Err(); err != nil {
+		t.Fatalf("force trim error: %v", err)
+	}
+	bus.client = continuityMetadataClient{
+		UniversalClient: client,
+		pending:         &goredis.XPending{Count: 1, Lower: "1000-0", Higher: "1000-0"},
+	}
+
+	if err := bus.CheckContinuity(ctx); !errors.Is(err, ErrStreamGap) {
+		t.Fatalf("CheckContinuity err = %v, want ErrStreamGap", err)
+	}
+}
+
+func TestRedisEventBusContinuityUsesEntriesAddedForCrossMillisecondGap(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(base, consumer)
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	for _, id := range []string{"1000-0", "2000-0"} {
+		if err := base.XAdd(ctx, &goredis.XAddArgs{
+			Stream: bus.StreamKey(), ID: id, Values: eventValues(sp.PlacementEvent{Type: sp.EventManualCacheClear}),
+		}).Err(); err != nil {
+			t.Fatalf("XAdd %s error: %v", id, err)
+		}
+	}
+	if err := base.XTrimMaxLen(ctx, bus.StreamKey(), 1).Err(); err != nil {
+		t.Fatalf("force trim error: %v", err)
+	}
+	bus.client = continuityMetadataClient{
+		UniversalClient: base, entriesAdded: 2, entriesRead: 0, lag: 1,
+	}
+
+	if err := bus.CheckContinuity(ctx); !errors.Is(err, ErrStreamGap) {
+		t.Fatalf("CheckContinuity err = %v, want ErrStreamGap", err)
+	}
+}
+
+func TestRedisEventBusContinuityAllowsSafeHistoricalTrim(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(base, consumer)
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	for _, id := range []string{"1000-0", "2000-0"} {
+		if err := base.XAdd(ctx, &goredis.XAddArgs{
+			Stream: bus.StreamKey(), ID: id, Values: eventValues(sp.PlacementEvent{Type: sp.EventManualCacheClear}),
+		}).Err(); err != nil {
+			t.Fatalf("XAdd %s error: %v", id, err)
+		}
+	}
+	messages, err := base.XReadGroup(ctx, &goredis.XReadGroupArgs{
+		Group: consumer.Group, Consumer: consumer.NodeSessionID,
+		Streams: []string{bus.StreamKey(), ">"}, Count: 2,
+	}).Result()
+	if err != nil {
+		t.Fatalf("XReadGroup error: %v", err)
+	}
+	for _, message := range messages[0].Messages {
+		if err := base.XAck(ctx, bus.StreamKey(), consumer.Group, message.ID).Err(); err != nil {
+			t.Fatalf("XAck error: %v", err)
+		}
+	}
+	if err := base.XTrimMaxLen(ctx, bus.StreamKey(), 1).Err(); err != nil {
+		t.Fatalf("force trim error: %v", err)
+	}
+	bus.client = continuityMetadataClient{
+		UniversalClient: base, entriesAdded: 2, entriesRead: 2, lag: 0,
+	}
+
+	if err := bus.CheckContinuity(ctx); err != nil {
+		t.Fatalf("CheckContinuity error: %v", err)
+	}
+}
+
+func TestRedisEventBusRealRedisContinuityMetadata(t *testing.T) {
+	addr := os.Getenv("STABLE_PLACEMENT_REAL_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("STABLE_PLACEMENT_REAL_REDIS_ADDR is not set")
+	}
+	client := goredis.NewClient(&goredis.Options{
+		Addr: addr, Password: os.Getenv("STABLE_PLACEMENT_REAL_REDIS_PASSWORD"),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("real Redis Ping error: %v", err)
+	}
+
+	newBus := func(t *testing.T) (*EventBus, StreamConsumer) {
+		t.Helper()
+		consumer, err := NewStreamConsumer(sp.Node{
+			NodeIdentity: "game/default/task8", NodeSessionID: t.Name(),
+		})
+		if err != nil {
+			t.Fatalf("consumer error: %v", err)
+		}
+		bus := NewEventBus(client, consumer)
+		bus.stream = fmt.Sprintf("sp:{stable-placement}:task8:%d", time.Now().UnixNano())
+		t.Cleanup(func() {
+			if err := client.Del(context.Background(), bus.stream).Err(); err != nil {
+				t.Errorf("cleanup isolated stream error: %v", err)
+			}
+		})
+		if err := bus.EnsureConsumerGroup(ctx); err != nil {
+			t.Fatalf("EnsureConsumerGroup error: %v", err)
+		}
+		return bus, consumer
+	}
+	add := func(t *testing.T, bus *EventBus, id string) {
+		t.Helper()
+		if err := client.XAdd(ctx, &goredis.XAddArgs{
+			Stream: bus.stream, ID: id, Values: eventValues(sp.PlacementEvent{Type: sp.EventManualCacheClear}),
+		}).Err(); err != nil {
+			t.Fatalf("XAdd %s error: %v", id, err)
+		}
+	}
+
+	t.Run("cross millisecond undelivered gap", func(t *testing.T) {
+		bus, _ := newBus(t)
+		add(t, bus, "1000-0")
+		add(t, bus, "2000-0")
+		if err := client.XTrimMaxLen(ctx, bus.stream, 1).Err(); err != nil {
+			t.Fatalf("XTrim error: %v", err)
+		}
+		if err := bus.CheckContinuity(ctx); !errors.Is(err, ErrStreamGap) {
+			t.Fatalf("CheckContinuity err = %v, want ErrStreamGap", err)
+		}
+	})
+
+	t.Run("safe historical trim", func(t *testing.T) {
+		bus, consumer := newBus(t)
+		add(t, bus, "1000-0")
+		add(t, bus, "2000-0")
+		streams, err := client.XReadGroup(ctx, &goredis.XReadGroupArgs{
+			Group: consumer.Group, Consumer: consumer.NodeSessionID,
+			Streams: []string{bus.stream, ">"}, Count: 2,
+		}).Result()
+		if err != nil {
+			t.Fatalf("XReadGroup error: %v", err)
+		}
+		for _, message := range streams[0].Messages {
+			if err := client.XAck(ctx, bus.stream, consumer.Group, message.ID).Err(); err != nil {
+				t.Fatalf("XAck error: %v", err)
+			}
+		}
+		if err := bus.Trim(ctx, 1); err != nil {
+			t.Fatalf("Trim error: %v", err)
+		}
+		if length := client.XLen(ctx, bus.stream).Val(); length != 1 {
+			t.Fatalf("stream len after safe trim = %d, want 1", length)
+		}
+		if err := bus.CheckContinuity(ctx); err != nil {
+			t.Fatalf("CheckContinuity error: %v", err)
+		}
+	})
+
+	t.Run("trimmed pending prefix", func(t *testing.T) {
+		bus, consumer := newBus(t)
+		add(t, bus, "1000-0")
+		add(t, bus, "2000-0")
+		if err := client.XReadGroup(ctx, &goredis.XReadGroupArgs{
+			Group: consumer.Group, Consumer: consumer.NodeSessionID,
+			Streams: []string{bus.stream, ">"}, Count: 1,
+		}).Err(); err != nil {
+			t.Fatalf("XReadGroup error: %v", err)
+		}
+		if err := client.XTrimMaxLen(ctx, bus.stream, 1).Err(); err != nil {
+			t.Fatalf("XTrim error: %v", err)
+		}
+		if err := bus.CheckContinuity(ctx); !errors.Is(err, ErrStreamGap) {
+			t.Fatalf("CheckContinuity err = %v, want ErrStreamGap", err)
+		}
+	})
+
+	t.Run("pending with empty stream", func(t *testing.T) {
+		bus, consumer := newBus(t)
+		add(t, bus, "1000-0")
+		if err := client.XReadGroup(ctx, &goredis.XReadGroupArgs{
+			Group: consumer.Group, Consumer: consumer.NodeSessionID,
+			Streams: []string{bus.stream, ">"}, Count: 1,
+		}).Err(); err != nil {
+			t.Fatalf("XReadGroup error: %v", err)
+		}
+		if err := client.XTrimMaxLen(ctx, bus.stream, 0).Err(); err != nil {
+			t.Fatalf("XTrim error: %v", err)
+		}
+		if err := bus.CheckContinuity(ctx); !errors.Is(err, ErrStreamGap) {
+			t.Fatalf("CheckContinuity err = %v, want ErrStreamGap", err)
+		}
+	})
 }
 
 func TestRedisEventBusContinuityAllowsUndeliveredMessages(t *testing.T) {
@@ -552,6 +1139,9 @@ func TestRedisEventBusSubscribeChecksContinuity(t *testing.T) {
 	}
 	if err := client.XTrimMaxLen(ctx, EventsStreamKey(), 1).Err(); err != nil {
 		t.Fatalf("force trim error: %v", err)
+	}
+	bus.client = continuityMetadataClient{
+		UniversalClient: client, entriesAdded: 2, entriesRead: 0, lag: 1,
 	}
 
 	handlerCalled := false

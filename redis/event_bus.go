@@ -22,6 +22,33 @@ type EventBus struct {
 	degraded bool
 }
 
+const trimStreamLua = `
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return 0
+end
+
+local groups = redis.call("XINFO", "GROUPS", KEYS[1])
+for _, group in ipairs(groups) do
+	local pending = nil
+	local lag = nil
+	for index = 1, #group, 2 do
+		if group[index] == "pending" then
+			pending = group[index + 1]
+		elseif group[index] == "lag" then
+			lag = group[index + 1]
+		end
+	end
+	if type(pending) ~= "number" or pending > 0 then
+		return 0
+	end
+	if type(lag) ~= "number" or lag ~= 0 then
+		return 0
+	end
+end
+
+return redis.call("XTRIM", KEYS[1], "MAXLEN", "=", ARGV[1])
+`
+
 func NewEventBus(client goredis.UniversalClient, consumer StreamConsumer) *EventBus {
 	return &EventBus{
 		client:   client,
@@ -147,19 +174,7 @@ func (b *EventBus) CheckPending(ctx context.Context, threshold time.Duration) er
 
 // Trim shortens the Stream only when every consumer group is caught up and has no pending messages.
 func (b *EventBus) Trim(ctx context.Context, maxLen int64) error {
-	groups, err := b.client.XInfoGroups(ctx, b.stream).Result()
-	if err != nil {
-		if strings.Contains(err.Error(), "no such key") {
-			return nil
-		}
-		return err
-	}
-	for _, group := range groups {
-		if group.Pending > 0 || group.Lag != 0 {
-			return nil
-		}
-	}
-	return b.client.XTrimMaxLen(ctx, b.stream, maxLen).Err()
+	return b.client.Eval(ctx, trimStreamLua, []string{b.stream}, maxLen).Err()
 }
 
 // RunTrimLoop periodically applies the same pending-safe trim policy as Trim.
@@ -200,6 +215,30 @@ func (b *EventBus) CheckContinuity(ctx context.Context) error {
 		}
 		return err
 	}
+	groups, err := b.client.XInfoGroups(ctx, b.stream).Result()
+	if err != nil {
+		if ctx.Err() == nil {
+			b.setDegraded()
+		}
+		return err
+	}
+	var consumerGroup *goredis.XInfoGroup
+	for i := range groups {
+		if groups[i].Name == b.consumer.Group {
+			consumerGroup = &groups[i]
+			break
+		}
+	}
+	if consumerGroup == nil {
+		return nil
+	}
+	pending, err := b.client.XPending(ctx, b.stream, b.consumer.Group).Result()
+	if err != nil {
+		if ctx.Err() == nil {
+			b.setDegraded()
+		}
+		return err
+	}
 	firstEntryID := info.FirstEntry.ID
 	if firstEntryID == "" && info.Length > 0 {
 		messages, err := b.client.XRangeN(ctx, b.stream, "-", "+", 1).Result()
@@ -213,35 +252,34 @@ func (b *EventBus) CheckContinuity(ctx context.Context) error {
 			firstEntryID = messages[0].ID
 		}
 	}
-	trimmed := info.MaxDeletedEntryID != "" && info.MaxDeletedEntryID != "0-0"
-	trimmed = trimmed || (info.EntriesAdded > 0 && info.EntriesAdded > info.Length)
-	if !trimmed && info.MaxDeletedEntryID == "" && info.EntriesAdded == 0 && firstEntryID != "" {
-		firstTime, firstSequence := splitRedisStreamID(firstEntryID)
-		lastTime, _ := splitRedisStreamID(info.LastGeneratedID)
-		trimmed = firstTime == lastTime && firstSequence > 0
-	}
-	if !trimmed {
-		return nil
-	}
-	groups, err := b.client.XInfoGroups(ctx, b.stream).Result()
-	if err != nil {
-		if ctx.Err() == nil {
-			b.setDegraded()
-		}
-		return err
-	}
-	for _, group := range groups {
-		if group.Name != b.consumer.Group {
-			continue
-		}
-		gapID := info.MaxDeletedEntryID
-		if gapID == "" || gapID == "0-0" {
-			gapID = firstEntryID
-		}
-		if compareRedisStreamID(gapID, group.LastDeliveredID) > 0 {
+	maxDeleted := info.MaxDeletedEntryID != "" && info.MaxDeletedEntryID != "0-0"
+	if pending.Count > 0 {
+		pendingMissing := info.Length == 0
+		pendingMissing = pendingMissing || (maxDeleted && compareRedisStreamID(pending.Lower, info.MaxDeletedEntryID) <= 0)
+		pendingMissing = pendingMissing || (firstEntryID != "" && compareRedisStreamID(pending.Lower, firstEntryID) < 0)
+		if pendingMissing {
 			b.setDegraded()
 			return ErrStreamGap
 		}
+	}
+	if maxDeleted && compareRedisStreamID(info.MaxDeletedEntryID, consumerGroup.LastDeliveredID) > 0 {
+		b.setDegraded()
+		return ErrStreamGap
+	}
+	if info.EntriesAdded > 0 && consumerGroup.EntriesRead >= 0 && consumerGroup.Lag >= 0 {
+		if consumerGroup.EntriesRead > info.EntriesAdded || consumerGroup.Lag > info.EntriesAdded-consumerGroup.EntriesRead {
+			b.setDegraded()
+			return ErrStreamGap
+		}
+		if consumerGroup.EntriesRead+consumerGroup.Lag < info.EntriesAdded {
+			b.setDegraded()
+			return ErrStreamGap
+		}
+		return nil
+	}
+	if info.EntriesAdded > info.Length {
+		b.setDegraded()
+		return ErrStreamGap
 	}
 	return nil
 }
@@ -306,13 +344,16 @@ func (b *EventBus) consume(ctx context.Context, id string, handler func(sp.Place
 				b.setDegraded()
 				return err
 			}
+			if ctx.Err() != nil {
+				return nil
+			}
 			if err := b.client.XAck(ctx, b.stream, b.consumer.Group, message.ID).Err(); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil
+				}
 				b.setDegraded()
 				return err
 			}
-		}
-		if id == "0" {
-			return nil
 		}
 	}
 }
