@@ -4,6 +4,7 @@ import "context"
 
 type Directory interface {
 	Lookup(ctx context.Context, key GrainKey) (*PlacementRoute, error)
+	ResolveRoute(ctx context.Context, cmd ResolveRouteCommand) (*PlacementRoute, error)
 	Allocate(ctx context.Context, cmd AllocateCommand) (*Placement, error)
 	Renew(ctx context.Context, cmd RenewCommand) (*Placement, error)
 	Release(ctx context.Context, cmd ReleaseCommand) error

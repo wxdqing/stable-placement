@@ -11,6 +11,13 @@ type AllocateCommand struct {
 	TargetNodeGroup string
 }
 
+type ResolveRouteCommand struct {
+	GrainID         string
+	Kind            string
+	TargetNodeType  string
+	TargetNodeGroup string
+}
+
 type RenewCommand struct {
 	// GrainKey 唯一标识要续约的 Grain。
 	GrainKey GrainKey

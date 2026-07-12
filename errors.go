@@ -17,4 +17,5 @@ var (
 	ErrNodeNotInvalid            = errors.New("node is not marked invalid")
 	ErrUnsupportedStrategyMode   = errors.New("unsupported strategy mode")
 	ErrPlacementConfigInvalid    = errors.New("placement config invalid")
+	ErrPlacementTargetMismatch   = errors.New("placement target mismatch")
 )

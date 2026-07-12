@@ -49,6 +49,39 @@ func (r *CachedRouter) Lookup(ctx context.Context, key sp.GrainKey) (*sp.Placeme
 	return route, nil
 }
 
+func (r *CachedRouter) ResolveRoute(ctx context.Context, cmd sp.ResolveRouteCommand) (*sp.PlacementRoute, error) {
+	key, err := sp.NewGrainKey(cmd.Kind, cmd.GrainID)
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	epoch := r.epoch
+	if route, ok := r.cache.GetCachedPlacement(key); ok && routeMatchesTarget(route, cmd) && time.Now().Before(route.ValidUntil) {
+		r.mu.Unlock()
+		return route, nil
+	}
+	r.mu.Unlock()
+
+	route, err := r.directory.ResolveRoute(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
+	if route.Status == sp.PlacementStatusActive && time.Now().Before(route.ValidUntil) {
+		r.mu.Lock()
+		if r.epoch == epoch {
+			r.cache.SetCachedPlacement(key, *route)
+		}
+		r.mu.Unlock()
+	}
+	return route, nil
+}
+
+func routeMatchesTarget(route *sp.PlacementRoute, cmd sp.ResolveRouteCommand) bool {
+	identity := sp.NodeIdentity(route.NodeIdentity)
+	return route.Status == sp.PlacementStatusActive &&
+		identity.NodeType() == cmd.TargetNodeType && identity.NodeGroup() == cmd.TargetNodeGroup
+}
+
 func (r *CachedRouter) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.Placement, error) {
 	r.mu.Lock()
 	epoch := r.epoch

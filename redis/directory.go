@@ -280,6 +280,96 @@ func (d *Directory) Lookup(ctx context.Context, key sp.GrainKey) (*sp.PlacementR
 	return &sp.PlacementRoute{GrainKey: current.GrainKey, NodeIdentity: current.NodeIdentity, OwnerNodeSessionID: current.OwnerNodeSessionID, Version: current.Version, Status: current.Status, NodeLeaseVersion: leaseVersion, ValidUntil: validUntil}, nil
 }
 
+func (d *Directory) ResolveRoute(ctx context.Context, cmd sp.ResolveRouteCommand) (*sp.PlacementRoute, error) {
+	key, err := sp.NewGrainKey(cmd.Kind, cmd.GrainID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := sp.NewNodeIdentity(cmd.TargetNodeType, cmd.TargetNodeGroup, "target"); err != nil {
+		return nil, err
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		route, err := d.resolveRouteOnce(ctx, key, cmd)
+		if !errors.Is(err, sp.ErrVersionConflict) {
+			return route, err
+		}
+	}
+	return nil, sp.ErrVersionConflict
+}
+
+func (d *Directory) resolveRouteOnce(ctx context.Context, key sp.GrainKey, cmd sp.ResolveRouteCommand) (*sp.PlacementRoute, error) {
+	oldRaw := ""
+	oldIndex := PlacementNodeKey("")
+	oldNode := NodeKey("")
+	ownerLease := NodeLeaseKey("", "")
+	ownerType, ownerGroup, ownerName := "", "", ""
+	if raw, placement, err := d.getPlacementRaw(ctx, key); err == nil {
+		oldRaw = string(raw)
+		oldIndex = PlacementNodeKey(placement.NodeIdentity)
+		oldNode = NodeKey(placement.NodeIdentity)
+		ownerID := sp.NodeIdentity(placement.NodeIdentity)
+		ownerType, ownerGroup, ownerName = ownerID.NodeType(), ownerID.NodeGroup(), ownerID.NodeName()
+		if ownerType == "" || ownerGroup == "" || ownerName == "" {
+			return nil, fmt.Errorf("invalid placement owner identity %q", placement.NodeIdentity)
+		}
+		ownerLease = NodeLeaseKey(ownerType, ownerGroup)
+	} else if !errors.Is(err, sp.ErrPlacementNotFound) {
+		return nil, err
+	}
+	requestStart := time.Now()
+	result, err := d.client.Eval(ctx, resolveRouteLua, []string{
+		PlacementKey(key), NodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup),
+		InvalidNodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup), StrategyRoundRobinKey(cmd.TargetNodeType, cmd.TargetNodeGroup),
+		NodeLeaseKey(cmd.TargetNodeType, cmd.TargetNodeGroup), SequenceKey(), EventsStreamKey(),
+		oldIndex, oldNode, ownerLease,
+	}, cmd.GrainID, cmd.Kind, key.String(), oldRaw, string(sp.EventPlacementCreated),
+		cmd.TargetNodeType, cmd.TargetNodeGroup, string(sp.EventPlacementRecovered),
+		ownerType, ownerGroup, ownerName).Result()
+	if err != nil {
+		return nil, err
+	}
+	if status, ok := result.(string); ok {
+		switch status {
+		case "conflict":
+			return nil, sp.ErrVersionConflict
+		case "target_mismatch":
+			return nil, sp.ErrPlacementTargetMismatch
+		case "owner_unavailable":
+			return nil, sp.ErrPlacementOwnerUnavailable
+		case "no_available_node":
+			return nil, sp.ErrNoAvailableNode
+		default:
+			return nil, fmt.Errorf("unexpected resolve route result %q", status)
+		}
+	}
+	items, ok := result.([]interface{})
+	if !ok || len(items) != 3 {
+		return nil, fmt.Errorf("unexpected resolve route result %T", result)
+	}
+	var wire redisPlacement
+	if err := json.Unmarshal([]byte(fmt.Sprint(items[0])), &wire); err != nil {
+		return nil, err
+	}
+	leaseVersion, err := strconv.ParseInt(fmt.Sprint(items[1]), 10, 64)
+	if err != nil || leaseVersion <= 0 {
+		return nil, fmt.Errorf("invalid route lease version %q", items[1])
+	}
+	remaining, err := strconv.ParseInt(fmt.Sprint(items[2]), 10, 64)
+	if err != nil || remaining <= 0 || remaining > time.Duration(1<<63-1).Milliseconds() {
+		return nil, sp.ErrPlacementOwnerUnavailable
+	}
+	validUntil := requestStart.Add(time.Duration(remaining) * time.Millisecond)
+	if !time.Now().Before(validUntil) {
+		return nil, sp.ErrPlacementOwnerUnavailable
+	}
+	placement := wire.placement()
+	return &sp.PlacementRoute{
+		GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity,
+		OwnerNodeSessionID: placement.OwnerNodeSessionID, Version: placement.Version,
+		Status: placement.Status, NodeLeaseVersion: leaseVersion, ValidUntil: validUntil,
+	}, nil
+}
+
 func NodeLeaseKeyForNode(p sp.Placement) string {
 	id := sp.NodeIdentity(p.NodeIdentity)
 	return NodeLeaseKey(id.NodeType(), id.NodeGroup())

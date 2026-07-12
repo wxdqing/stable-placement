@@ -68,6 +68,121 @@ func (d *Directory) Lookup(_ context.Context, key sp.GrainKey) (*sp.PlacementRou
 	return &route, nil
 }
 
+func (d *Directory) ResolveRoute(ctx context.Context, cmd sp.ResolveRouteCommand) (*sp.PlacementRoute, error) {
+	key, err := sp.NewGrainKey(cmd.Kind, cmd.GrainID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := sp.NewNodeIdentity(cmd.TargetNodeType, cmd.TargetNodeGroup, "target"); err != nil {
+		return nil, err
+	}
+
+	d.mu.Lock()
+	d.registry.mu.Lock()
+	now := d.registry.now()
+	placement, exists := d.placements[key]
+	eventType := sp.EventPlacementCreated
+
+	if exists && placement.Status == sp.PlacementStatusActive {
+		ownerIdentity := sp.NodeIdentity(placement.NodeIdentity)
+		if ownerIdentity.NodeType() != cmd.TargetNodeType || ownerIdentity.NodeGroup() != cmd.TargetNodeGroup {
+			d.registry.mu.Unlock()
+			d.mu.Unlock()
+			return nil, sp.ErrPlacementTargetMismatch
+		}
+		if d.placementRouteableLocked(placement, now) {
+			route := d.routeLocked(placement, d.registry.nodes[placement.NodeIdentity], now)
+			d.registry.mu.Unlock()
+			d.mu.Unlock()
+			return route, nil
+		}
+		if sameNode, ok := d.registry.nodes[placement.NodeIdentity]; ok && d.nodeSessionUsableLocked(sameNode, now) && sameNode.NodeSessionID != placement.OwnerNodeSessionID {
+			d.movePlacementLocked(&placement, sameNode, now)
+			eventType = sp.EventPlacementRecovered
+		} else {
+			if !d.registry.isInvalidLocked(ownerIdentity.NodeType(), ownerIdentity.NodeGroup(), ownerIdentity.NodeName()) {
+				d.registry.mu.Unlock()
+				d.mu.Unlock()
+				return nil, sp.ErrPlacementOwnerUnavailable
+			}
+			target, chooseErr := d.chooseTargetLocked(ctx, cmd)
+			if chooseErr != nil {
+				d.registry.mu.Unlock()
+				d.mu.Unlock()
+				return nil, chooseErr
+			}
+			d.movePlacementLocked(&placement, target, now)
+			eventType = sp.EventPlacementRecovered
+		}
+	} else {
+		target, chooseErr := d.chooseTargetLocked(ctx, cmd)
+		if chooseErr != nil {
+			d.registry.mu.Unlock()
+			d.mu.Unlock()
+			return nil, chooseErr
+		}
+		version := int64(1)
+		if exists {
+			version = placement.Version + 1
+			d.deleteNodeIndexLocked(placement.NodeIdentity, key)
+		}
+		placement = sp.Placement{
+			GrainID: cmd.GrainID, Kind: cmd.Kind, GrainKey: key,
+			NodeIdentity: target.NodeIdentity, OwnerNodeSessionID: target.NodeSessionID,
+			Version: version, Status: sp.PlacementStatusActive, CreateTime: now, UpdateTime: now,
+		}
+		d.placements[key] = placement
+		d.addNodeIndexLocked(target.NodeIdentity, key)
+	}
+
+	node := d.registry.nodes[placement.NodeIdentity]
+	route := d.routeLocked(placement, node, now)
+	d.registry.mu.Unlock()
+	d.mu.Unlock()
+	_ = d.publish(ctx, placement, eventType)
+	return route, nil
+}
+
+func (d *Directory) chooseTargetLocked(ctx context.Context, cmd sp.ResolveRouteCommand) (sp.Node, error) {
+	nodes := make([]sp.Node, 0)
+	now := d.registry.now()
+	for _, node := range d.registry.nodes {
+		if node.NodeType == cmd.TargetNodeType && node.NodeGroup == cmd.TargetNodeGroup && d.targetAvailableLocked(node, now) {
+			nodes = append(nodes, node)
+		}
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].NodeIdentity < nodes[j].NodeIdentity })
+	if len(nodes) == 0 {
+		return sp.Node{}, sp.ErrNoAvailableNode
+	}
+	chosen, err := d.strategy.Choose(ctx, sp.StrategyInput{
+		GrainID: cmd.GrainID, Kind: cmd.Kind, NodeType: cmd.TargetNodeType,
+		NodeGroup: cmd.TargetNodeGroup, EffectiveNodes: nodes,
+	})
+	if err != nil {
+		return sp.Node{}, err
+	}
+	for _, candidate := range nodes {
+		if candidate.NodeIdentity == chosen.NodeIdentity && candidate.NodeSessionID == chosen.NodeSessionID {
+			return candidate, nil
+		}
+	}
+	return sp.Node{}, sp.ErrNoAvailableNode
+}
+
+func (d *Directory) routeLocked(placement sp.Placement, node sp.Node, now time.Time) *sp.PlacementRoute {
+	return &sp.PlacementRoute{
+		GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity,
+		OwnerNodeSessionID: placement.OwnerNodeSessionID, Version: placement.Version,
+		Status: placement.Status, NodeLeaseVersion: node.Lease.Version,
+		ValidUntil: now.Add(time.UnixMilli(node.Lease.ExpireAtUnixMilli).Sub(now)),
+	}
+}
+
+func (d *Directory) nodeSessionUsableLocked(node sp.Node, now time.Time) bool {
+	return (node.Status == sp.NodeStatusActive || node.Status == sp.NodeStatusDraining) && !leaseExpired(node, now)
+}
+
 func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.Placement, error) {
 	key, err := sp.NewGrainKey(cmd.Kind, cmd.GrainID)
 	if err != nil {

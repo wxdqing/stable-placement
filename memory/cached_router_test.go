@@ -19,10 +19,19 @@ type cachedRouterDirectory struct {
 	allocateErr     error
 	lookupCalls     int
 	allocateCalls   int
+	resolveCalls    int
 	lookupStarted   chan struct{}
 	lookupRelease   chan struct{}
 	allocateStarted chan struct{}
 	allocateRelease chan struct{}
+}
+
+func (d *cachedRouterDirectory) ResolveRoute(context.Context, sp.ResolveRouteCommand) (*sp.PlacementRoute, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.resolveCalls++
+	route := d.route
+	return &route, d.lookupErr
 }
 
 func (d *cachedRouterDirectory) Lookup(context.Context, sp.GrainKey) (*sp.PlacementRoute, error) {
@@ -111,6 +120,28 @@ func TestCachedRouterLookupUsesCacheOnlyBeforeValidUntil(t *testing.T) {
 				t.Fatalf("Lookup calls = %d, want %d", calls, test.calls)
 			}
 		})
+	}
+}
+
+func TestCachedRouterResolveRouteCachesHealthyRoute(t *testing.T) {
+	key, _ := sp.NewGrainKey("player", "acct-1")
+	want := activeRoute(key, "game/default/game-1")
+	directory := &cachedRouterDirectory{route: want}
+	router := NewCachedRouter(directory, NewPlacementCache())
+	cmd := sp.ResolveRouteCommand{GrainID: "acct-1", Kind: "player", TargetNodeType: "game", TargetNodeGroup: "default"}
+	first, err := router.ResolveRoute(context.Background(), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := router.ResolveRoute(context.Background(), cmd)
+	if err != nil || *first != want || *second != want {
+		t.Fatalf("routes=%+v %+v err=%v", first, second, err)
+	}
+	directory.mu.Lock()
+	calls := directory.resolveCalls
+	directory.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("ResolveRoute calls = %d", calls)
 	}
 }
 
