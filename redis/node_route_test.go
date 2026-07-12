@@ -110,6 +110,127 @@ func TestRedisDirectoryAllocateLookupRenewAndReleaseRoute(t *testing.T) {
 	}
 }
 
+func TestRedisDirectoryPlacementTimestampContract(t *testing.T) {
+	ctx := context.Background()
+	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: 10 * time.Second})
+	server.SetTime(time.UnixMilli(500123))
+	a, b := testNode("timestamp-a", "session-a"), testNode("timestamp-b", "session-b")
+	for _, node := range []sp.Node{a, b} {
+		if err := dir.RegisterNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+	}
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "timestamps", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCreate := time.UnixMilli(500123)
+	if placement.CreateTime != wantCreate || placement.UpdateTime != wantCreate {
+		t.Fatalf("allocated timestamps = %v / %v, want %v", placement.CreateTime, placement.UpdateTime, wantCreate)
+	}
+	assertPersisted := func(t *testing.T, want *sp.Placement) {
+		t.Helper()
+		page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: want.NodeIdentity})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Placements) != 1 || page.Placements[0] != *want {
+			t.Fatalf("persisted placements = %+v, want %+v", page.Placements, *want)
+		}
+		var wire map[string]any
+		if err := json.Unmarshal([]byte(client.Get(ctx, PlacementKey(want.GrainKey)).Val()), &wire); err != nil {
+			t.Fatal(err)
+		}
+		if wire["CreateTimeUnixMilli"] != float64(want.CreateTime.UnixMilli()) || wire["UpdateTimeUnixMilli"] != float64(want.UpdateTime.UnixMilli()) {
+			t.Fatalf("wire timestamps = %#v", wire)
+		}
+		if _, ok := wire["CreateTime"]; ok {
+			t.Fatalf("wire contains public CreateTime field: %#v", wire)
+		}
+	}
+	assertPersisted(t, placement)
+
+	server.SetTime(time.UnixMilli(501123))
+	renewed, err := dir.Renew(ctx, sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewed.CreateTime != placement.CreateTime || renewed.UpdateTime != placement.UpdateTime {
+		t.Fatalf("renewed timestamps = %v / %v, allocated = %v / %v", renewed.CreateTime, renewed.UpdateTime, placement.CreateTime, placement.UpdateTime)
+	}
+	assertPersisted(t, renewed)
+
+	target := a
+	if placement.NodeIdentity == a.NodeIdentity {
+		target = b
+	}
+	server.SetTime(time.UnixMilli(502123))
+	transferred, err := dir.Transfer(ctx, sp.TransferCommand{GrainKey: placement.GrainKey, FromNodeIdentity: placement.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transferred.CreateTime != placement.CreateTime || transferred.UpdateTime != time.UnixMilli(502123) {
+		t.Fatalf("transferred timestamps = %v / %v", transferred.CreateTime, transferred.UpdateTime)
+	}
+	assertPersisted(t, transferred)
+
+	next := target
+	next.NodeSessionID = "replacement"
+	if _, err := dir.ReplaceNodeSession(ctx, next); err != nil {
+		t.Fatal(err)
+	}
+	server.SetTime(time.UnixMilli(503123))
+	recovered, err := dir.Recover(ctx, sp.RecoverCommand{GrainKey: transferred.GrainKey, NewNodeIdentity: placement.NodeIdentity, PlacementVersion: transferred.Version})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.CreateTime != placement.CreateTime || recovered.UpdateTime != time.UnixMilli(503123) {
+		t.Fatalf("recovered timestamps = %v / %v", recovered.CreateTime, recovered.UpdateTime)
+	}
+	assertPersisted(t, recovered)
+}
+
+func TestRedisDirectoryReleaseAndReallocateTimestampContract(t *testing.T) {
+	ctx := context.Background()
+	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: 10 * time.Second})
+	server.SetTime(time.UnixMilli(600123))
+	node := testNode("timestamp-release", "session-a")
+	if err := dir.RegisterNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	first, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "timestamp-release", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetTime(time.UnixMilli(601123))
+	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: first.GrainKey, NodeIdentity: first.NodeIdentity, NodeSessionID: first.OwnerNodeSessionID, PlacementVersion: first.Version}); err != nil {
+		t.Fatal(err)
+	}
+	released, err := dir.getPlacement(ctx, first.GrainKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released.CreateTime != first.CreateTime || released.UpdateTime != time.UnixMilli(601123) {
+		t.Fatalf("released timestamps = %v / %v, first = %v / %v", released.CreateTime, released.UpdateTime, first.CreateTime, first.UpdateTime)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal([]byte(client.Get(ctx, PlacementKey(first.GrainKey)).Val()), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire["CreateTimeUnixMilli"] != float64(first.CreateTime.UnixMilli()) || wire["UpdateTimeUnixMilli"] != float64(601123) {
+		t.Fatalf("released wire timestamps = %#v", wire)
+	}
+
+	server.SetTime(time.UnixMilli(602123))
+	second, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: first.GrainID, Kind: first.Kind, TargetNodeType: "game", TargetNodeGroup: "default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Version != first.Version+2 || second.CreateTime != time.UnixMilli(602123) || second.UpdateTime != second.CreateTime {
+		t.Fatalf("reallocated placement = %+v, first = %+v", second, first)
+	}
+}
+
 func TestRedisDirectoryRecoverReleasedReturnsNotRecoverableV2(t *testing.T) {
 	ctx := context.Background()
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})

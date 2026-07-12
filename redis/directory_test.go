@@ -22,7 +22,7 @@ func addIndexedPlacementV2(t *testing.T, client *goredis.Client, nodeIdentity, g
 		t.Fatal(err)
 	}
 	placement := sp.Placement{GrainID: grainID, Kind: "Player", GrainKey: key, NodeIdentity: nodeIdentity, OwnerNodeSessionID: "session-a", Version: 1, Status: status}
-	raw, err := json.Marshal(placement)
+	raw, err := json.Marshal(redisPlacementFromPlacement(placement))
 	if err != nil {
 		t.Fatal(err)
 	}

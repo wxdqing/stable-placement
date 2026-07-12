@@ -187,15 +187,62 @@ func TestDirectoryAllocateExistingPlacementRules(t *testing.T) {
 }
 
 func TestDirectoryAllocateReleasedPlacementAdvancesHistory(t *testing.T) {
-	directory, _, _ := newTestDirectory(t)
+	directory, clock, _ := newTestDirectory(t)
 	node := registerTestNode(t, directory, "game-1", "session-a")
 	first := allocateTestPlacement(t, directory, "10001", node)
+	if first.CreateTime.IsZero() || first.CreateTime != first.UpdateTime {
+		t.Fatalf("allocated timestamps = %v / %v", first.CreateTime, first.UpdateTime)
+	}
+	clock.Advance(time.Second)
 	if err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: first.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: first.Version}); err != nil {
 		t.Fatal(err)
 	}
+	released := directory.placements[first.GrainKey]
+	if released.CreateTime != first.CreateTime || !released.UpdateTime.After(first.UpdateTime) {
+		t.Fatalf("released timestamps = %v / %v, first = %v / %v", released.CreateTime, released.UpdateTime, first.CreateTime, first.UpdateTime)
+	}
+	clock.Advance(time.Second)
 	second := allocateTestPlacement(t, directory, "10001", node)
-	if second.Version != first.Version+2 || second.Status != sp.PlacementStatusActive {
+	if second.Version != first.Version+2 || second.Status != sp.PlacementStatusActive || second.CreateTime != second.UpdateTime || !second.CreateTime.After(released.UpdateTime) {
 		t.Fatalf("reallocated placement = %+v, first = %+v", second, first)
+	}
+}
+
+func TestDirectoryPlacementMutationTimestampContract(t *testing.T) {
+	directory, clock, _ := newTestDirectory(t)
+	owner := registerTestNode(t, directory, "owner", "owner-session")
+	target := registerTestNode(t, directory, "target", "target-session")
+	placement := allocateTestPlacement(t, directory, "timestamps", owner)
+	if placement.CreateTime.IsZero() || placement.CreateTime != placement.UpdateTime {
+		t.Fatalf("allocated timestamps = %v / %v", placement.CreateTime, placement.UpdateTime)
+	}
+
+	clock.Advance(time.Second)
+	renewed, err := directory.Renew(context.Background(), sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewed.CreateTime != placement.CreateTime || renewed.UpdateTime != placement.UpdateTime {
+		t.Fatalf("renewed timestamps = %v / %v, allocated = %v / %v", renewed.CreateTime, renewed.UpdateTime, placement.CreateTime, placement.UpdateTime)
+	}
+
+	clock.Advance(time.Second)
+	transferred, err := directory.Transfer(context.Background(), sp.TransferCommand{GrainKey: placement.GrainKey, FromNodeIdentity: owner.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transferred.CreateTime != placement.CreateTime || !transferred.UpdateTime.After(placement.UpdateTime) {
+		t.Fatalf("transferred timestamps = %v / %v, allocated = %v / %v", transferred.CreateTime, transferred.UpdateTime, placement.CreateTime, placement.UpdateTime)
+	}
+
+	setNodeSession(directory.registry, target.NodeIdentity, "replacement")
+	clock.Advance(time.Second)
+	recovered, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: transferred.GrainKey, NewNodeIdentity: owner.NodeIdentity, PlacementVersion: transferred.Version})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.CreateTime != placement.CreateTime || !recovered.UpdateTime.After(transferred.UpdateTime) {
+		t.Fatalf("recovered timestamps = %v / %v, transferred = %v / %v", recovered.CreateTime, recovered.UpdateTime, transferred.CreateTime, transferred.UpdateTime)
 	}
 }
 

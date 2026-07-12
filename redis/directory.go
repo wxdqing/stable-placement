@@ -27,6 +27,36 @@ type redisNode struct {
 	NodeKey          string
 }
 
+type redisPlacement struct {
+	GrainID             string
+	Kind                string
+	GrainKey            sp.GrainKey
+	NodeIdentity        string
+	OwnerNodeSessionID  string
+	Version             int64
+	Status              sp.PlacementStatus
+	CreateTimeUnixMilli int64
+	UpdateTimeUnixMilli int64
+}
+
+func redisPlacementFromPlacement(placement sp.Placement) redisPlacement {
+	return redisPlacement{
+		GrainID: placement.GrainID, Kind: placement.Kind, GrainKey: placement.GrainKey,
+		NodeIdentity: placement.NodeIdentity, OwnerNodeSessionID: placement.OwnerNodeSessionID,
+		Version: placement.Version, Status: placement.Status,
+		CreateTimeUnixMilli: placement.CreateTime.UnixMilli(), UpdateTimeUnixMilli: placement.UpdateTime.UnixMilli(),
+	}
+}
+
+func (placement redisPlacement) placement() sp.Placement {
+	return sp.Placement{
+		GrainID: placement.GrainID, Kind: placement.Kind, GrainKey: placement.GrainKey,
+		NodeIdentity: placement.NodeIdentity, OwnerNodeSessionID: placement.OwnerNodeSessionID,
+		Version: placement.Version, Status: placement.Status,
+		CreateTime: time.UnixMilli(placement.CreateTimeUnixMilli), UpdateTime: time.UnixMilli(placement.UpdateTimeUnixMilli),
+	}
+}
+
 const maxPlacementIndexScore = int64(1<<53 - 1)
 
 func NewDirectory(client goredis.UniversalClient, mode sp.StrategyMode, config sp.NodeLeaseConfig) (*Directory, error) {
@@ -201,10 +231,11 @@ func (d *Directory) Lookup(ctx context.Context, key sp.GrainKey) (*sp.PlacementR
 	if !ok || len(items) != 3 {
 		return nil, sp.ErrPlacementNotFound
 	}
-	var current sp.Placement
-	if err := json.Unmarshal([]byte(fmt.Sprint(items[0])), &current); err != nil {
+	var currentWire redisPlacement
+	if err := json.Unmarshal([]byte(fmt.Sprint(items[0])), &currentWire); err != nil {
 		return nil, err
 	}
+	current := currentWire.placement()
 	leaseVersion, err := strconv.ParseInt(fmt.Sprint(items[1]), 10, 64)
 	if err != nil {
 		return nil, err
@@ -467,23 +498,25 @@ func (d *Directory) getPlacementRaw(ctx context.Context, key sp.GrainKey) ([]byt
 	if err != nil {
 		return nil, nil, err
 	}
-	var p sp.Placement
-	if err := json.Unmarshal(raw, &p); err != nil {
+	var wire redisPlacement
+	if err := json.Unmarshal(raw, &wire); err != nil {
 		return nil, nil, err
 	}
+	p := wire.placement()
 	return raw, &p, nil
 }
 func decodePlacement(value interface{}) (*sp.Placement, error) {
 	raw := fmt.Sprint(value)
-	var p sp.Placement
-	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+	var wire redisPlacement
+	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
 		return nil, err
 	}
+	p := wire.placement()
 	return &p, nil
 }
 
 func oldNodeIdentity(_ string, raw string) string {
-	var placement sp.Placement
+	var placement redisPlacement
 	_ = json.Unmarshal([]byte(raw), &placement)
 	return placement.NodeIdentity
 }

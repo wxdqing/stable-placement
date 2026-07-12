@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -172,6 +173,202 @@ func TestExpireNodeLeasesUsesRedisTimeAndIsIdempotent(t *testing.T) {
 	}
 	if expired != 2 {
 		t.Fatalf("expired events = %d", expired)
+	}
+}
+
+func TestExpiredOfflineNodeTombstoneLifecycle(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T, retainPlacement bool) (*Directory, *goredis.Client, sp.Node, *sp.Placement) {
+		t.Helper()
+		dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
+		server.SetTime(time.Unix(450, 0))
+		node := testNode("game-1", "session-a")
+		if err := dir.RegisterNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+		var placement *sp.Placement
+		if retainPlacement {
+			var err error
+			placement, err = dir.Allocate(ctx, sp.AllocateCommand{GrainID: "retained", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		server.SetTime(time.Unix(451, 0))
+		if count, err := dir.ExpireNodeLeases(ctx, "game", "default", 1); err != nil || count != 1 {
+			t.Fatalf("ExpireNodeLeases = %d, %v", count, err)
+		}
+		stored := readNode(t, ctx, dir, node.NodeIdentity)
+		if stored.Status != sp.NodeStatusOffline || client.ZScore(ctx, NodeLeaseKey("game", "default"), NodeKey(node.NodeIdentity)).Err() != goredis.Nil {
+			t.Fatalf("expired node = %+v, lease score err = %v", stored, client.ZScore(ctx, NodeLeaseKey("game", "default"), NodeKey(node.NodeIdentity)).Err())
+		}
+		return dir, client, node, placement
+	}
+	keys := func(node sp.Node) []string {
+		return []string{NodeKey(node.NodeIdentity), NodesKey(node.NodeType, node.NodeGroup), NodeLeaseKey(node.NodeType, node.NodeGroup), PlacementNodeKey(node.NodeIdentity), EventsStreamKey(), AuditStreamKey()}
+	}
+
+	t.Run("same-session register reports expired", func(t *testing.T) {
+		dir, client, node, _ := setup(t, false)
+		before := snapshotRedisKeysV2(t, client, keys(node)...)
+		if err := dir.RegisterNode(ctx, node); !errors.Is(err, sp.ErrNodeLeaseExpired) {
+			t.Fatalf("RegisterNode err = %v", err)
+		}
+		requireRedisSnapshotV2(t, snapshotRedisKeysV2(t, client, keys(node)...), before)
+	})
+
+	t.Run("different-session register preserves session precedence", func(t *testing.T) {
+		dir, client, node, _ := setup(t, false)
+		before := snapshotRedisKeysV2(t, client, keys(node)...)
+		node.NodeSessionID = "session-b"
+		if err := dir.RegisterNode(ctx, node); !errors.Is(err, sp.ErrInvalidNodeSession) {
+			t.Fatalf("RegisterNode err = %v", err)
+		}
+		requireRedisSnapshotV2(t, snapshotRedisKeysV2(t, client, keys(node)...), before)
+	})
+
+	t.Run("renew reports offline backend error", func(t *testing.T) {
+		dir, client, node, _ := setup(t, false)
+		before := snapshotRedisKeysV2(t, client, keys(node)...)
+		if err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
+			t.Fatalf("RenewNode err = %v", err)
+		}
+		requireRedisSnapshotV2(t, snapshotRedisKeysV2(t, client, keys(node)...), before)
+	})
+
+	t.Run("drain rejects offline tombstone", func(t *testing.T) {
+		dir, client, node, _ := setup(t, false)
+		if err := dir.MarkNodeInvalid(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshotRedisKeysV2(t, client, append(keys(node), InvalidNodesKey(node.NodeType, node.NodeGroup))...)
+		if err := dir.DrainNode(ctx, node.NodeIdentity); !errors.Is(err, sp.ErrNodeNotFound) {
+			t.Fatalf("DrainNode err = %v", err)
+		}
+		requireRedisSnapshotV2(t, snapshotRedisKeysV2(t, client, append(keys(node), InvalidNodesKey(node.NodeType, node.NodeGroup))...), before)
+	})
+
+	t.Run("replace creates a new active lease", func(t *testing.T) {
+		dir, client, node, _ := setup(t, false)
+		beforeEvents := client.XLen(ctx, EventsStreamKey()).Val()
+		replacement := node
+		replacement.NodeSessionID = "session-b"
+		old, err := dir.ReplaceNodeSession(ctx, replacement)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored := readNode(t, ctx, dir, node.NodeIdentity)
+		score, scoreErr := client.ZScore(ctx, NodeLeaseKey("game", "default"), NodeKey(node.NodeIdentity)).Result()
+		if old.NodeSessionID != node.NodeSessionID || stored.NodeSessionID != replacement.NodeSessionID || stored.Status != sp.NodeStatusActive || stored.Lease.Version != 1 || scoreErr != nil || int64(score) != stored.Lease.ExpireAtUnixMilli {
+			t.Fatalf("old=%+v stored=%+v score=%v scoreErr=%v", old, stored, score, scoreErr)
+		}
+		if !client.SIsMember(ctx, NodesKey("game", "default"), NodeKey(node.NodeIdentity)).Val() || client.ZCard(ctx, PlacementNodeKey(node.NodeIdentity)).Val() != 0 || client.XLen(ctx, EventsStreamKey()).Val() != beforeEvents+1 {
+			t.Fatal("replace did not atomically preserve indexes and append one event")
+		}
+		event := client.XRevRangeN(ctx, EventsStreamKey(), "+", "-", 1).Val()[0]
+		if event.Values["type"] != string(sp.EventNodeReplaced) || event.Values["node_session_id"] != replacement.NodeSessionID {
+			t.Fatalf("replace event = %+v", event.Values)
+		}
+	})
+
+	for _, operation := range []string{"unregister", "complete drain"} {
+		t.Run(operation+" deletes empty tombstone", func(t *testing.T) {
+			dir, client, node, _ := setup(t, false)
+			beforeEvents := client.XLen(ctx, EventsStreamKey()).Val()
+			var err error
+			if operation == "unregister" {
+				err = dir.UnregisterNode(ctx, node.NodeIdentity, node.NodeSessionID)
+			} else {
+				err = dir.CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.Exists(ctx, NodeKey(node.NodeIdentity)).Val() != 0 || client.SIsMember(ctx, NodesKey("game", "default"), NodeKey(node.NodeIdentity)).Val() || client.ZCard(ctx, NodeLeaseKey("game", "default")).Val() != 0 || client.ZCard(ctx, PlacementNodeKey(node.NodeIdentity)).Val() != 0 || client.XLen(ctx, EventsStreamKey()).Val() != beforeEvents+1 {
+				t.Fatal("delete did not atomically remove node indexes and append one event")
+			}
+		})
+	}
+
+	t.Run("complete drain retains tombstone with placements", func(t *testing.T) {
+		dir, client, node, placement := setup(t, true)
+		before := snapshotRedisKeysV2(t, client, append(keys(node), PlacementKey(placement.GrainKey))...)
+		if err := dir.CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeHasPlacements) {
+			t.Fatalf("CompleteDrain err = %v", err)
+		}
+		requireRedisSnapshotV2(t, snapshotRedisKeysV2(t, client, append(keys(node), PlacementKey(placement.GrainKey))...), before)
+	})
+}
+
+func TestRedisNodeLifecycleLeaseScoreRulesAreAtomic(t *testing.T) {
+	ctx := context.Background()
+	operations := []struct {
+		name string
+		run  func(context.Context, *Directory, sp.Node) error
+	}{
+		{name: "register", run: func(ctx context.Context, dir *Directory, node sp.Node) error { return dir.RegisterNode(ctx, node) }},
+		{name: "renew", run: func(ctx context.Context, dir *Directory, node sp.Node) error {
+			return dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID)
+		}},
+		{name: "replace", run: func(ctx context.Context, dir *Directory, node sp.Node) error {
+			node.NodeSessionID = "replacement"
+			_, err := dir.ReplaceNodeSession(ctx, node)
+			return err
+		}},
+		{name: "unregister", run: func(ctx context.Context, dir *Directory, node sp.Node) error {
+			return dir.UnregisterNode(ctx, node.NodeIdentity, node.NodeSessionID)
+		}},
+		{name: "complete drain", run: func(ctx context.Context, dir *Directory, node sp.Node) error {
+			return dir.CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID)
+		}},
+		{name: "drain", run: func(ctx context.Context, dir *Directory, node sp.Node) error {
+			return dir.DrainNode(ctx, node.NodeIdentity)
+		}},
+	}
+	for _, status := range []sp.NodeStatus{sp.NodeStatusActive, sp.NodeStatusDraining, sp.NodeStatusOffline} {
+		for _, operation := range operations {
+			t.Run(string(status)+"/"+operation.name, func(t *testing.T) {
+				dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
+				server.SetTime(time.Unix(460, 0))
+				node := testNode("score-rules", "session-a")
+				if err := dir.RegisterNode(ctx, node); err != nil {
+					t.Fatal(err)
+				}
+				if status == sp.NodeStatusOffline {
+					server.SetTime(time.Unix(461, 0))
+					if count, err := dir.ExpireNodeLeases(ctx, node.NodeType, node.NodeGroup, 1); err != nil || count != 1 {
+						t.Fatalf("ExpireNodeLeases = %d, %v", count, err)
+					}
+					client.ZAdd(ctx, NodeLeaseKey(node.NodeType, node.NodeGroup), goredis.Z{Score: 1, Member: NodeKey(node.NodeIdentity)})
+				} else {
+					if status == sp.NodeStatusDraining {
+						var stored redisNode
+						if err := json.Unmarshal([]byte(client.Get(ctx, NodeKey(node.NodeIdentity)).Val()), &stored); err != nil {
+							t.Fatal(err)
+						}
+						stored.Status = status
+						raw, err := json.Marshal(stored)
+						if err != nil {
+							t.Fatal(err)
+						}
+						client.Set(ctx, NodeKey(node.NodeIdentity), raw, 0)
+					}
+					client.ZRem(ctx, NodeLeaseKey(node.NodeType, node.NodeGroup), NodeKey(node.NodeIdentity))
+				}
+				if operation.name == "drain" {
+					if err := dir.MarkNodeInvalid(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
+						t.Fatal(err)
+					}
+				}
+				keys := []string{NodeKey(node.NodeIdentity), NodesKey(node.NodeType, node.NodeGroup), NodeLeaseKey(node.NodeType, node.NodeGroup), PlacementNodeKey(node.NodeIdentity), InvalidNodesKey(node.NodeType, node.NodeGroup), EventsStreamKey(), AuditStreamKey()}
+				before := snapshotRedisKeysV2(t, client, keys...)
+				err := operation.run(ctx, dir, node)
+				if err == nil || !strings.Contains(err.Error(), "LEASE_SCORE_MISMATCH") {
+					t.Fatalf("%s %s err = %v", status, operation.name, err)
+				}
+				requireRedisSnapshotV2(t, snapshotRedisKeysV2(t, client, keys...), before)
+			})
+		}
 	}
 }
 
