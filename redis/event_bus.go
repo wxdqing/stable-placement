@@ -94,6 +94,38 @@ redis.call("XGROUP", "DESTROY", KEYS[1], ARGV[1])
 return 0
 `
 
+const closeConsumerGroupIfIdleLua = `
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return 0
+end
+local groups = redis.call("XINFO", "GROUPS", KEYS[1])
+for _, group in ipairs(groups) do
+	local name = nil
+	local pending = nil
+	local lag = nil
+	for index = 1, #group, 2 do
+		if group[index] == "name" then
+			name = group[index + 1]
+		elseif group[index] == "pending" then
+			pending = group[index + 1]
+		elseif group[index] == "lag" then
+			lag = group[index + 1]
+		end
+	end
+	if name == ARGV[1] then
+		if type(pending) ~= "number" or pending ~= 0 then
+			return 1
+		end
+		if type(lag) ~= "number" or lag ~= 0 then
+			return 1
+		end
+		redis.call("XGROUP", "DESTROY", KEYS[1], ARGV[1])
+		return 0
+	end
+end
+return 0
+`
+
 func NewEventBus(client goredis.UniversalClient, consumer StreamConsumer) *EventBus {
 	return &EventBus{
 		client:   client,
@@ -187,6 +219,24 @@ func (b *EventBus) DeleteConsumerGroup(ctx context.Context) error {
 	return err
 }
 
+func (b *EventBus) CloseConsumerGroupIfIdle(ctx context.Context) error {
+	if !validStreamConsumer(b.consumer) {
+		b.setDegraded()
+		return ErrSharedConsumerGroup
+	}
+	result, err := b.client.Eval(ctx, closeConsumerGroupIfIdleLua, []string{b.stream}, b.consumer.Group).Int64()
+	if err != nil {
+		return err
+	}
+	if result == 1 {
+		return ErrPendingMessages
+	}
+	if result != 0 {
+		return errors.New("redis consumer close returned an invalid result")
+	}
+	return nil
+}
+
 // CleanupConsumerGroup removes a previously valid node-session consumer group.
 func (b *EventBus) CleanupConsumerGroup(ctx context.Context, consumer StreamConsumer) error {
 	if !validStreamConsumer(consumer) {
@@ -226,9 +276,9 @@ func (b *EventBus) ReplaceConsumer(ctx context.Context, old StreamConsumer) erro
 	return nil
 }
 
-// Close removes this bus's session-specific consumer group.
+// Close removes this bus's session-specific consumer group only when it is idle.
 func (b *EventBus) Close(ctx context.Context) error {
-	err := b.DeleteConsumerGroup(ctx)
+	err := b.CloseConsumerGroupIfIdle(ctx)
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		b.setDegraded()
 	}
