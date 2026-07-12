@@ -149,11 +149,26 @@ return placement_raw
 `
 
 const renewLua = `
-local node = redis.call("GET", KEYS[4])
-if not node then
+local function expect_type(key, expected, label)
+	local actual = redis.call("TYPE", key)
+	if type(actual) == "table" then actual = actual["ok"] end
+	if actual ~= "none" and actual ~= expected then
+		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
+	end
+	return nil
+end
+local type_error = expect_type(KEYS[1], "string", "placement")
+	or expect_type(KEYS[2], "zset", "lease_expire")
+	or expect_type(KEYS[3], "stream", "audit")
+	or expect_type(KEYS[4], "string", "node")
+if type_error then return type_error end
+
+local node_raw = redis.call("GET", KEYS[4])
+if not node_raw then
 	return "invalid_node_session"
 end
-if not string.find(node, '"NodeSessionID":"' .. ARGV[9] .. '"', 1, true) then
+local node = cjson.decode(node_raw)
+if node["NodeSessionID"] ~= ARGV[9] then
 	return "invalid_node_session"
 end
 
@@ -197,6 +212,15 @@ return updated
 `
 
 const mutationLua = `
+local function expect_type(key, expected, label)
+	local actual = redis.call("TYPE", key)
+	if type(actual) == "table" then actual = actual["ok"] end
+	if actual ~= "none" and actual ~= expected then
+		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
+	end
+	return nil
+end
+
 local function validate_sequence_counter(key)
 	local raw = redis.call("GET", key)
 	if not raw then return nil end
@@ -213,12 +237,28 @@ local function validate_sequence_counter(key)
 	return nil
 end
 
+local type_error = expect_type(KEYS[1], "string", "placement")
+	or expect_type(KEYS[6], "stream", "events")
+if not type_error and ARGV[3] == "1" then type_error = expect_type(KEYS[2], "zset", "old_node_index") end
+if not type_error and ARGV[4] == "1" then
+	type_error = expect_type(KEYS[3], "zset", "new_node_index")
+		or expect_type(KEYS[5], "string", "sequence")
+end
+if not type_error and (ARGV[5] == "remove" or ARGV[5] == "add") then type_error = expect_type(KEYS[4], "zset", "lease_expire") end
+if not type_error and ARGV[12] == "1" then type_error = expect_type(KEYS[7], "string", "node") end
+if not type_error and ARGV[14] == "1" then
+	type_error = expect_type(KEYS[8], "string", "target_node")
+		or expect_type(KEYS[9], "set", "invalid_nodes")
+end
+if type_error then return type_error end
+
 if ARGV[12] == "1" then
-	local node = redis.call("GET", KEYS[7])
-	if not node then
+	local node_raw = redis.call("GET", KEYS[7])
+	if not node_raw then
 		return "invalid_node_session"
 	end
-	if not string.find(node, '"NodeSessionID":"' .. ARGV[13] .. '"', 1, true) then
+	local node = cjson.decode(node_raw)
+	if node["NodeSessionID"] ~= ARGV[13] then
 		return "invalid_node_session"
 	end
 end
@@ -469,7 +509,7 @@ if not raw then
 end
 if raw ~= ARGV[4] then return 0 end
 local node = cjson.decode(raw)
-if node["Status"] ~= "active" or node["NodeType"] ~= ARGV[6] or node["NodeGroup"] ~= ARGV[7] then
+if (node["Status"] ~= "active" and node["Status"] ~= "draining") or node["NodeType"] ~= ARGV[6] or node["NodeGroup"] ~= ARGV[7] then
 	redis.call("ZREM", KEYS[2], ARGV[1])
 	return 0
 end

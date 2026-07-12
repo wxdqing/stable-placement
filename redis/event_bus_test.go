@@ -29,9 +29,10 @@ type xAckErrorClient struct {
 
 type consumerLifecycleErrorClient struct {
 	goredis.UniversalClient
-	pendingErr error
-	destroyErr error
-	ensureErr  error
+	pendingErr    error
+	pendingExtErr error
+	destroyErr    error
+	ensureErr     error
 }
 
 type consumerReplaceRaceClient struct {
@@ -70,6 +71,15 @@ func (c consumerLifecycleErrorClient) XPending(ctx context.Context, stream, grou
 	}
 	cmd := goredis.NewXPendingCmd(ctx, "xpending", stream, group)
 	cmd.SetErr(c.pendingErr)
+	return cmd
+}
+
+func (c consumerLifecycleErrorClient) XPendingExt(ctx context.Context, args *goredis.XPendingExtArgs) *goredis.XPendingExtCmd {
+	if c.pendingExtErr == nil {
+		return c.UniversalClient.XPendingExt(ctx, args)
+	}
+	cmd := goredis.NewXPendingExtCmd(ctx, "xpending", args.Stream, args.Group)
+	cmd.SetErr(c.pendingExtErr)
 	return cmd
 }
 
@@ -1111,6 +1121,26 @@ func TestRedisEventBusPendingTimeoutEntersDegraded(t *testing.T) {
 	}
 	if !checkBus.IsDegraded() {
 		t.Fatal("bus did not enter degraded mode")
+	}
+}
+
+func TestRedisEventBusCheckPendingCancellationDoesNotDegrade(t *testing.T) {
+	for _, checkErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(checkErr.Error(), func(t *testing.T) {
+			server := miniredis.RunT(t)
+			base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+			consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			bus := NewEventBus(consumerLifecycleErrorClient{UniversalClient: base, pendingExtErr: checkErr}, consumer)
+			if err := bus.CheckPending(context.Background(), time.Second); !errors.Is(err, checkErr) {
+				t.Fatalf("CheckPending error = %v, want %v", err, checkErr)
+			}
+			if bus.IsDegraded() {
+				t.Fatal("CheckPending cancellation degraded bus")
+			}
+		})
 	}
 }
 

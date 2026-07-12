@@ -63,6 +63,68 @@ func TestDirectoryLookupRejectsExpiredLease(t *testing.T) {
 	}
 }
 
+func TestDirectoryAllocateReplacesExpiredActivePlacement(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := newTestDirectory(t)
+	node1 := registerTestNode(t, dir, "game-1", "session-a")
+	node2 := registerTestNode(t, dir, "game-2", "session-b")
+
+	first, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID: "expired-active", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default",
+		LeaseTTL: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("first Allocate error: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if exists, err := dir.Exists(ctx, first.GrainKey); err != nil || exists {
+		t.Fatalf("Exists expired active = (%v, %v), want (false, nil)", exists, err)
+	}
+
+	second, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID: first.GrainID, Kind: first.Kind, TargetNodeType: "game", TargetNodeGroup: "default",
+		LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("second Allocate error: %v", err)
+	}
+	if second.Version <= first.Version {
+		t.Fatalf("replacement version = %d, want > %d", second.Version, first.Version)
+	}
+	if second.NodeIdentity != node2.NodeIdentity {
+		t.Fatalf("replacement node = %q, want %q", second.NodeIdentity, node2.NodeIdentity)
+	}
+	page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: node1.NodeIdentity})
+	if err != nil {
+		t.Fatalf("FindByNode old owner error: %v", err)
+	}
+	if len(page.Placements) != 0 {
+		t.Fatalf("old owner placements = %+v, want none", page.Placements)
+	}
+}
+
+func TestDirectoryRenewAndReleaseAcceptEscapedNodeSessionID(t *testing.T) {
+	for _, operation := range []string{"renew", "release"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			dir, _ := newTestDirectory(t)
+			node := registerTestNode(t, dir, "game-1", `session\"with\\escapes`)
+			placement, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: operation, Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default", LeaseTTL: time.Minute})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if operation == "renew" {
+				_, err = dir.Renew(ctx, sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version, LeaseVersion: placement.Lease.Version, ExtendTTL: time.Minute})
+			} else {
+				err = dir.Release(ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version, LeaseVersion: placement.Lease.Version})
+			}
+			if err != nil {
+				t.Fatalf("%s error: %v", operation, err)
+			}
+		})
+	}
+}
+
 func TestDirectoryAllocateLookupRenewTransferRelease(t *testing.T) {
 	ctx := context.Background()
 	dir, _ := newTestDirectory(t)

@@ -246,7 +246,9 @@ func (b *EventBus) CheckPending(ctx context.Context, threshold time.Duration) er
 		Count:  1,
 	}).Result()
 	if err != nil {
-		b.setDegraded()
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			b.setDegraded()
+		}
 		return err
 	}
 	if len(pending) > 0 {

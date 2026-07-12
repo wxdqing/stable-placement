@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -106,6 +109,55 @@ func newTestDirectory(t *testing.T) (*Directory, *goredis.Client) {
 		t.Fatal(err)
 	}
 	return dir, client
+}
+
+func snapshotRedisKeys(t *testing.T, client *goredis.Client, keys ...string) map[string]string {
+	t.Helper()
+	ctx := context.Background()
+	result := make(map[string]string, len(keys))
+	for _, key := range keys {
+		typ, err := client.Type(ctx, key).Result()
+		if err != nil {
+			t.Fatalf("TYPE %s: %v", key, err)
+		}
+		var value any
+		switch typ {
+		case "none":
+			value = nil
+		case "string":
+			value, err = client.Get(ctx, key).Result()
+		case "set":
+			var members []string
+			members, err = client.SMembers(ctx, key).Result()
+			sort.Strings(members)
+			value = members
+		case "zset":
+			value, err = client.ZRangeWithScores(ctx, key, 0, -1).Result()
+		case "stream":
+			value, err = client.XRange(ctx, key, "-", "+").Result()
+		default:
+			t.Fatalf("unsupported redis type %q for %s", typ, key)
+		}
+		if err != nil {
+			t.Fatalf("snapshot %s: %v", key, err)
+		}
+		raw, err := json.Marshal(struct {
+			Type  string
+			Value any
+		}{typ, value})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result[key] = string(raw)
+	}
+	return result
+}
+
+func assertRedisSnapshotEqual(t *testing.T, got, want map[string]string) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("redis state changed after rejected mutation:\n got: %#v\nwant: %#v", got, want)
+	}
 }
 
 func addIndexedPlacement(t *testing.T, client *goredis.Client, nodeIdentity, grainID string, score float64, status sp.PlacementStatus) sp.GrainKey {
@@ -1234,6 +1286,217 @@ func TestRedisDirectoryAllocateLuaRejectsAllInvalidCandidates(t *testing.T) {
 	key, _ := sp.NewGrainKey("Player", "10001")
 	if _, err := dir.Lookup(ctx, key); !errors.Is(err, sp.ErrPlacementNotFound) {
 		t.Fatalf("Lookup after rejected allocate err = %v", err)
+	}
+}
+
+func TestRedisDirectoryRenewAndReleaseAcceptEscapedNodeSessionID(t *testing.T) {
+	for _, operation := range []string{"renew", "release"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			dir, _ := newTestDirectory(t)
+			node := registerTestNode(t, dir, "game-1", `session\"with\\escapes`)
+			placement, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: operation, Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default", LeaseTTL: time.Minute})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if operation == "renew" {
+				_, err = dir.Renew(ctx, sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version, LeaseVersion: placement.Lease.Version, ExtendTTL: time.Minute})
+			} else {
+				err = dir.Release(ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version, LeaseVersion: placement.Lease.Version})
+			}
+			if err != nil {
+				t.Fatalf("%s error: %v", operation, err)
+			}
+		})
+	}
+}
+
+func TestRedisDirectoryRenewWrongTypeIsAtomic(t *testing.T) {
+	for _, corrupted := range []string{"lease", "audit"} {
+		t.Run(corrupted, func(t *testing.T) {
+			ctx := context.Background()
+			dir, client := newTestDirectory(t)
+			node := registerTestNode(t, dir, "game-1", "session-a")
+			placement, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "renew-" + corrupted, Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default", LeaseTTL: time.Minute})
+			if err != nil {
+				t.Fatal(err)
+			}
+			corruptKey := LeaseExpireKey()
+			if corrupted == "audit" {
+				corruptKey = AuditStreamKey()
+			}
+			if err := client.Del(ctx, corruptKey).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Set(ctx, corruptKey, "wrong-type", 0).Err(); err != nil {
+				t.Fatal(err)
+			}
+			keys := []string{PlacementKey(placement.GrainKey), LeaseExpireKey(), AuditStreamKey(), NodeKey(node.NodeIdentity), EventsStreamKey()}
+			before := snapshotRedisKeys(t, client, keys...)
+			_, err = dir.Renew(ctx, sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version, LeaseVersion: placement.Lease.Version, ExtendTTL: time.Minute})
+			if err == nil || !strings.Contains(err.Error(), "WRONGTYPE") {
+				t.Fatalf("Renew error = %v, want WRONGTYPE", err)
+			}
+			after := snapshotRedisKeys(t, client, keys...)
+			assertRedisSnapshotEqual(t, after, before)
+		})
+	}
+}
+
+func TestRedisDirectoryMutationWrongTypeIsAtomic(t *testing.T) {
+	for _, operation := range []string{"release", "expire", "transfer", "recover"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			dir, client := newTestDirectory(t)
+			node1 := registerTestNode(t, dir, "game-1", "session-a")
+			node2 := registerTestNode(t, dir, "game-2", "session-b")
+			placement, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "atomic-" + operation, Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default", LeaseTTL: time.Minute})
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := placement
+			if operation == "recover" {
+				if err := dir.Expire(ctx, sp.ExpireCommand{GrainKey: placement.GrainKey, LeaseVersion: placement.Lease.Version, Now: placement.LeaseExpireAt.Add(time.Millisecond)}); err != nil {
+					t.Fatal(err)
+				}
+				current, err = dir.getPlacement(ctx, placement.GrainKey)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			corruptKey := EventsStreamKey()
+			switch operation {
+			case "expire":
+				corruptKey = LeaseExpireKey()
+			case "transfer", "recover":
+				corruptKey = PlacementNodeKey(node2.NodeIdentity)
+			}
+			if err := client.Del(ctx, corruptKey).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Set(ctx, corruptKey, "wrong-type", 0).Err(); err != nil {
+				t.Fatal(err)
+			}
+			keys := []string{PlacementKey(placement.GrainKey), PlacementNodeKey(node1.NodeIdentity), PlacementNodeKey(node2.NodeIdentity), LeaseExpireKey(), SequenceKey(), EventsStreamKey()}
+			before := snapshotRedisKeys(t, client, keys...)
+			switch operation {
+			case "release":
+				err = dir.Release(ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: node1.NodeIdentity, NodeSessionID: node1.NodeSessionID, PlacementVersion: placement.Version, LeaseVersion: placement.Lease.Version})
+			case "expire":
+				err = dir.Expire(ctx, sp.ExpireCommand{GrainKey: placement.GrainKey, LeaseVersion: placement.Lease.Version, Now: placement.LeaseExpireAt.Add(time.Millisecond)})
+			case "transfer":
+				_, err = dir.Transfer(ctx, sp.TransferCommand{GrainKey: placement.GrainKey, FromNodeIdentity: node1.NodeIdentity, ToNodeIdentity: node2.NodeIdentity, PlacementVersion: placement.Version, LeaseTTL: time.Minute})
+			case "recover":
+				_, err = dir.Recover(ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, NewNodeIdentity: node2.NodeIdentity, PlacementVersion: current.Version, LeaseTTL: time.Minute})
+			}
+			if err == nil || !strings.Contains(err.Error(), "WRONGTYPE") {
+				t.Fatalf("%s error = %v, want WRONGTYPE", operation, err)
+			}
+			after := snapshotRedisKeys(t, client, keys...)
+			assertRedisSnapshotEqual(t, after, before)
+		})
+	}
+}
+
+func TestRedisDirectoryRealRedisLuaWrongTypeIsAtomic(t *testing.T) {
+	addr := os.Getenv("STABLE_PLACEMENT_REAL_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("STABLE_PLACEMENT_REAL_REDIS_ADDR is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := goredis.NewClient(&goredis.Options{Addr: addr, Password: os.Getenv("STABLE_PLACEMENT_REAL_REDIS_PASSWORD")})
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("real Redis Ping error: %v", err)
+	}
+	tag := fmt.Sprintf("{final-review-%d}", time.Now().UnixNano())
+	key := func(name string) string { return "sp:" + tag + ":" + name }
+
+	t.Run("renew audit", func(t *testing.T) {
+		keys := []string{key("renew-placement"), key("renew-lease"), key("renew-audit"), key("renew-node")}
+		t.Cleanup(func() { _ = client.Del(context.Background(), keys...).Err() })
+		nodeRaw, err := json.Marshal(map[string]string{"NodeSessionID": `session\"with\\escapes`})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Set(ctx, keys[0], "old", 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.ZAdd(ctx, keys[1], goredis.Z{Score: 1, Member: "grain"}).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Set(ctx, keys[2], "wrong-type", 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Set(ctx, keys[3], nodeRaw, 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshotRedisKeys(t, client, keys...)
+		err = client.Eval(ctx, renewLua, keys, "old", "new", "2", "grain", string(sp.EventPlacementRenewed), "node", "1", "2", `session\"with\\escapes`).Err()
+		if err == nil || !strings.Contains(err.Error(), "WRONGTYPE") {
+			t.Fatalf("renew Eval error = %v, want WRONGTYPE", err)
+		}
+		assertRedisSnapshotEqual(t, snapshotRedisKeys(t, client, keys...), before)
+	})
+
+	t.Run("mutation new index", func(t *testing.T) {
+		keys := []string{key("mutation-placement"), key("mutation-old-index"), key("mutation-new-index"), key("mutation-lease"), key("mutation-sequence"), key("mutation-events"), key("mutation-node"), key("mutation-target"), key("mutation-invalid")}
+		t.Cleanup(func() { _ = client.Del(context.Background(), keys...).Err() })
+		placementRaw := `{"GrainID":"1","Kind":"Player","GrainKey":"Player/1","NodeIdentity":"old","Version":1,"Status":"active","Lease":{"OwnerNodeIdentity":"old","OwnerNodeSessionID":"old","Version":1}}`
+		targetRaw := `{"NodeType":"game","NodeGroup":"default","NodeName":"target","NodeIdentity":"new","NodeSessionID":"new-session","Status":"active"}`
+		if err := client.Set(ctx, keys[0], placementRaw, 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.ZAdd(ctx, keys[1], goredis.Z{Score: 1, Member: "Player/1"}).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Set(ctx, keys[2], "wrong-type", 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.ZAdd(ctx, keys[3], goredis.Z{Score: 1, Member: "Player/1"}).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Set(ctx, keys[4], "1", 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Set(ctx, keys[7], targetRaw, 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshotRedisKeys(t, client, keys...)
+		err := client.Eval(ctx, mutationLua, keys, placementRaw, placementRaw, "1", "1", "add", "Player/1", "2", string(sp.EventPlacementTransferred), "new", "2", "1", "0", "", "1", "game", "default", "target").Err()
+		if err == nil || !strings.Contains(err.Error(), "WRONGTYPE") {
+			t.Fatalf("mutation Eval error = %v, want WRONGTYPE", err)
+		}
+		assertRedisSnapshotEqual(t, snapshotRedisKeys(t, client, keys...), before)
+	})
+}
+
+func TestRedisDirectoryMissingTransferAndRecoverTargetIsNoAvailableNode(t *testing.T) {
+	for _, operation := range []string{"transfer", "recover"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			dir, _ := newTestDirectory(t)
+			node := registerTestNode(t, dir, "game-1", "session-a")
+			placement, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: operation + "-missing", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default", LeaseTTL: time.Minute})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if operation == "transfer" {
+				_, err = dir.Transfer(ctx, sp.TransferCommand{GrainKey: placement.GrainKey, FromNodeIdentity: node.NodeIdentity, ToNodeIdentity: "game/default/missing", PlacementVersion: placement.Version})
+			} else {
+				if err = dir.Expire(ctx, sp.ExpireCommand{GrainKey: placement.GrainKey, LeaseVersion: placement.Lease.Version, Now: placement.LeaseExpireAt.Add(time.Millisecond)}); err != nil {
+					t.Fatal(err)
+				}
+				expired, getErr := dir.getPlacement(ctx, placement.GrainKey)
+				if getErr != nil {
+					t.Fatal(getErr)
+				}
+				_, err = dir.Recover(ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, NewNodeIdentity: "game/default/missing", PlacementVersion: expired.Version})
+			}
+			if !errors.Is(err, sp.ErrNoAvailableNode) {
+				t.Fatalf("%s error = %v, want ErrNoAvailableNode", operation, err)
+			}
+		})
 	}
 }
 

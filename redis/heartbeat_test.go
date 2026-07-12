@@ -124,6 +124,50 @@ func TestRedisDirectoryExpireHeartbeatsWritesOfflineEventOnce(t *testing.T) {
 	}
 }
 
+func TestRedisDirectoryExpireHeartbeatsMarksDrainingOfflineOnce(t *testing.T) {
+	ctx := context.Background()
+	dir, client := newTestDirectory(t)
+	dir.SetHeartbeatTTL(time.Second)
+	staleAt := time.Now().Add(-time.Minute)
+	node := registerHeartbeatTestNode(t, dir, "game-1", "session-a", staleAt)
+	if err := dir.MarkNodeInvalid(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
+		t.Fatalf("MarkNodeInvalid error: %v", err)
+	}
+	if err := dir.DrainNode(ctx, node.NodeIdentity); err != nil {
+		t.Fatalf("DrainNode error: %v", err)
+	}
+	heartbeatKey := NodeHeartbeatKey(node.NodeType, node.NodeGroup)
+	for scan := 0; scan < 2; scan++ {
+		count, err := dir.ExpireHeartbeats(ctx, node.NodeType, node.NodeGroup, staleAt.Add(2*time.Second), 10)
+		if err != nil {
+			t.Fatalf("scan %d error: %v", scan, err)
+		}
+		if want := 1 - scan; count != want {
+			t.Fatalf("scan %d count = %d, want %d", scan, count, want)
+		}
+	}
+	stored, err := dir.getNode(ctx, node.NodeIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != sp.NodeStatusOffline {
+		t.Fatalf("status = %s, want offline", stored.Status)
+	}
+	if _, err := client.ZScore(ctx, heartbeatKey, NodeKey(node.NodeIdentity)).Result(); !errors.Is(err, goredis.Nil) {
+		t.Fatalf("heartbeat remains: %v", err)
+	}
+	events := client.XRange(ctx, EventsStreamKey(), "-", "+").Val()
+	count := 0
+	for _, event := range events {
+		if event.Values["type"] == string(sp.EventNodeUnregistered) {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("NodeUnregistered events = %d, want 1", count)
+	}
+}
+
 func TestRedisDirectoryExpireHeartbeatsPaginatesEqualScoresPastStaleMembers(t *testing.T) {
 	ctx := context.Background()
 	dir, base := newTestDirectory(t)
@@ -149,8 +193,8 @@ func TestRedisDirectoryExpireHeartbeatsPaginatesEqualScoresPastStaleMembers(t *t
 		}
 	}
 	writeNode(members[0], sp.Node{
-		NodeType: "game", NodeGroup: "default", NodeName: "draining",
-		NodeIdentity: "game/default/draining", NodeSessionID: "session-a", Status: sp.NodeStatusDraining,
+		NodeType: "game", NodeGroup: "default", NodeName: "offline",
+		NodeIdentity: "game/default/offline", NodeSessionID: "session-a", Status: sp.NodeStatusOffline,
 	})
 	// members[1] intentionally has no raw node.
 	writeNode(members[2], sp.Node{

@@ -577,6 +577,9 @@ func (d *Directory) effectiveNodes(ctx context.Context, nodeType string, nodeGro
 
 func (d *Directory) effectiveNode(ctx context.Context, nodeIdentity string) (*sp.Node, error) {
 	node, err := d.getNode(ctx, nodeIdentity)
+	if errors.Is(err, sp.ErrNodeNotFound) {
+		return nil, sp.ErrNoAvailableNode
+	}
 	if err != nil {
 		return nil, err
 	}

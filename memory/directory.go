@@ -64,7 +64,8 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 	}
 
 	d.mu.RLock()
-	if placement, ok := d.placements[key]; ok && placement.Status == sp.PlacementStatusActive {
+	if placement, ok := d.placements[key]; ok && placement.Status == sp.PlacementStatusActive &&
+		(placement.LeaseExpireAt.IsZero() || time.Now().Before(placement.LeaseExpireAt)) {
 		d.mu.RUnlock()
 		return copyPlacement(placement), nil
 	}
@@ -112,14 +113,20 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 	}
 
 	d.mu.Lock()
+	oldNodeIdentity := ""
 	if existing, ok := d.placements[key]; ok {
-		if existing.Status == sp.PlacementStatusActive {
+		if existing.Status == sp.PlacementStatusActive &&
+			(existing.LeaseExpireAt.IsZero() || time.Now().Before(existing.LeaseExpireAt)) {
 			d.mu.Unlock()
 			return copyPlacement(existing), nil
 		}
 		placement.Version = existing.Version + 1
+		oldNodeIdentity = existing.NodeIdentity
 	}
 	if !d.registry.commitIfNodeAvailable(chosen, func() {
+		if oldNodeIdentity != "" {
+			d.deleteNodeIndexLocked(oldNodeIdentity, key)
+		}
 		d.placements[key] = placement
 		d.addNodeIndexLocked(chosen.NodeIdentity, key)
 	}) {
@@ -319,7 +326,8 @@ func (d *Directory) Exists(_ context.Context, key sp.GrainKey) (bool, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	placement, ok := d.placements[key]
-	return ok && placement.Status == sp.PlacementStatusActive, nil
+	return ok && placement.Status == sp.PlacementStatusActive &&
+		(placement.LeaseExpireAt.IsZero() || time.Now().Before(placement.LeaseExpireAt)), nil
 }
 
 func (d *Directory) FindByNode(_ context.Context, query sp.FindByNodeQuery) (sp.PlacementPage, error) {
