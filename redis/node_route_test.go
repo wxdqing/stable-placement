@@ -110,6 +110,38 @@ func TestRedisDirectoryAllocateLookupRenewAndReleaseRoute(t *testing.T) {
 	}
 }
 
+func TestRedisDirectoryRecoverReleasedReturnsNotRecoverableV2(t *testing.T) {
+	ctx := context.Background()
+	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
+	server.SetTime(time.Unix(550, 0))
+	a, b := testNode("game-1", "session-a"), testNode("game-2", "session-b")
+	for _, node := range []sp.Node{a, b} {
+		if err := dir.RegisterNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+	}
+	placement, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "released", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version}); err != nil {
+		t.Fatal(err)
+	}
+	target := a
+	if placement.NodeIdentity == a.NodeIdentity {
+		target = b
+	}
+	released := *placement
+	released.Version++
+	want := captureRouteMutationSnapshot(t, ctx, client, released, a.NodeIdentity, b.NodeIdentity)
+
+	_, err = dir.Recover(ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: released.Version})
+	if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
+		t.Fatalf("Recover released placement err = %v, want ErrPlacementNotRecoverable", err)
+	}
+	requireRouteMutationSnapshot(t, ctx, client, released, want, a.NodeIdentity, b.NodeIdentity)
+}
+
 type delayedEvalClient struct {
 	goredis.UniversalClient
 	delay time.Duration
