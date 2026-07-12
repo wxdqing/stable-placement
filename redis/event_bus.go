@@ -545,14 +545,15 @@ func validStreamConsumer(consumer StreamConsumer) bool {
 
 func eventValues(event sp.PlacementEvent) map[string]any {
 	return map[string]any{
-		"type":              string(event.Type),
-		"grain_key":         event.GrainKey.String(),
-		"node_identity":     event.NodeIdentity,
-		"node_type":         event.NodeType,
-		"node_group":        event.NodeGroup,
-		"node_name":         event.NodeName,
-		"placement_version": event.PlacementVersion,
-		"lease_version":     event.LeaseVersion,
+		"type":               string(event.Type),
+		"grain_key":          event.GrainKey.String(),
+		"node_identity":      event.NodeIdentity,
+		"node_session_id":    event.NodeSessionID,
+		"node_type":          event.NodeType,
+		"node_group":         event.NodeGroup,
+		"node_name":          event.NodeName,
+		"placement_version":  event.PlacementVersion,
+		"node_lease_version": event.NodeLeaseVersion,
 	}
 }
 
@@ -562,16 +563,20 @@ func parseEvent(values map[string]any) (sp.PlacementEvent, error) {
 		return sp.PlacementEvent{}, errors.New("redis stream event missing type")
 	}
 	event := sp.PlacementEvent{
-		Type:         sp.EventType(eventType),
-		GrainKey:     sp.GrainKey(stringValue(values["grain_key"])),
-		NodeIdentity: stringValue(values["node_identity"]),
-		NodeType:     stringValue(values["node_type"]),
-		NodeGroup:    stringValue(values["node_group"]),
-		NodeName:     stringValue(values["node_name"]),
-		Time:         time.Now(),
+		Type:          sp.EventType(eventType),
+		GrainKey:      sp.GrainKey(stringValue(values["grain_key"])),
+		NodeIdentity:  stringValue(values["node_identity"]),
+		NodeSessionID: stringValue(values["node_session_id"]),
+		NodeType:      stringValue(values["node_type"]),
+		NodeGroup:     stringValue(values["node_group"]),
+		NodeName:      stringValue(values["node_name"]),
+		Time:          time.Now(),
 	}
 	event.PlacementVersion, _ = strconv.ParseInt(stringValue(values["placement_version"]), 10, 64)
-	event.LeaseVersion, _ = strconv.ParseInt(stringValue(values["lease_version"]), 10, 64)
+	event.NodeLeaseVersion, _ = strconv.ParseInt(stringValue(values["node_lease_version"]), 10, 64)
+	if event.Type == sp.EventNodeLeaseExpired && (event.NodeIdentity == "" || event.NodeSessionID == "" || event.NodeLeaseVersion <= 0) {
+		return sp.PlacementEvent{}, errors.New("redis stream node lease event missing identity, session, or version")
+	}
 	return event, nil
 }
 
@@ -581,6 +586,10 @@ func stringValue(value any) string {
 		return v
 	case []byte:
 		return string(v)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
 	default:
 		return ""
 	}

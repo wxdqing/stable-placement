@@ -1,530 +1,176 @@
 package redis
 
-const (
-	ScriptAllocate = "allocate"
-	ScriptRenew    = "renew"
-	ScriptRelease  = "release"
-	ScriptTransfer = "transfer"
-	ScriptRecover  = "recover"
-	ScriptExpire   = "expire"
-	ScriptDrain    = "drain"
-)
-
-const allocateLua = `
+const luaHelpers = `
 local function expect_type(key, expected, label)
-	local actual = redis.call("TYPE", key)
-	if type(actual) == "table" then
-		actual = actual["ok"]
-	end
-	if actual ~= "none" and actual ~= expected then
-		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
-	end
-	return nil
+  local actual = redis.call("TYPE", key)
+  if type(actual) == "table" then actual = actual["ok"] end
+  if actual ~= "none" and actual ~= expected then return redis.error_reply("WRONGTYPE " .. label) end
+  return nil
 end
-
+local function decode(raw, label)
+  if not raw then return nil, nil end
+  local ok, value = pcall(cjson.decode, raw)
+  if not ok or type(value) ~= "table" then return nil, redis.error_reply("INVALID_JSON " .. label) end
+  return value, nil
+end
+local function now_millis()
+  local t = redis.call("TIME")
+  return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+end
 local function read_counter(key, label, maximum)
-	local raw = redis.call("GET", key)
-	if not raw then
-		return "0", nil
-	end
-	if not string.match(raw, "^%d+$") then
-		return nil, redis.error_reply("INVALID_COUNTER " .. label .. " must be a non-negative decimal")
-	end
-	if #raw > 1 and string.sub(raw, 1, 1) == "0" then
-		return nil, redis.error_reply("INVALID_COUNTER " .. label .. " must not contain leading zeros")
-	end
-	if #raw > #maximum or (#raw == #maximum and raw >= maximum) then
-		return nil, redis.error_reply("INVALID_COUNTER " .. label .. " must be less than " .. maximum)
-	end
-	return raw, nil
+  local raw=redis.call("GET",key)
+  if not raw then return "0",nil end
+  if not string.match(raw,"^%d+$") or (#raw>1 and string.sub(raw,1,1)=="0") or #raw>#maximum or (#raw==#maximum and raw>=maximum) then return nil,redis.error_reply("INVALID_COUNTER "..label) end
+  return raw,nil
 end
-
-local function decimal_mod(value, divisor)
-	local remainder = 0
-	for index = 1, #value do
-		remainder = (remainder * 10 + tonumber(string.sub(value, index, index))) % divisor
-	end
-	return remainder
+local function decimal_mod(value,divisor)
+  local remainder=0
+  for index=1,#value do remainder=(remainder*10+tonumber(string.sub(value,index,index)))%divisor end
+  return remainder
 end
-
-local type_error = expect_type(KEYS[1], "string", "placement")
-	or expect_type(KEYS[2], "set", "nodes")
-	or expect_type(KEYS[3], "set", "invalid_nodes")
-	or expect_type(KEYS[4], "string", "round_robin")
-	or expect_type(KEYS[5], "zset", "lease_expire")
-	or expect_type(KEYS[6], "string", "sequence")
-	or expect_type(KEYS[7], "stream", "events")
-	or expect_type(KEYS[8], "zset", "old_node_index")
-if type_error then
-	return type_error
+local function event(stream, kind, grain, node, session, placement_version, lease_version)
+  redis.call("XADD", stream, "*", "type", kind, "grain_key", grain or "", "node_identity", node or "", "node_session_id", session or "", "node_type", "", "node_group", "", "node_name", "", "placement_version", placement_version or "0", "node_lease_version", lease_version or "0")
 end
+local function node_event(stream, kind, node, session, node_type, node_group, node_name, lease_version)
+  redis.call("XADD", stream, "*", "type", kind, "grain_key", "", "node_identity", node or "", "node_session_id", session or "", "node_type", node_type or "", "node_group", node_group or "", "node_name", node_name or "", "placement_version", "0", "node_lease_version", lease_version or "0")
+end
+`
 
-local existing = redis.call("GET", KEYS[1])
-local next_version = 1
-local remove_old_node = false
+const registerNodeLua = luaHelpers + `
+local e = expect_type(KEYS[1],"string","node") or expect_type(KEYS[2],"set","nodes") or expect_type(KEYS[3],"zset","leases") or expect_type(KEYS[4],"stream","events")
+if e then return e end
+local incoming, de = decode(ARGV[1],"incoming_node"); if de then return de end
+local raw = redis.call("GET",KEYS[1]); local existing, olde = decode(raw,"node"); if olde then return olde end
+local now = now_millis()
 if existing then
-	local existing_placement = cjson.decode(existing)
-	if existing_placement["Status"] == "active" then
-		if ARGV[9] ~= "" and existing ~= ARGV[9] then
-			return "conflict"
-		end
-		local expire_at = redis.call("ZSCORE", KEYS[5], ARGV[3])
-		if not expire_at or tonumber(expire_at) > tonumber(ARGV[8]) then
-			return existing
-		end
-		if existing ~= ARGV[9] then
-			return "conflict"
-		end
-		remove_old_node = true
-	elseif existing ~= ARGV[9] then
-		return "conflict"
-	end
-	next_version = tonumber(existing_placement["Version"] or 0) + 1
-elseif ARGV[9] ~= "" then
-	return "conflict"
+  if existing["NodeKey"]~=ARGV[3] or existing["NodeIdentity"]~=incoming["NodeIdentity"] or existing["NodeType"]~=incoming["NodeType"] or existing["NodeGroup"]~=incoming["NodeGroup"] or existing["NodeName"]~=incoming["NodeName"] then return redis.error_reply("IDENTITY_MISMATCH") end
+  local score=redis.call("ZSCORE",KEYS[3],ARGV[3]);if not score or tonumber(score)~=tonumber(existing["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end
+  if existing["NodeSessionID"] ~= incoming["NodeSessionID"] then return "invalid_node_session" end
+  if existing["Status"] == "offline" or tonumber(existing["Lease"]["ExpireAtUnixMilli"] or 0) <= now then return "node_lease_expired" end
+  return "ok"
 end
-
-local candidate_keys = redis.call("SMEMBERS", KEYS[2])
-table.sort(candidate_keys)
-local effective = {}
-for _, candidate_key in ipairs(candidate_keys) do
-	local node_raw = redis.call("GET", candidate_key)
-	if node_raw then
-		local node = cjson.decode(node_raw)
-		if node["Status"] == "active" and redis.call("SISMEMBER", KEYS[3], node["NodeName"]) == 0 then
-			table.insert(effective, node)
-		end
-	end
-end
-if #effective == 0 then
-	return "no_available_node"
-end
-
-local cursor, counter_error = read_counter(KEYS[4], "round_robin", "9223372036854775807")
-if counter_error then
-	return counter_error
-end
-local _, sequence_error = read_counter(KEYS[6], "sequence", "9007199254740991")
-if sequence_error then
-	return sequence_error
-end
-local chosen = effective[decimal_mod(cursor, #effective) + 1]
-type_error = expect_type(chosen["PlacementNodeKey"], "zset", "new_node_index")
-if type_error then
-	return type_error
-end
-local placement = {
-	GrainID = ARGV[1],
-	Kind = ARGV[2],
-	GrainKey = ARGV[3],
-	NodeIdentity = chosen["NodeIdentity"],
-	Version = next_version,
-	Status = "active",
-	CreateTime = ARGV[4],
-	UpdateTime = ARGV[4],
-	LeaseExpireAt = ARGV[5],
-	Lease = {
-		OwnerNodeIdentity = chosen["NodeIdentity"],
-		OwnerNodeSessionID = chosen["NodeSessionID"],
-		Version = 1,
-		ExpireAt = ARGV[5],
-	},
-}
-local placement_raw = cjson.encode(placement)
-if remove_old_node then
-	redis.call("ZREM", KEYS[8], ARGV[3])
-end
-redis.call("SET", KEYS[1], placement_raw)
-redis.call("INCR", KEYS[4])
-local score = redis.call("INCR", KEYS[6])
-redis.call("ZADD", chosen["PlacementNodeKey"], score, ARGV[3])
-redis.call("ZADD", KEYS[5], ARGV[6], ARGV[3])
-redis.call("XADD", KEYS[7], "*",
-	"type", ARGV[7],
-	"grain_key", ARGV[3],
-	"node_identity", chosen["NodeIdentity"],
-	"placement_version", tostring(next_version),
-	"lease_version", "1")
-return placement_raw
-`
-
-const renewLua = `
-local function expect_type(key, expected, label)
-	local actual = redis.call("TYPE", key)
-	if type(actual) == "table" then actual = actual["ok"] end
-	if actual ~= "none" and actual ~= expected then
-		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
-	end
-	return nil
-end
-local type_error = expect_type(KEYS[1], "string", "placement")
-	or expect_type(KEYS[2], "zset", "lease_expire")
-	or expect_type(KEYS[3], "stream", "audit")
-	or expect_type(KEYS[4], "string", "node")
-if type_error then return type_error end
-
-local node_raw = redis.call("GET", KEYS[4])
-if not node_raw then
-	return "invalid_node_session"
-end
-local node = cjson.decode(node_raw)
-if node["NodeSessionID"] ~= ARGV[9] then
-	return "invalid_node_session"
-end
-
-if redis.call("GET", KEYS[1]) ~= ARGV[1] then
-	return "conflict"
-end
-
-redis.call("SET", KEYS[1], ARGV[2])
-redis.call("ZADD", KEYS[2], ARGV[3], ARGV[4])
-redis.call("XADD", KEYS[3], "*",
-	"type", ARGV[5],
-	"grain_key", ARGV[4],
-	"node_identity", ARGV[6],
-	"placement_version", ARGV[7],
-	"lease_version", ARGV[8])
-return ARGV[2]
-`
-
-const renewNodeLua = `
-local function expect_type(key, expected, label)
-	local actual = redis.call("TYPE", key)
-	if type(actual) == "table" then actual = actual["ok"] end
-	if actual ~= "none" and actual ~= expected then
-		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
-	end
-	return nil
-end
-local type_error = expect_type(KEYS[1], "string", "node")
-	or expect_type(KEYS[2], "zset", "node_heartbeat")
-if type_error then return type_error end
-local raw = redis.call("GET", KEYS[1])
-if not raw then return "node_not_found" end
-local node = cjson.decode(raw)
-if node["Status"] ~= "active" then return "node_not_found" end
-if node["NodeSessionID"] ~= ARGV[1] then return "invalid_node_session" end
-node["LastHeartbeatAt"] = ARGV[2]
-local updated = cjson.encode(node)
-redis.call("SET", KEYS[1], updated)
-redis.call("ZADD", KEYS[2], ARGV[3], ARGV[4])
-return updated
-`
-
-const mutationLua = `
-local function expect_type(key, expected, label)
-	local actual = redis.call("TYPE", key)
-	if type(actual) == "table" then actual = actual["ok"] end
-	if actual ~= "none" and actual ~= expected then
-		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
-	end
-	return nil
-end
-
-local function validate_sequence_counter(key)
-	local raw = redis.call("GET", key)
-	if not raw then return nil end
-	if not string.match(raw, "^%d+$") then
-		return redis.error_reply("INVALID_COUNTER sequence must be a non-negative decimal")
-	end
-	if #raw > 1 and string.sub(raw, 1, 1) == "0" then
-		return redis.error_reply("INVALID_COUNTER sequence must not contain leading zeros")
-	end
-	local maximum = "9007199254740991"
-	if #raw > #maximum or (#raw == #maximum and raw >= maximum) then
-		return redis.error_reply("INVALID_COUNTER sequence must be less than " .. maximum)
-	end
-	return nil
-end
-
-local type_error = expect_type(KEYS[1], "string", "placement")
-	or expect_type(KEYS[6], "stream", "events")
-if not type_error and ARGV[3] == "1" then type_error = expect_type(KEYS[2], "zset", "old_node_index") end
-if not type_error and ARGV[4] == "1" then
-	type_error = expect_type(KEYS[3], "zset", "new_node_index")
-		or expect_type(KEYS[5], "string", "sequence")
-end
-if not type_error and (ARGV[5] == "remove" or ARGV[5] == "add") then type_error = expect_type(KEYS[4], "zset", "lease_expire") end
-if not type_error and ARGV[12] == "1" then type_error = expect_type(KEYS[7], "string", "node") end
-if not type_error and ARGV[14] == "1" then
-	type_error = expect_type(KEYS[8], "string", "target_node")
-		or expect_type(KEYS[9], "set", "invalid_nodes")
-end
-if type_error then return type_error end
-
-if ARGV[12] == "1" then
-	local node_raw = redis.call("GET", KEYS[7])
-	if not node_raw then
-		return "invalid_node_session"
-	end
-	local node = cjson.decode(node_raw)
-	if node["NodeSessionID"] ~= ARGV[13] then
-		return "invalid_node_session"
-	end
-end
-
-local updated_placement = ARGV[2]
-local event_node_identity = ARGV[9]
-if ARGV[14] == "1" then
-	local target_raw = redis.call("GET", KEYS[8])
-	if not target_raw then
-		return "no_available_node"
-	end
-	local target = cjson.decode(target_raw)
-	if target["NodeType"] ~= ARGV[15] or target["NodeGroup"] ~= ARGV[16] or target["NodeName"] ~= ARGV[17] then
-		return "no_available_node"
-	end
-	if target["Status"] ~= "active" or redis.call("SISMEMBER", KEYS[9], ARGV[17]) ~= 0 then
-		return "no_available_node"
-	end
-	local placement = cjson.decode(updated_placement)
-	placement["NodeIdentity"] = target["NodeIdentity"]
-	placement["Lease"]["OwnerNodeIdentity"] = target["NodeIdentity"]
-	placement["Lease"]["OwnerNodeSessionID"] = target["NodeSessionID"]
-	updated_placement = cjson.encode(placement)
-	event_node_identity = target["NodeIdentity"]
-end
-
-if redis.call("GET", KEYS[1]) ~= ARGV[1] then
-	return "conflict"
-end
-
-if ARGV[4] == "1" then
-	local sequence_error = validate_sequence_counter(KEYS[5])
-	if sequence_error then return sequence_error end
-end
-
-redis.call("SET", KEYS[1], updated_placement)
-if ARGV[3] == "1" then
-	redis.call("ZREM", KEYS[2], ARGV[6])
-end
-if ARGV[4] == "1" then
-	local score = redis.call("INCR", KEYS[5])
-	redis.call("ZADD", KEYS[3], score, ARGV[6])
-end
-if ARGV[5] == "remove" then
-	redis.call("ZREM", KEYS[4], ARGV[6])
-elseif ARGV[5] == "add" then
-	redis.call("ZADD", KEYS[4], ARGV[7], ARGV[6])
-end
-redis.call("XADD", KEYS[6], "*",
-	"type", ARGV[8],
-	"grain_key", ARGV[6],
-	"node_identity", event_node_identity,
-	"placement_version", ARGV[10],
-	"lease_version", ARGV[11])
-return updated_placement
-`
-
-const registerNodeLua = `
-local function expect_type(key, expected, label)
-	local actual = redis.call("TYPE", key)
-	if type(actual) == "table" then actual = actual["ok"] end
-	if actual ~= "none" and actual ~= expected then
-		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
-	end
-	return nil
-end
-local type_error = expect_type(KEYS[1], "string", "node")
-	or expect_type(KEYS[2], "set", "nodes")
-	or expect_type(KEYS[3], "stream", "events")
-	or expect_type(KEYS[4], "zset", "node_heartbeat")
-if type_error then return type_error end
-redis.call("SET", KEYS[1], ARGV[1])
-redis.call("SADD", KEYS[2], ARGV[7])
-redis.call("ZADD", KEYS[4], ARGV[8], ARGV[7])
-redis.call("XADD", KEYS[3], "*",
-	"type", ARGV[3],
-	"node_identity", ARGV[2],
-	"node_type", ARGV[4],
-	"node_group", ARGV[5],
-	"node_name", ARGV[6])
-return ARGV[1]
-`
-
-const replaceNodeSessionLua = `
-local function expect_type(key, expected, label)
-	local actual = redis.call("TYPE", key)
-	if type(actual) == "table" then actual = actual["ok"] end
-	if actual ~= "none" and actual ~= expected then
-		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
-	end
-	return nil
-end
-local type_error = expect_type(KEYS[1], "string", "node")
-	or expect_type(KEYS[2], "set", "nodes")
-	or expect_type(KEYS[3], "stream", "events")
-	or expect_type(KEYS[4], "zset", "node_heartbeat")
-if type_error then return type_error end
-local old = redis.call("GET", KEYS[1])
-redis.call("SET", KEYS[1], ARGV[1])
-redis.call("SADD", KEYS[2], ARGV[7])
-redis.call("ZADD", KEYS[4], ARGV[8], ARGV[7])
-redis.call("XADD", KEYS[3], "*",
-	"type", ARGV[3],
-	"node_identity", ARGV[2],
-	"node_type", ARGV[4],
-	"node_group", ARGV[5],
-	"node_name", ARGV[6])
-return old or ""
-`
-
-const markNodeInvalidLua = `
-local function expect_type(key, expected, label)
-	local actual = redis.call("TYPE", key)
-	if type(actual) == "table" then actual = actual["ok"] end
-	if actual ~= "none" and actual ~= expected then
-		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
-	end
-	return nil
-end
-local type_error = expect_type(KEYS[1], "set", "invalid_nodes")
-	or expect_type(KEYS[2], "stream", "events")
-if type_error then return type_error end
-redis.call("SADD", KEYS[1], ARGV[1])
-redis.call("XADD", KEYS[2], "*",
-	"type", ARGV[2],
-	"node_identity", ARGV[3],
-	"node_type", ARGV[4],
-	"node_group", ARGV[5],
-	"node_name", ARGV[1])
+incoming["Status"]="active"; incoming["Lease"]={Version=1,TTLMillis=tonumber(ARGV[2]),ExpireAtUnixMilli=now+tonumber(ARGV[2])}
+local encoded=cjson.encode(incoming)
+redis.call("SET",KEYS[1],encoded);redis.call("SADD",KEYS[2],ARGV[3]);redis.call("ZADD",KEYS[3],incoming["Lease"]["ExpireAtUnixMilli"],ARGV[3])
+node_event(KEYS[4],ARGV[4],incoming["NodeIdentity"],incoming["NodeSessionID"],incoming["NodeType"],incoming["NodeGroup"],incoming["NodeName"],"1")
 return "ok"
 `
 
-const restoreNodeLua = `
-local function expect_type(key, expected, label)
-	local actual = redis.call("TYPE", key)
-	if type(actual) == "table" then actual = actual["ok"] end
-	if actual ~= "none" and actual ~= expected then
-		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
-	end
-	return nil
-end
-local type_error = expect_type(KEYS[1], "set", "invalid_nodes")
-	or expect_type(KEYS[2], "stream", "events")
-if type_error then return type_error end
-redis.call("SREM", KEYS[1], ARGV[1])
-redis.call("XADD", KEYS[2], "*",
-	"type", ARGV[2],
-	"node_identity", ARGV[3],
-	"node_type", ARGV[4],
-	"node_group", ARGV[5],
-	"node_name", ARGV[1])
-return "ok"
+const renewNodeLua = luaHelpers + `
+local e=expect_type(KEYS[1],"string","node") or expect_type(KEYS[2],"zset","leases");if e then return e end
+local raw=redis.call("GET",KEYS[1]);if not raw then return "node_not_found" end
+local node,de=decode(raw,"node");if de then return de end
+if node["NodeKey"]~=ARGV[2] or tonumber(node["Lease"]["Version"] or 0)<=0 or tonumber(node["Lease"]["TTLMillis"] or 0)<=0 then return redis.error_reply("INVALID_NODE") end
+local score=redis.call("ZSCORE",KEYS[2],ARGV[2]);if not score or tonumber(score)~=tonumber(node["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end
+if node["NodeSessionID"]~=ARGV[1] then return "invalid_node_session" end
+if node["Status"]=="offline" then return "node_not_found" end
+local now=now_millis();if tonumber(node["Lease"]["ExpireAtUnixMilli"] or 0)<=now then return "node_lease_expired" end
+node["Lease"]["Version"]=tonumber(node["Lease"]["Version"])+1
+local expiry=now+tonumber(node["Lease"]["TTLMillis"]);if expiry<tonumber(score) then expiry=tonumber(score) end
+node["Lease"]["ExpireAtUnixMilli"]=expiry
+redis.call("SET",KEYS[1],cjson.encode(node));redis.call("ZADD",KEYS[2],expiry,ARGV[2]);return "ok"
 `
 
-const drainNodeLua = `
-local function expect_type(key, expected, label)
-	local actual = redis.call("TYPE", key)
-	if type(actual) == "table" then actual = actual["ok"] end
-	if actual ~= "none" and actual ~= expected then
-		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
-	end
-	return nil
-end
-local type_error = expect_type(KEYS[1], "string", "node")
-	or expect_type(KEYS[2], "set", "invalid_nodes")
-	or expect_type(KEYS[3], "stream", "events")
-if type_error then return type_error end
-local node_raw = redis.call("GET", KEYS[1])
-if not node_raw then
-	return "node_not_found"
-end
-local node = cjson.decode(node_raw)
-if redis.call("SISMEMBER", KEYS[2], node["NodeName"]) == 0 then
-	return "node_not_invalid"
-end
-node["Status"] = "draining"
-local updated = cjson.encode(node)
-redis.call("SET", KEYS[1], updated)
-redis.call("XADD", KEYS[3], "*",
-	"type", ARGV[1],
-	"node_identity", node["NodeIdentity"],
-	"node_type", node["NodeType"],
-	"node_group", node["NodeGroup"],
-	"node_name", node["NodeName"])
-return updated
+const replaceNodeSessionLua = luaHelpers + `
+local e=expect_type(KEYS[1],"string","node") or expect_type(KEYS[2],"set","nodes") or expect_type(KEYS[3],"zset","leases") or expect_type(KEYS[4],"stream","events");if e then return e end
+local incoming,de=decode(ARGV[1],"incoming_node");if de then return de end
+local oldraw=redis.call("GET",KEYS[1]);local old,oe=decode(oldraw,"node");if oe then return oe end
+if old and old["NodeIdentity"]~=incoming["NodeIdentity"] then return redis.error_reply("IDENTITY_MISMATCH") end
+if old and old["NodeKey"]~=ARGV[3] then return redis.error_reply("IDENTITY_MISMATCH") end
+if old and old["NodeSessionID"]==incoming["NodeSessionID"] then return "invalid_node_session" end
+if old then local score=redis.call("ZSCORE",KEYS[3],ARGV[3]);if not score or tonumber(score)~=tonumber(old["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end end
+local now=now_millis();incoming["Status"]="active";incoming["Lease"]={Version=1,TTLMillis=tonumber(ARGV[2]),ExpireAtUnixMilli=now+tonumber(ARGV[2])}
+redis.call("SET",KEYS[1],cjson.encode(incoming));redis.call("SADD",KEYS[2],ARGV[3]);redis.call("ZADD",KEYS[3],incoming["Lease"]["ExpireAtUnixMilli"],ARGV[3]);node_event(KEYS[4],ARGV[4],incoming["NodeIdentity"],incoming["NodeSessionID"],incoming["NodeType"],incoming["NodeGroup"],incoming["NodeName"],"1")
+return {"ok",oldraw or ""}
 `
 
-const unregisterNodeLua = `
-local function expect_type(key, expected, label)
-	local actual = redis.call("TYPE", key)
-	if type(actual) == "table" then actual = actual["ok"] end
-	if actual ~= "none" and actual ~= expected then
-		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
-	end
-	return nil
-end
-local type_error = expect_type(KEYS[1], "string", "node")
-	or expect_type(KEYS[2], "set", "nodes")
-	or expect_type(KEYS[3], "stream", "events")
-	or expect_type(KEYS[4], "zset", "node_placements")
-	or expect_type(KEYS[5], "zset", "node_heartbeat")
-if type_error then return type_error end
-local node_raw = redis.call("GET", KEYS[1])
-if not node_raw then
-	return "node_not_found"
-end
-local node = cjson.decode(node_raw)
-if node["NodeSessionID"] ~= ARGV[1] then
-	return "invalid_node_session"
-end
-if ARGV[3] == "1" and redis.call("ZCARD", KEYS[4]) > 0 then
-	return "node_has_placements"
-end
-redis.call("DEL", KEYS[1])
-redis.call("SREM", KEYS[2], KEYS[1])
-redis.call("ZREM", KEYS[5], KEYS[1])
-redis.call("XADD", KEYS[3], "*",
-	"type", ARGV[2],
-	"node_identity", node["NodeIdentity"],
-	"node_type", node["NodeType"],
-	"node_group", node["NodeGroup"],
-	"node_name", node["NodeName"])
-return "ok"
+const expireNodeLeaseLua = luaHelpers + `
+local e=expect_type(KEYS[1],"string","node") or expect_type(KEYS[2],"zset","leases") or expect_type(KEYS[3],"stream","events");if e then return e end
+local current_score=redis.call("ZSCORE",KEYS[2],ARGV[1]);if not current_score then return "stale" end
+if tostring(current_score)~=tostring(ARGV[3]) and tonumber(current_score)~=tonumber(ARGV[3]) then return "stale" end
+local raw=redis.call("GET",KEYS[1]);if not raw then redis.call("ZREM",KEYS[2],ARGV[1]);return "stale" end
+if raw~=ARGV[2] then return "stale" end
+local node,de=decode(raw,"node");if de then return de end
+if tonumber(node["Lease"]["ExpireAtUnixMilli"] or -1)~=tonumber(current_score) or tostring(node["Lease"]["Version"])~=ARGV[4] or node["NodeSessionID"]~=ARGV[5] then return "stale" end
+if node["NodeKey"]~=ARGV[1] or tonumber(node["Lease"]["Version"] or 0)<=0 or tonumber(node["Lease"]["TTLMillis"] or 0)<=0 then return redis.error_reply("INVALID_NODE") end
+if node["Status"]=="offline" then redis.call("ZREM",KEYS[2],ARGV[1]);return "stale" end
+if tonumber(current_score)>now_millis() then return "not_due" end
+node["Status"]="offline";redis.call("SET",KEYS[1],cjson.encode(node));redis.call("ZREM",KEYS[2],ARGV[1]);node_event(KEYS[3],ARGV[6],node["NodeIdentity"],node["NodeSessionID"],node["NodeType"],node["NodeGroup"],node["NodeName"],tostring(node["Lease"]["Version"]));return "expired"
 `
 
-const expireHeartbeatLua = `
-local function expect_type(key, expected, label)
-	local actual = redis.call("TYPE", key)
-	if type(actual) == "table" then actual = actual["ok"] end
-	if actual ~= "none" and actual ~= expected then
-		return redis.error_reply("WRONGTYPE " .. label .. " expected " .. expected .. " got " .. actual)
-	end
-	return nil
-end
-local type_error = expect_type(KEYS[1], "string", "node")
-	or expect_type(KEYS[2], "zset", "node_heartbeat")
-	or expect_type(KEYS[3], "stream", "events")
-if type_error then return type_error end
-
-local score = redis.call("ZSCORE", KEYS[2], ARGV[1])
-if not score or tonumber(score) ~= tonumber(ARGV[2]) or tonumber(score) > tonumber(ARGV[3]) then
-	return 0
-end
-local raw = redis.call("GET", KEYS[1])
-if not raw then
-	redis.call("ZREM", KEYS[2], ARGV[1])
-	return 0
-end
-if raw ~= ARGV[4] then return 0 end
-local node = cjson.decode(raw)
-if (node["Status"] ~= "active" and node["Status"] ~= "draining") or node["NodeType"] ~= ARGV[6] or node["NodeGroup"] ~= ARGV[7] then
-	redis.call("ZREM", KEYS[2], ARGV[1])
-	return 0
-end
-if node["NodeSessionID"] ~= ARGV[5] then return 0 end
-node["Status"] = "offline"
-redis.call("SET", KEYS[1], cjson.encode(node))
-redis.call("ZREM", KEYS[2], ARGV[1])
-redis.call("XADD", KEYS[3], "*",
-	"type", ARGV[8],
-	"node_identity", node["NodeIdentity"],
-	"node_type", node["NodeType"],
-	"node_group", node["NodeGroup"],
-	"node_name", node["NodeName"])
-return 1
+const unregisterNodeLua = luaHelpers + `
+local e=expect_type(KEYS[1],"string","node") or expect_type(KEYS[2],"set","nodes") or expect_type(KEYS[3],"zset","leases") or expect_type(KEYS[4],"zset","index") or expect_type(KEYS[5],"stream","events");if e then return e end
+local raw=redis.call("GET",KEYS[1]);if not raw then return "node_not_found" end;local node,de=decode(raw,"node");if de then return de end
+if node["NodeKey"]~=ARGV[2] then return redis.error_reply("IDENTITY_MISMATCH") end
+if node["NodeSessionID"]~=ARGV[1] then return "invalid_node_session" end;if ARGV[3]=="true" and redis.call("ZCARD",KEYS[4])>0 then return "node_has_placements" end
+local score=redis.call("ZSCORE",KEYS[3],ARGV[2]);if not score or tonumber(score)~=tonumber(node["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end
+redis.call("DEL",KEYS[1]);redis.call("SREM",KEYS[2],ARGV[2]);redis.call("ZREM",KEYS[3],ARGV[2]);node_event(KEYS[5],ARGV[4],node["NodeIdentity"],node["NodeSessionID"],node["NodeType"],node["NodeGroup"],node["NodeName"],tostring(node["Lease"]["Version"]));return "ok"
 `
+
+const drainNodeLua = luaHelpers + `
+local e=expect_type(KEYS[1],"string","node") or expect_type(KEYS[2],"set","invalid") or expect_type(KEYS[3],"zset","leases") or expect_type(KEYS[4],"stream","events");if e then return e end
+local raw=redis.call("GET",KEYS[1]);if not raw then return "node_not_found" end;local node,de=decode(raw,"node");if de then return de end;if redis.call("SISMEMBER",KEYS[2],ARGV[1])==0 then return "node_not_invalid" end
+if node["NodeKey"]~=ARGV[3] then return redis.error_reply("IDENTITY_MISMATCH") end;local score=redis.call("ZSCORE",KEYS[3],ARGV[3]);if not score or tonumber(score)~=tonumber(node["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end
+node["Status"]="draining";redis.call("SET",KEYS[1],cjson.encode(node));node_event(KEYS[4],ARGV[2],node["NodeIdentity"],node["NodeSessionID"],node["NodeType"],node["NodeGroup"],node["NodeName"],tostring(node["Lease"]["Version"]));return "ok"
+`
+const markInvalidLua = luaHelpers + `local e=expect_type(KEYS[1],"set","invalid") or expect_type(KEYS[2],"stream","events");if e then return e end;redis.call("SADD",KEYS[1],ARGV[1]);node_event(KEYS[2],ARGV[5],ARGV[2],"",ARGV[3],ARGV[4],ARGV[1],"0");return "ok"`
+const restoreNodeLua = luaHelpers + `local e=expect_type(KEYS[1],"set","invalid") or expect_type(KEYS[2],"stream","events");if e then return e end;redis.call("SREM",KEYS[1],ARGV[1]);node_event(KEYS[2],ARGV[5],ARGV[2],"",ARGV[3],ARGV[4],ARGV[1],"0");return "ok"`
+
+const lookupLua = luaHelpers + `
+local e=expect_type(KEYS[1],"string","placement") or expect_type(KEYS[2],"string","node") or expect_type(KEYS[3],"zset","leases");if e then return e end
+local praw=redis.call("GET",KEYS[1]);if not praw or praw~=ARGV[1] then return "placement_not_found" end;local p,pe=decode(praw,"placement");if pe then return pe end
+local nraw=redis.call("GET",KEYS[2]);if not nraw then return "placement_not_found" end;local n,ne=decode(nraw,"node");if ne then return ne end
+local score=redis.call("ZSCORE",KEYS[3],ARGV[2]);local now=now_millis()
+if p["GrainKey"]~=ARGV[3] or p["Status"]~="active" or n["NodeKey"]~=ARGV[2] or p["NodeIdentity"]~=n["NodeIdentity"] or p["OwnerNodeSessionID"]~=n["NodeSessionID"] or (n["Status"]~="active" and n["Status"]~="draining") or tonumber(n["Lease"]["Version"] or 0)<=0 or tonumber(n["Lease"]["TTLMillis"] or 0)<=0 or not score or tonumber(score)~=tonumber(n["Lease"]["ExpireAtUnixMilli"] or -1) or tonumber(score)<=now then return "placement_not_found" end
+return {praw,tostring(n["Lease"]["Version"]),tostring(math.max(0,tonumber(score)-now))}
+`
+
+const allocateLua = luaHelpers + `
+local e=expect_type(KEYS[1],"string","placement") or expect_type(KEYS[2],"set","nodes") or expect_type(KEYS[3],"set","invalid") or expect_type(KEYS[4],"string","round_robin") or expect_type(KEYS[5],"zset","leases") or expect_type(KEYS[6],"string","sequence") or expect_type(KEYS[7],"stream","events") or expect_type(KEYS[8],"zset","old_index") or expect_type(KEYS[9],"string","old_node") or expect_type(KEYS[10],"zset","owner_leases");if e then return e end
+local existing_raw=redis.call("GET",KEYS[1]);local existing,xe=decode(existing_raw,"placement");if xe then return xe end
+if existing_raw then if existing_raw~=ARGV[4] then return "conflict" end;if existing["GrainKey"]~=ARGV[3] then return redis.error_reply("IDENTITY_MISMATCH") end;if existing["Status"]=="active" then local nr=redis.call("GET",KEYS[9]);local oldnode;oldnode,xe=decode(nr,"owner_node");if xe then return xe end;local now=now_millis();local score=oldnode and redis.call("ZSCORE",KEYS[10],KEYS[9]) or nil;if oldnode and oldnode["NodeKey"]==KEYS[9] and existing["NodeIdentity"]==oldnode["NodeIdentity"] and existing["OwnerNodeSessionID"]==oldnode["NodeSessionID"] and (oldnode["Status"]=="active" or oldnode["Status"]=="draining") and score and tonumber(score)==tonumber(oldnode["Lease"]["ExpireAtUnixMilli"] or -1) and tonumber(score)>now then return existing_raw end;return "owner_unavailable" end end
+local node_keys=redis.call("SMEMBERS",KEYS[2]);table.sort(node_keys);local now=now_millis();local candidates={}
+for _,key in ipairs(node_keys) do local te=expect_type(key,"string","candidate_node");if te then return te end;local nr=redis.call("GET",key);local n,ne=decode(nr,"candidate_node");if ne then return ne end;if n then local index_error=expect_type(n["PlacementNodeKey"],"zset","candidate_index");if index_error then return index_error end;local score=redis.call("ZSCORE",KEYS[5],key);if n["NodeKey"]==key and n["NodeType"]==ARGV[6] and n["NodeGroup"]==ARGV[7] and n["Status"]=="active" and redis.call("SISMEMBER",KEYS[3],n["NodeName"])==0 and score and tonumber(score)==tonumber(n["Lease"]["ExpireAtUnixMilli"] or -1) and tonumber(score)>now then table.insert(candidates,{key=key,node=n}) end end end
+if #candidates==0 then return "no_available_node" end
+local rr,re=read_counter(KEYS[4],"round_robin","9223372036854775807");if re then return re end;local seq,se=read_counter(KEYS[6],"sequence","9007199254740991");if se then return se end
+local chosen=candidates[decimal_mod(rr,#candidates)+1];local version=existing and tonumber(existing["Version"])+1 or 1;local p={GrainID=ARGV[1],Kind=ARGV[2],GrainKey=ARGV[3],NodeIdentity=chosen.node["NodeIdentity"],OwnerNodeSessionID=chosen.node["NodeSessionID"],Version=version,Status="active",CreateTime="0001-01-01T00:00:00Z",UpdateTime="0001-01-01T00:00:00Z"};local encoded=cjson.encode(p)
+redis.call("INCR",KEYS[4]);local nextseq=redis.call("INCR",KEYS[6]);if existing then redis.call("ZREM",KEYS[8],ARGV[3]) end;redis.call("SET",KEYS[1],encoded);redis.call("ZADD",chosen.node["PlacementNodeKey"],nextseq,ARGV[3]);event(KEYS[7],ARGV[5],ARGV[3],chosen.node["NodeIdentity"],chosen.node["NodeSessionID"],tostring(version),"0");return encoded
+`
+
+const renewPlacementLua = luaHelpers + `
+local e=expect_type(KEYS[1],"string","placement") or expect_type(KEYS[2],"string","node") or expect_type(KEYS[3],"zset","leases") or expect_type(KEYS[4],"stream","audit");if e then return e end
+local raw=redis.call("GET",KEYS[1]);if not raw then return "placement_not_found" end;if raw~=ARGV[1] then return "version_conflict" end;local p,pe=decode(raw,"placement");if pe then return pe end
+local nr=redis.call("GET",KEYS[2]);local n,ne=decode(nr,"node");if ne then return ne end
+if p["GrainKey"]~=ARGV[6] or p["Status"]~="active" then return "placement_not_found" end;if p["NodeIdentity"]~=ARGV[2] then return "invalid_owner" end;if tostring(p["Version"])~=ARGV[4] then return "version_conflict" end;if not n or n["NodeKey"]~=KEYS[2] or n["NodeIdentity"]~=p["NodeIdentity"] or (n["Status"]~="active" and n["Status"]~="draining") then return "owner_unavailable" end;if p["OwnerNodeSessionID"]~=ARGV[3] or n["NodeSessionID"]~=ARGV[3] then return "invalid_node_session" end
+local score=redis.call("ZSCORE",KEYS[3],KEYS[2]);if not score or tonumber(score)~=tonumber(n["Lease"]["ExpireAtUnixMilli"] or -1) then return "owner_unavailable" end;if tonumber(score)<=now_millis() then return "node_lease_expired" end
+event(KEYS[4],ARGV[5],p["GrainKey"],p["NodeIdentity"],p["OwnerNodeSessionID"],tostring(p["Version"]),"0");return raw
+`
+
+const mutationLua = luaHelpers + `
+local e=expect_type(KEYS[1],"string","placement") or expect_type(KEYS[2],"string","owner_node") or expect_type(KEYS[3],"string","target_node") or expect_type(KEYS[4],"zset","old_index") or expect_type(KEYS[5],"zset","new_index") or expect_type(KEYS[6],"zset","target_leases") or expect_type(KEYS[7],"stream","events") or expect_type(KEYS[8],"zset","owner_leases") or expect_type(KEYS[9],"set","target_invalid") or expect_type(KEYS[10],"string","sequence");if e then return e end
+local raw=redis.call("GET",KEYS[1]);if not raw then return "placement_not_found" end;if raw~=ARGV[2] then return "version_conflict" end;local p,pe=decode(raw,"placement");if pe then return pe end
+local ownerraw=redis.call("GET",KEYS[2]);local owner,oe=decode(ownerraw,"owner_node");if oe then return oe end;local targetraw=redis.call("GET",KEYS[3]);local target,te=decode(targetraw,"target_node");if te then return te end
+if p["GrainKey"]~=ARGV[8] or p["Status"]~="active" then return "placement_not_found" end;if tostring(p["Version"])~=ARGV[6] then return "version_conflict" end
+local seq,se=read_counter(KEYS[10],"sequence","9007199254740991");if se then return se end
+if ARGV[1]=="release" then if p["NodeIdentity"]~=ARGV[3] then return "invalid_owner" end;if not owner or owner["NodeIdentity"]~=p["NodeIdentity"] then return "owner_unavailable" end;if p["OwnerNodeSessionID"]~=ARGV[5] or owner["NodeSessionID"]~=ARGV[5] then return "invalid_node_session" end
+else
+ if ARGV[1]=="transfer" and ARGV[3]~="" and p["NodeIdentity"]~=ARGV[3] then return "invalid_owner" end
+ local now=now_millis();if ARGV[1]=="recover" then local owner_score=owner and redis.call("ZSCORE",KEYS[8],KEYS[2]) or nil;local healthy=owner and owner["NodeKey"]==KEYS[2] and owner["NodeIdentity"]==p["NodeIdentity"] and owner["NodeSessionID"]==p["OwnerNodeSessionID"] and (owner["Status"]=="active" or owner["Status"]=="draining") and owner_score and tonumber(owner_score)==tonumber(owner["Lease"]["ExpireAtUnixMilli"] or -1) and tonumber(owner_score)>now;if healthy then return "not_recoverable" end end
+ if not target or target["NodeKey"]~=KEYS[3] or target["NodeIdentity"]~=ARGV[4] or target["PlacementNodeKey"]~=KEYS[5] or target["Status"]~="active" or redis.call("SISMEMBER",KEYS[9],target["NodeName"])~=0 then return "no_available_node" end;local score=redis.call("ZSCORE",KEYS[6],KEYS[3]);if not score or tonumber(score)~=tonumber(target["Lease"]["ExpireAtUnixMilli"] or -1) or tonumber(score)<=now then return "no_available_node" end
+end
+p["Version"]=tonumber(p["Version"])+1;if ARGV[1]=="release" then p["Status"]="released" else p["NodeIdentity"]=target["NodeIdentity"];p["OwnerNodeSessionID"]=target["NodeSessionID"] end;local encoded=cjson.encode(p)
+redis.call("ZREM",KEYS[4],p["GrainKey"]);redis.call("SET",KEYS[1],encoded);if ARGV[1]~="release" then local score=redis.call("INCR",KEYS[10]);redis.call("ZADD",KEYS[5],score,p["GrainKey"]) end;event(KEYS[7],ARGV[7],p["GrainKey"],p["NodeIdentity"],p["OwnerNodeSessionID"],tostring(p["Version"]),"0");return encoded
+`
+
+const (
+	ScriptAllocate        = "allocate"
+	ScriptRenew           = "renew"
+	ScriptRelease         = "release"
+	ScriptTransfer        = "transfer"
+	ScriptRecover         = "recover"
+	ScriptDrain           = "drain"
+	ScriptNodeLeaseExpire = "node_lease_expire"
+)
 
 type ScriptSpec struct {
 	Name              string
@@ -533,13 +179,5 @@ type ScriptSpec struct {
 }
 
 func ScriptSpecs() []ScriptSpec {
-	return []ScriptSpec{
-		{Name: ScriptAllocate, WritesOutbox: true},
-		{Name: ScriptRenew, WritesAuditStream: true},
-		{Name: ScriptRelease, WritesOutbox: true},
-		{Name: ScriptTransfer, WritesOutbox: true},
-		{Name: ScriptRecover, WritesOutbox: true},
-		{Name: ScriptExpire, WritesOutbox: true},
-		{Name: ScriptDrain, WritesOutbox: true},
-	}
+	return []ScriptSpec{{ScriptAllocate, true, false}, {ScriptRenew, false, true}, {ScriptRelease, true, false}, {ScriptTransfer, true, false}, {ScriptRecover, true, false}, {ScriptDrain, true, false}, {ScriptNodeLeaseExpire, true, false}}
 }

@@ -304,7 +304,8 @@ func TestRedisEventBusBroadcastsToUniqueConsumerGroups(t *testing.T) {
 		GrainKey:         sp.GrainKey("Player/10001"),
 		NodeIdentity:     "game/default/game-2",
 		PlacementVersion: 2,
-		LeaseVersion:     1,
+		NodeSessionID:    "session-a",
+		NodeLeaseVersion: 1,
 	}
 	if err := first.Publish(ctx, event); err != nil {
 		t.Fatalf("Publish error: %v", err)
