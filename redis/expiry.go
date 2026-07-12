@@ -31,72 +31,99 @@ func (d *Directory) ExpireDue(ctx context.Context, now time.Time, limit int64) (
 	if limit <= 0 {
 		return 0, nil
 	}
-	expired := 0
+	type candidate struct {
+		key   sp.GrainKey
+		score float64
+	}
+	var candidates []candidate
 	min := "-inf"
-	for scan := 0; scan < maxExpireScanRounds && int64(expired) < limit; scan++ {
+	var cursorScore float64
+	var offsetWithinScore int64
+	hasCursor := false
+	for scan := 0; scan < maxExpireScanRounds; scan++ {
 		values, err := d.client.ZRangeByScoreWithScores(ctx, LeaseExpireKey(), &goredis.ZRangeBy{
 			Min:    min,
 			Max:    strconv.FormatInt(now.UnixMilli(), 10),
-			Offset: 0,
+			Offset: offsetWithinScore,
 			Count:  limit,
 		}).Result()
 		if err != nil {
-			return expired, err
+			return 0, err
 		}
 		if len(values) == 0 {
 			break
 		}
-
 		for _, value := range values {
-			if int64(expired) == limit {
-				break
-			}
 			rawKey, ok := value.Member.(string)
 			if !ok {
 				continue
 			}
-			key := sp.GrainKey(rawKey)
-			placement, err := d.getPlacement(ctx, key)
-			if errors.Is(err, sp.ErrPlacementNotFound) {
-				_, cleanupErr := d.cleanupStaleLease(ctx, key, value.Score)
-				if cleanupErr != nil {
-					return expired, cleanupErr
-				}
-				continue
-			}
-			if err != nil {
-				return expired, err
-			}
-			if placement.Status != sp.PlacementStatusActive {
-				_, cleanupErr := d.cleanupStaleLease(ctx, key, value.Score)
-				if cleanupErr != nil {
-					return expired, cleanupErr
-				}
-				continue
-			}
+			candidates = append(candidates, candidate{key: sp.GrainKey(rawKey), score: value.Score})
+		}
 
-			err = d.Expire(ctx, sp.ExpireCommand{
-				GrainKey:     placement.GrainKey,
-				LeaseVersion: placement.Lease.Version,
-				Now:          now,
-			})
-			if err == nil {
-				expired++
-				continue
+		lastScore := values[len(values)-1].Score
+		trailingAtLastScore := int64(0)
+		for index := len(values) - 1; index >= 0 && values[index].Score == lastScore; index-- {
+			trailingAtLastScore++
+		}
+		if hasCursor && lastScore == cursorScore {
+			offsetWithinScore += trailingAtLastScore
+		} else {
+			cursorScore = lastScore
+			offsetWithinScore = trailingAtLastScore
+			hasCursor = true
+		}
+		min = strconv.FormatFloat(lastScore, 'f', -1, 64)
+		if int64(len(values)) < limit {
+			break
+		}
+	}
+
+	expired := 0
+	for _, candidate := range candidates {
+		if int64(expired) == limit {
+			break
+		}
+		key := candidate.key
+		placement, err := d.getPlacement(ctx, key)
+		if errors.Is(err, sp.ErrPlacementNotFound) {
+			_, cleanupErr := d.cleanupStaleLease(ctx, key, candidate.score)
+			if cleanupErr != nil {
+				return expired, cleanupErr
 			}
-			if errors.Is(err, sp.ErrPlacementNotFound) {
-				_, cleanupErr := d.cleanupStaleLease(ctx, key, value.Score)
-				if cleanupErr != nil {
-					return expired, cleanupErr
-				}
-				continue
-			}
-			if errors.Is(err, sp.ErrVersionConflict) || errors.Is(err, sp.ErrLeaseNotExpired) {
-				continue
-			}
+			continue
+		}
+		if err != nil {
 			return expired, err
 		}
-		min = "(" + strconv.FormatFloat(values[len(values)-1].Score, 'f', -1, 64)
+		if placement.Status != sp.PlacementStatusActive {
+			_, cleanupErr := d.cleanupStaleLease(ctx, key, candidate.score)
+			if cleanupErr != nil {
+				return expired, cleanupErr
+			}
+			continue
+		}
+
+		err = d.Expire(ctx, sp.ExpireCommand{
+			GrainKey:     placement.GrainKey,
+			LeaseVersion: placement.Lease.Version,
+			Now:          now,
+		})
+		if err == nil {
+			expired++
+			continue
+		}
+		if errors.Is(err, sp.ErrPlacementNotFound) {
+			_, cleanupErr := d.cleanupStaleLease(ctx, key, candidate.score)
+			if cleanupErr != nil {
+				return expired, cleanupErr
+			}
+			continue
+		}
+		if errors.Is(err, sp.ErrVersionConflict) || errors.Is(err, sp.ErrLeaseNotExpired) {
+			continue
+		}
+		return expired, err
 	}
 	return expired, nil
 }

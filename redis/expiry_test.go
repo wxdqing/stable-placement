@@ -30,6 +30,7 @@ type zRangeCountClient struct {
 	goredis.UniversalClient
 	mu     sync.Mutex
 	counts []int64
+	gets   map[string]int
 }
 
 func (c *zRangeCountClient) ZRangeByScoreWithScores(ctx context.Context, key string, opt *goredis.ZRangeBy) *goredis.ZSliceCmd {
@@ -43,6 +44,23 @@ func (c *zRangeCountClient) Counts() []int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]int64(nil), c.counts...)
+}
+
+func (c *zRangeCountClient) Get(ctx context.Context, key string) *goredis.StringCmd {
+	result := c.UniversalClient.Get(ctx, key)
+	c.mu.Lock()
+	if c.gets == nil {
+		c.gets = make(map[string]int)
+	}
+	c.gets[key]++
+	c.mu.Unlock()
+	return result
+}
+
+func (c *zRangeCountClient) GetCount(key string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gets[key]
 }
 
 func (c blockingZRangeClient) ZRangeByScoreWithScores(ctx context.Context, key string, opt *goredis.ZRangeBy) *goredis.ZSliceCmd {
@@ -384,8 +402,10 @@ func TestRedisDirectoryAllocateCounterPreflightKeepsAllState(t *testing.T) {
 		value string
 	}{
 		{name: "round-robin non-integer", key: func() string { return StrategyRoundRobinKey("game", "default") }, label: "round_robin", value: "not-an-integer"},
+		{name: "round-robin leading zero", key: func() string { return StrategyRoundRobinKey("game", "default") }, label: "round_robin", value: "0001"},
 		{name: "round-robin int64 max", key: func() string { return StrategyRoundRobinKey("game", "default") }, label: "round_robin", value: "9223372036854775807"},
 		{name: "sequence non-integer", key: SequenceKey, label: "sequence", value: "not-an-integer"},
+		{name: "sequence leading zero", key: SequenceKey, label: "sequence", value: "0001"},
 		{name: "sequence int64 max", key: SequenceKey, label: "sequence", value: "9223372036854775807"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -595,6 +615,84 @@ func TestRedisDirectoryExpireDueKeepsEachQueryBoundedWhileAdvancingPastSkipped(t
 		if queryCount > 2 {
 			t.Fatalf("query Count = %d, want <= 2; all counts = %v", queryCount, counts)
 		}
+	}
+}
+
+func TestRedisDirectoryExpireDuePaginatesEqualScoresWithoutSkipping(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	dir, err := NewDirectory(base, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerTestNode(t, dir, "game-1", "session-a")
+
+	missingKey, _ := sp.NewGrainKey("Player", "a-equal-score-missing")
+	future, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "b-equal-score-future",
+		Kind:            "Player",
+		TargetNodeType:  "game",
+		TargetNodeGroup: "default",
+		LeaseTTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	due := allocateExpiringPlacement(t, dir, "c-equal-score-due")
+	waitUntilExpired(due.LeaseExpireAt)
+	sharedScore := due.LeaseExpireAt.UnixMilli()
+	if err := base.ZAdd(ctx, LeaseExpireKey(),
+		goredis.Z{Score: float64(sharedScore), Member: missingKey.String()},
+		goredis.Z{Score: float64(sharedScore), Member: future.GrainKey.String()},
+		goredis.Z{Score: float64(sharedScore), Member: due.GrainKey.String()},
+	).Err(); err != nil {
+		t.Fatal(err)
+	}
+	recording := &zRangeCountClient{UniversalClient: base}
+	dir.client = recording
+
+	count, err := dir.ExpireDue(ctx, due.LeaseExpireAt.Add(time.Millisecond), 1)
+	if err != nil {
+		t.Fatalf("ExpireDue error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("ExpireDue count = %d, want 1", count)
+	}
+	counts := recording.Counts()
+	if len(counts) < 3 || len(counts) > maxExpireScanRounds {
+		t.Fatalf("query rounds = %d, want [3, %d]; counts = %v", len(counts), maxExpireScanRounds, counts)
+	}
+	for _, queryCount := range counts {
+		if queryCount > 1 {
+			t.Fatalf("query Count = %d, want <= 1; all counts = %v", queryCount, counts)
+		}
+	}
+	if got := recording.GetCount(PlacementKey(missingKey)); got != 1 {
+		t.Fatalf("missing placement reads = %d, want 1", got)
+	}
+	if got := recording.GetCount(PlacementKey(future.GrainKey)); got != 2 {
+		t.Fatalf("future placement reads = %d, want 2", got)
+	}
+	if got := recording.GetCount(PlacementKey(due.GrainKey)); got != 2 {
+		t.Fatalf("due placement reads = %d, want 2", got)
+	}
+	if _, err := base.ZScore(ctx, LeaseExpireKey(), missingKey.String()).Result(); !errors.Is(err, goredis.Nil) {
+		t.Fatalf("missing stale member err = %v, want redis.Nil", err)
+	}
+	futureStored, err := dir.getPlacement(ctx, future.GrainKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if futureStored.Status != sp.PlacementStatusActive {
+		t.Fatalf("future status = %q, want active", futureStored.Status)
+	}
+	dueStored, err := dir.getPlacement(ctx, due.GrainKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dueStored.Status != sp.PlacementStatusExpired {
+		t.Fatalf("due status = %q, want expired", dueStored.Status)
 	}
 }
 

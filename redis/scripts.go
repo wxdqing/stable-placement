@@ -30,15 +30,14 @@ local function read_counter(key, label)
 	if not string.match(raw, "^%d+$") then
 		return nil, redis.error_reply("INVALID_COUNTER " .. label .. " must be a non-negative decimal")
 	end
-	local normalized = string.gsub(raw, "^0+", "")
-	if normalized == "" then
-		normalized = "0"
+	if #raw > 1 and string.sub(raw, 1, 1) == "0" then
+		return nil, redis.error_reply("INVALID_COUNTER " .. label .. " must not contain leading zeros")
 	end
 	local maximum = "9223372036854775807"
-	if #normalized > #maximum or (#normalized == #maximum and normalized >= maximum) then
+	if #raw > #maximum or (#raw == #maximum and raw >= maximum) then
 		return nil, redis.error_reply("INVALID_COUNTER " .. label .. " must be less than " .. maximum)
 	end
-	return normalized, nil
+	return raw, nil
 end
 
 local function decimal_mod(value, divisor)
