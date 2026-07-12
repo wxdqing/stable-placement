@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -425,6 +426,128 @@ func TestRedisDirectoryFindByNodeRejectsInvalidScores(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRedisDirectoryFindByNodeRejectsDuplicateScoreAcrossBatches(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	dir, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeIdentity := "game/default/game-1"
+	for index := 1; index <= 101; index++ {
+		key, err := sp.NewGrainKey("Player", fmt.Sprintf("boundary-%03d", index))
+		if err != nil {
+			t.Fatal(err)
+		}
+		score := index
+		if index == 101 {
+			score = 100
+		}
+		if err := client.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: float64(score), Member: key.String()}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: nodeIdentity, Limit: 10})
+	if err == nil || !strings.Contains(err.Error(), "invalid placement index score") {
+		t.Fatalf("FindByNode error = %v, want duplicate score data error", err)
+	}
+	if len(page.Placements) != 0 || page.NextCursor != "" {
+		t.Fatalf("FindByNode page = %+v, want empty page on duplicate score", page)
+	}
+}
+
+func TestRedisDirectoryFindByNodeValidatesCursorBoundary(t *testing.T) {
+	const nodeIdentity = "game/default/game-1"
+	ctx := context.Background()
+
+	t.Run("same score with different member is duplicate", func(t *testing.T) {
+		server := miniredis.RunT(t)
+		client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+		dir, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		actualKey := addIndexedPlacement(t, client, nodeIdentity, "cursor-actual", 10, sp.PlacementStatusActive)
+		cursorKey, _ := sp.NewGrainKey("Player", "cursor-missing")
+
+		page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: nodeIdentity, Cursor: formatCursor(10, cursorKey.String()), Limit: 10})
+		if err == nil || !strings.Contains(err.Error(), "invalid placement index score") {
+			t.Fatalf("FindByNode error = %v, want duplicate score data error for %s", err, actualKey)
+		}
+		if len(page.Placements) != 0 || page.NextCursor != "" {
+			t.Fatalf("FindByNode page = %+v, want empty page", page)
+		}
+	})
+
+	t.Run("same score and member skips processed boundary", func(t *testing.T) {
+		server := miniredis.RunT(t)
+		client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+		dir, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		boundaryKey, _ := sp.NewGrainKey("Player", "cursor-boundary")
+		if err := client.Set(ctx, PlacementKey(boundaryKey), "{", 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.ZAdd(ctx, PlacementNodeKey(nodeIdentity), goredis.Z{Score: 10, Member: boundaryKey.String()}).Err(); err != nil {
+			t.Fatal(err)
+		}
+		nextKey := addIndexedPlacement(t, client, nodeIdentity, "cursor-next", 11, sp.PlacementStatusActive)
+
+		page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: nodeIdentity, Cursor: formatCursor(10, boundaryKey.String()), Limit: 10})
+		if err != nil {
+			t.Fatalf("FindByNode error: %v", err)
+		}
+		if len(page.Placements) != 1 || page.Placements[0].GrainKey != nextKey || page.NextCursor != "" {
+			t.Fatalf("FindByNode page = %+v, want next placement only", page)
+		}
+	})
+
+	t.Run("deleted cursor member allows a greater first score", func(t *testing.T) {
+		server := miniredis.RunT(t)
+		client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+		dir, err := NewDirectory(client, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cursorKey, _ := sp.NewGrainKey("Player", "cursor-deleted")
+		nextKey := addIndexedPlacement(t, client, nodeIdentity, "after-deleted-cursor", 11, sp.PlacementStatusActive)
+
+		page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: nodeIdentity, Cursor: formatCursor(10, cursorKey.String()), Limit: 10})
+		if err != nil {
+			t.Fatalf("FindByNode error: %v", err)
+		}
+		if len(page.Placements) != 1 || page.Placements[0].GrainKey != nextKey || page.NextCursor != "" {
+			t.Fatalf("FindByNode page = %+v, want next placement only", page)
+		}
+	})
+
+	t.Run("first score below cursor is invalid", func(t *testing.T) {
+		server := miniredis.RunT(t)
+		base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+		key := addIndexedPlacement(t, base, nodeIdentity, "below-cursor", 9, sp.PlacementStatusActive)
+		dir, err := NewDirectory(staticPlacementIndexClient{
+			UniversalClient: base,
+			values:          []goredis.Z{{Score: 9, Member: key.String()}},
+		}, sp.StrategyModeRedisRoundRobin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cursorKey, _ := sp.NewGrainKey("Player", "cursor")
+
+		page, err := dir.FindByNode(ctx, sp.FindByNodeQuery{NodeIdentity: nodeIdentity, Cursor: formatCursor(10, cursorKey.String()), Limit: 10})
+		if err == nil || !strings.Contains(err.Error(), "invalid placement index score") {
+			t.Fatalf("FindByNode error = %v, want score before cursor data error", err)
+		}
+		if len(page.Placements) != 0 || page.NextCursor != "" {
+			t.Fatalf("FindByNode page = %+v, want empty page", page)
+		}
+	})
 }
 
 func TestRedisDirectoryAllocateAcceptsLargestSafeSequenceResult(t *testing.T) {

@@ -451,12 +451,21 @@ func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (s
 	}
 	batchSize := int64(max(limit, 100))
 	min := "-inf"
+	var boundaryScore int64
+	var boundaryKey string
+	hasBoundary := false
 	if query.Cursor != "" {
-		score, err := parseCursorScore(query.Cursor)
+		score, key, err := parseCursor(query.Cursor)
 		if err != nil {
 			return sp.PlacementPage{}, err
 		}
-		min = "(" + strconv.FormatInt(score, 10)
+		if score < 0 || score > maxPlacementIndexScore {
+			return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %d in cursor", score)
+		}
+		boundaryScore = score
+		boundaryKey = key
+		hasBoundary = true
+		min = strconv.FormatInt(score, 10)
 	}
 	status := query.Status
 	if status == "" {
@@ -465,8 +474,8 @@ func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (s
 	var placements []sp.Placement
 	var placementScores []int64
 	var placementKeys []string
-	var previousScore int64
-	hasPreviousScore := false
+	previousScore := boundaryScore
+	hasPreviousScore := hasBoundary
 	indexKey := PlacementNodeKey(query.NodeIdentity)
 	for {
 		values, err := d.client.ZRangeByScoreWithScores(ctx, indexKey, &goredis.ZRangeBy{
@@ -481,21 +490,34 @@ func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (s
 			break
 		}
 		var lastScore int64
-		for _, value := range values {
+		var lastKey string
+		for index, value := range values {
 			if math.IsNaN(value.Score) || math.IsInf(value.Score, 0) || math.Trunc(value.Score) != value.Score || value.Score < 0 || value.Score > float64(maxPlacementIndexScore) {
 				return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %v", value.Score)
 			}
 			score := int64(value.Score)
+			key, ok := value.Member.(string)
+			if !ok {
+				return sp.PlacementPage{}, fmt.Errorf("invalid placement index member type %T", value.Member)
+			}
+			lastScore = score
+			lastKey = key
+			if hasBoundary && index == 0 {
+				if score < boundaryScore {
+					return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %d before cursor score %d", score, boundaryScore)
+				}
+				if score == boundaryScore {
+					if key != boundaryKey {
+						return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %d: duplicate member %q after %q", score, key, boundaryKey)
+					}
+					continue
+				}
+			}
 			if hasPreviousScore && score <= previousScore {
 				return sp.PlacementPage{}, fmt.Errorf("invalid placement index score %d: scores must be unique and increasing", score)
 			}
 			previousScore = score
 			hasPreviousScore = true
-			lastScore = score
-			key, ok := value.Member.(string)
-			if !ok {
-				return sp.PlacementPage{}, fmt.Errorf("invalid placement index member type %T", value.Member)
-			}
 			placement, err := d.getPlacement(ctx, sp.GrainKey(key))
 			if errors.Is(err, sp.ErrPlacementNotFound) {
 				continue
@@ -519,7 +541,10 @@ func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (s
 		if int64(len(values)) < batchSize {
 			break
 		}
-		min = "(" + strconv.FormatInt(lastScore, 10)
+		boundaryScore = lastScore
+		boundaryKey = lastKey
+		hasBoundary = true
+		min = strconv.FormatInt(lastScore, 10)
 	}
 	return sp.PlacementPage{Placements: placements}, nil
 }
@@ -959,9 +984,16 @@ func normalizeNode(node *sp.Node) error {
 	return nil
 }
 
-func parseCursorScore(cursor string) (int64, error) {
-	score, _, _ := strings.Cut(cursor, ":")
-	return strconv.ParseInt(score, 10, 64)
+func parseCursor(cursor string) (int64, string, error) {
+	rawScore, key, ok := strings.Cut(cursor, ":")
+	if !ok || key == "" {
+		return 0, "", fmt.Errorf("invalid placement cursor %q", cursor)
+	}
+	score, err := strconv.ParseInt(rawScore, 10, 64)
+	if err != nil {
+		return 0, "", err
+	}
+	return score, key, nil
 }
 
 func formatCursor(score int64, key string) string {
