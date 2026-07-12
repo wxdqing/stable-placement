@@ -9,6 +9,17 @@ import (
 	sp "github.com/wxdqing/stable-placement"
 )
 
+type blockingStrategy struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s blockingStrategy) Choose(_ context.Context, input sp.StrategyInput) (sp.Node, error) {
+	close(s.started)
+	<-s.release
+	return input.EffectiveNodes[0], nil
+}
+
 func TestNodeRegistryInvalidGroupSurvivesSessionReplacement(t *testing.T) {
 	ctx := context.Background()
 	registry := NewNodeRegistry(NewEventBus())
@@ -135,5 +146,78 @@ func TestCompleteDrainRejectsNodeWithPlacements(t *testing.T) {
 	}
 	if err := dir.NodeRegistry().CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
 		t.Fatalf("CompleteDrain after release error: %v", err)
+	}
+}
+
+func TestCompleteDrainPreventsConcurrentAllocateCommit(t *testing.T) {
+	ctx := context.Background()
+	bus := NewEventBus()
+	strategy := blockingStrategy{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	dir, err := NewDirectory(NewNodeRegistry(bus), sp.StrategyModeGo, strategy, bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := registerTestNode(t, dir, "game-1", "session-a")
+	allocateDone := make(chan error, 1)
+	go func() {
+		_, err := dir.Allocate(ctx, sp.AllocateCommand{
+			GrainID:         "10001",
+			Kind:            "Player",
+			TargetNodeType:  node.NodeType,
+			TargetNodeGroup: node.NodeGroup,
+			LeaseTTL:        time.Minute,
+		})
+		allocateDone <- err
+	}()
+	<-strategy.started
+
+	if err := dir.NodeRegistry().MarkNodeInvalid(ctx, node.NodeType, node.NodeGroup, node.NodeName); err != nil {
+		t.Fatalf("MarkNodeInvalid error: %v", err)
+	}
+	if err := dir.NodeRegistry().DrainNode(ctx, node.NodeIdentity); err != nil {
+		t.Fatalf("DrainNode error: %v", err)
+	}
+	if err := dir.NodeRegistry().CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+		t.Fatalf("CompleteDrain error: %v", err)
+	}
+	close(strategy.release)
+
+	if err := <-allocateDone; !errors.Is(err, sp.ErrNoAvailableNode) {
+		t.Fatalf("concurrent Allocate err = %v, want ErrNoAvailableNode", err)
+	}
+	key, err := sp.NewGrainKey("Player", "10001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dir.Lookup(ctx, key); !errors.Is(err, sp.ErrPlacementNotFound) {
+		t.Fatalf("Lookup after rejected Allocate err = %v, want ErrPlacementNotFound", err)
+	}
+}
+
+func TestCompleteDrainValidatesSessionBeforePlacements(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := newTestDirectory(t)
+	node := registerTestNode(t, dir, "game-1", "session-a")
+	if _, err := dir.Allocate(ctx, sp.AllocateCommand{
+		GrainID:         "10001",
+		Kind:            "Player",
+		TargetNodeType:  node.NodeType,
+		TargetNodeGroup: node.NodeGroup,
+		LeaseTTL:        time.Minute,
+	}); err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+
+	if err := dir.NodeRegistry().CompleteDrain(ctx, node.NodeIdentity, "wrong-session"); !errors.Is(err, sp.ErrInvalidNodeSession) {
+		t.Fatalf("CompleteDrain wrong session err = %v, want ErrInvalidNodeSession", err)
+	}
+	if err := dir.NodeRegistry().UnregisterNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+		t.Fatalf("UnregisterNode error: %v", err)
+	}
+	if err := dir.NodeRegistry().CompleteDrain(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
+		t.Fatalf("CompleteDrain missing node err = %v, want ErrNodeNotFound", err)
 	}
 }

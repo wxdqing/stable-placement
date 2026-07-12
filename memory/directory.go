@@ -30,10 +30,12 @@ func NewDirectory(registry *NodeRegistry, mode sp.StrategyMode, strategy sp.Plac
 		strategy:   strategy,
 		publisher:  publisher,
 	}
-	registry.hasActivePlacements = func(nodeIdentity string) bool {
-		d.mu.RLock()
-		defer d.mu.RUnlock()
-		return len(d.byNode[nodeIdentity]) > 0
+	registry.completeDrain = func(nodeIdentity string, nodeSessionID string) (sp.PlacementEvent, error) {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return registry.unregisterNode(nodeIdentity, nodeSessionID, func() bool {
+			return len(d.byNode[nodeIdentity]) > 0
+		})
 	}
 	return d, nil
 }
@@ -114,8 +116,13 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 		}
 		placement.Version = existing.Version + 1
 	}
-	d.placements[key] = placement
-	d.addNodeIndexLocked(chosen.NodeIdentity, key)
+	if !d.registry.commitIfNodeAvailable(chosen, func() {
+		d.placements[key] = placement
+		d.addNodeIndexLocked(chosen.NodeIdentity, key)
+	}) {
+		d.mu.Unlock()
+		return nil, sp.ErrNoAvailableNode
+	}
 	d.mu.Unlock()
 
 	_ = d.publish(ctx, placement, sp.EventPlacementCreated)

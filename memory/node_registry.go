@@ -10,12 +10,12 @@ import (
 )
 
 type NodeRegistry struct {
-	mu                  sync.RWMutex
-	nodes               map[string]sp.Node
-	invalid             map[string]map[string]struct{}
-	publisher           sp.EventPublisher
-	heartbeatTTL        time.Duration
-	hasActivePlacements func(string) bool
+	mu            sync.RWMutex
+	nodes         map[string]sp.Node
+	invalid       map[string]map[string]struct{}
+	publisher     sp.EventPublisher
+	heartbeatTTL  time.Duration
+	completeDrain func(string, string) (sp.PlacementEvent, error)
 }
 
 func NewNodeRegistry(publisher sp.EventPublisher) *NodeRegistry {
@@ -64,15 +64,25 @@ func (r *NodeRegistry) RenewNode(_ context.Context, nodeIdentity string, nodeSes
 }
 
 func (r *NodeRegistry) UnregisterNode(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
+	event, err := r.unregisterNode(nodeIdentity, nodeSessionID, nil)
+	if err != nil {
+		return err
+	}
+	return r.publish(ctx, event)
+}
+
+func (r *NodeRegistry) unregisterNode(nodeIdentity string, nodeSessionID string, hasActivePlacements func() bool) (sp.PlacementEvent, error) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	node, ok := r.nodes[nodeIdentity]
 	if !ok {
-		r.mu.Unlock()
-		return sp.ErrNodeNotFound
+		return sp.PlacementEvent{}, sp.ErrNodeNotFound
 	}
 	if node.NodeSessionID != nodeSessionID {
-		r.mu.Unlock()
-		return sp.ErrInvalidNodeSession
+		return sp.PlacementEvent{}, sp.ErrInvalidNodeSession
+	}
+	if hasActivePlacements != nil && hasActivePlacements() {
+		return sp.PlacementEvent{}, sp.ErrNodeHasPlacements
 	}
 	delete(r.nodes, nodeIdentity)
 	event := sp.PlacementEvent{
@@ -83,8 +93,7 @@ func (r *NodeRegistry) UnregisterNode(ctx context.Context, nodeIdentity string, 
 		NodeName:     node.NodeName,
 		Time:         time.Now(),
 	}
-	r.mu.Unlock()
-	return r.publish(ctx, event)
+	return event, nil
 }
 
 func (r *NodeRegistry) ReplaceNodeSession(ctx context.Context, node sp.Node) (*sp.Node, error) {
@@ -145,10 +154,19 @@ func (r *NodeRegistry) DrainNode(ctx context.Context, nodeIdentity string) error
 }
 
 func (r *NodeRegistry) CompleteDrain(ctx context.Context, nodeIdentity string, nodeSessionID string) error {
-	if r.hasActivePlacements != nil && r.hasActivePlacements(nodeIdentity) {
-		return sp.ErrNodeHasPlacements
+	var (
+		event sp.PlacementEvent
+		err   error
+	)
+	if r.completeDrain != nil {
+		event, err = r.completeDrain(nodeIdentity, nodeSessionID)
+	} else {
+		event, err = r.unregisterNode(nodeIdentity, nodeSessionID, nil)
 	}
-	return r.UnregisterNode(ctx, nodeIdentity, nodeSessionID)
+	if err != nil {
+		return err
+	}
+	return r.publish(ctx, event)
 }
 
 func (r *NodeRegistry) ExpireHeartbeats(ctx context.Context, now time.Time) error {
@@ -255,6 +273,21 @@ func (r *NodeRegistry) Node(nodeIdentity string) (sp.Node, bool) {
 	defer r.mu.RUnlock()
 	node, ok := r.nodes[nodeIdentity]
 	return node, ok
+}
+
+func (r *NodeRegistry) commitIfNodeAvailable(chosen sp.Node, commit func()) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	node, ok := r.nodes[chosen.NodeIdentity]
+	if !ok || node.Status != sp.NodeStatusActive || node.NodeSessionID != chosen.NodeSessionID {
+		return false
+	}
+	_, invalid := r.invalid[groupKey(node.NodeType, node.NodeGroup)][node.NodeName]
+	if invalid {
+		return false
+	}
+	commit()
+	return true
 }
 
 func (r *NodeRegistry) normalizeNode(node *sp.Node) {
