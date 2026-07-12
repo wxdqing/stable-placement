@@ -47,7 +47,7 @@ func newHarnessWithNodeLeaseConfig(t *testing.T, config sp.NodeLeaseConfig) *har
 	})
 	ctx := context.Background()
 	if err := client.Ping(ctx).Err(); err != nil {
-		t.Skipf("redis %s not available: %v", addr, err)
+		t.Fatalf("redis %s unavailable: %v", addr, err)
 	}
 	dir, err := redis.NewDirectory(client, sp.StrategyModeRedisRoundRobin, config)
 	if err != nil {
@@ -158,7 +158,8 @@ func (h *harness) registerGame(name string, session string) sp.Node {
 		NodeSessionID: session,
 		Status:        sp.NodeStatusActive,
 	}
-	h.must(h.dir.RegisterNode(h.ctx, node), "RegisterNode "+name)
+	_, err = h.dir.RegisterNode(h.ctx, node)
+	h.must(err, "RegisterNode "+name)
 	h.nodes[name] = node
 	return node
 }

@@ -50,7 +50,8 @@ func TestCluster_A3_RenewNodeSessionValidation(t *testing.T) {
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	for {
-		h.must(h.dir.RenewNode(h.ctx, node.NodeIdentity, node.NodeSessionID), "RenewNode")
+		_, err := h.dir.RenewNode(h.ctx, node.NodeIdentity, node.NodeSessionID)
+		h.must(err, "RenewNode")
 		after := h.listGameNodes()[0].Lease
 		if after.Version > before.Version && after.ExpireAtUnixMilli > before.ExpireAtUnixMilli {
 			break
@@ -62,6 +63,6 @@ func TestCluster_A3_RenewNodeSessionValidation(t *testing.T) {
 	}
 
 	h.step("Then 错误 session 返回 ErrInvalidNodeSession")
-	err := h.dir.RenewNode(h.ctx, node.NodeIdentity, "wrong-session")
+	_, err := h.dir.RenewNode(h.ctx, node.NodeIdentity, "wrong-session")
 	h.mustErrIs(err, sp.ErrInvalidNodeSession, "RenewNode wrong session")
 }
