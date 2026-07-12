@@ -88,7 +88,7 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 		_, err := s.dir.Recover(s.ctx, sp.RecoverCommand{
 			GrainKey:         placement.GrainKey,
 			NewNodeIdentity:  node2.NodeIdentity,
-			PlacementVersion: placement.Version,
+			PlacementVersion: placement.Version + 1,
 			LeaseTTL:         time.Minute,
 		})
 		if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
@@ -119,7 +119,7 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 		recovered, err := s.dir.Recover(s.ctx, sp.RecoverCommand{
 			GrainKey:         placement.GrainKey,
 			NewNodeIdentity:  node2.NodeIdentity,
-			PlacementVersion: placement.Version,
+			PlacementVersion: placement.Version + 1,
 			LeaseTTL:         time.Minute,
 		})
 		if err != nil {

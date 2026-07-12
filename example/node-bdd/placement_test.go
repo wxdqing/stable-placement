@@ -138,7 +138,7 @@ func TestPlacement_D6_RecoverRejectedAfterRelease(t *testing.T) {
 	_, err := h.dir.Recover(h.ctx, sp.RecoverCommand{
 		GrainKey:         placement.GrainKey,
 		NewNodeIdentity:  node2.NodeIdentity,
-		PlacementVersion: placement.Version,
+		PlacementVersion: placement.Version + 1,
 		LeaseTTL:         time.Minute,
 	})
 	h.mustErrIs(err, sp.ErrPlacementNotRecoverable, "Recover after release")
@@ -190,7 +190,7 @@ func TestPlacement_D8_ExpireThenRecover(t *testing.T) {
 	recovered, err := h.dir.Recover(h.ctx, sp.RecoverCommand{
 		GrainKey:         placement.GrainKey,
 		NewNodeIdentity:  node2.NodeIdentity,
-		PlacementVersion: placement.Version,
+		PlacementVersion: placement.Version + 1,
 		LeaseTTL:         time.Minute,
 	})
 	h.must(err, "Recover")
