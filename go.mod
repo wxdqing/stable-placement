@@ -47,4 +47,4 @@ require (
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
 )
 
-replace github.com/asynkron/protoactor-go v0.0.0 => github.com/wxdqing/protoactor-go v0.0.0-20260713064558-10fc935c8232
+replace github.com/asynkron/protoactor-go v0.0.0 => github.com/wxdqing/protoactor-go v0.0.0-20260714124825-a6c973c2d6a1

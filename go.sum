@@ -68,8 +68,8 @@ github.com/tinylib/msgp v1.1.5/go.mod h1:eQsjooMTnV42mHu917E26IogZ2930nFyBQdofk1
 github.com/ttacon/chalk v0.0.0-20160626202418-22c06c80ed31/go.mod h1:onvgF043R+lC5RZ8IT9rBXDaEDnpnw/Cl+HFiw+v/7Q=
 github.com/twmb/murmur3 v1.1.8 h1:8Yt9taO/WN3l08xErzjeschgZU2QSrwm1kclYq+0aRg=
 github.com/twmb/murmur3 v1.1.8/go.mod h1:Qq/R7NUyOfr65zD+6Q5IHKsJLwP7exErjN6lyyq3OSQ=
-github.com/wxdqing/protoactor-go v0.0.0-20260713064558-10fc935c8232 h1:tm7o6vMLDlDPBZVH/YBF2oPTNBhrH9dYiIsj8k0YHx4=
-github.com/wxdqing/protoactor-go v0.0.0-20260713064558-10fc935c8232/go.mod h1:sU3UZJiKycCxJM1SivZNTJ689tXK7hG2YfYsU6rp374=
+github.com/wxdqing/protoactor-go v0.0.0-20260714124825-a6c973c2d6a1 h1:tubD05JIookThRJrAYR7hjf+Gg/eDFo0gv+IZImxn+Y=
+github.com/wxdqing/protoactor-go v0.0.0-20260714124825-a6c973c2d6a1/go.mod h1:sU3UZJiKycCxJM1SivZNTJ689tXK7hG2YfYsU6rp374=
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/gopher-lua v1.1.1 h1:kYKnWBjvbNP4XLT3+bPEwAXJx262OhaHDWDVOPjL46M=
 github.com/yuin/gopher-lua v1.1.1/go.mod h1:GBR0iDaNXjAgGg9zfCvksxSRnQx76gclCIb7kdAd1Pw=
