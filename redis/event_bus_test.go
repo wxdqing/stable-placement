@@ -1453,6 +1453,33 @@ func TestRedisEventBusContinuityUsesEntriesAddedForCrossMillisecondGap(t *testin
 	}
 }
 
+func TestRedisEventBusContinuityAllowsTailCreatedGroup(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	base := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	consumer, err := NewStreamConsumer(sp.Node{NodeIdentity: "game/default/game-1", NodeSessionID: "session-tail"})
+	if err != nil {
+		t.Fatalf("consumer error: %v", err)
+	}
+	bus := NewEventBus(base, consumer)
+	if err := bus.Publish(ctx, sp.PlacementEvent{Type: sp.EventManualCacheClear}); err != nil {
+		t.Fatalf("Publish error: %v", err)
+	}
+	if err := bus.EnsureConsumerGroup(ctx); err != nil {
+		t.Fatalf("EnsureConsumerGroup error: %v", err)
+	}
+	bus.client = continuityMetadataClient{
+		UniversalClient: base,
+		entriesAdded:    1,
+		entriesRead:     0,
+		lag:             0,
+	}
+
+	if err := bus.CheckContinuity(ctx); err != nil {
+		t.Fatalf("CheckContinuity error: %v", err)
+	}
+}
+
 func TestRedisEventBusContinuityAllowsSafeHistoricalTrim(t *testing.T) {
 	ctx := context.Background()
 	server := miniredis.RunT(t)

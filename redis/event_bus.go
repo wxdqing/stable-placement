@@ -432,6 +432,10 @@ func (b *EventBus) checkContinuitySnapshot(ctx context.Context, info *goredis.XI
 	if maxDeleted && compareRedisStreamID(info.MaxDeletedEntryID, consumerGroup.LastDeliveredID) > 0 {
 		return true, nil
 	}
+	if consumerGroup.Pending == 0 && consumerGroup.Lag == 0 &&
+		consumerGroup.LastDeliveredID != "" && consumerGroup.LastDeliveredID == info.LastGeneratedID {
+		return false, nil
+	}
 	if info.EntriesAdded > 0 && consumerGroup.EntriesRead >= 0 && consumerGroup.Lag >= 0 {
 		if consumerGroup.EntriesRead > info.EntriesAdded || consumerGroup.Lag > info.EntriesAdded-consumerGroup.EntriesRead {
 			return true, nil
