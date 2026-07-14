@@ -38,3 +38,11 @@ func TestCommandTypesCarryOwnerSessionAndVersions(t *testing.T) {
 		t.Fatalf("release command owner mismatch: %+v", release)
 	}
 }
+
+func TestRenewNodeCommandCarriesOptionalMetrics(t *testing.T) {
+	metrics := NodeMetrics{CPUAvailableMilliCores: 250, MemoryAvailableBytes: 512 << 20, Goroutines: 4}
+	cmd := RenewNodeCommand{NodeIdentity: "game/default/game-1", NodeSessionID: "session-a", Metrics: &metrics}
+	if cmd.NodeIdentity == "" || cmd.NodeSessionID == "" || cmd.Metrics == nil || *cmd.Metrics != metrics {
+		t.Fatalf("renew node command = %+v", cmd)
+	}
+}

@@ -60,3 +60,21 @@ func TestNodeLeaseAndPlacementRouteContracts(t *testing.T) {
 		t.Fatalf("unexpected placement route: %+v", route)
 	}
 }
+
+func TestNodeMetricsSurviveNodeCopy(t *testing.T) {
+	want := NodeMetrics{CPUAvailableMilliCores: 500, MemoryAvailableBytes: 1 << 30, Goroutines: 8, UpdatedAtUnixMilli: 1234}
+	node := Node{Metrics: want}
+	copied := node
+	if copied.Metrics != want {
+		t.Fatalf("node metrics = %+v, want %+v", copied.Metrics, want)
+	}
+}
+
+func TestValidateNodeMetricsRejectsNegativeCollectedValues(t *testing.T) {
+	if err := ValidateNodeMetrics(NodeMetrics{CPUAvailableMilliCores: 1, MemoryAvailableBytes: 1, Goroutines: 1, UpdatedAtUnixMilli: -1}); err != nil {
+		t.Fatalf("registry-owned timestamp should be ignored: %v", err)
+	}
+	if err := ValidateNodeMetrics(NodeMetrics{MemoryAvailableBytes: -1}); !errors.Is(err, ErrPlacementConfigInvalid) {
+		t.Fatalf("negative metrics error = %v", err)
+	}
+}

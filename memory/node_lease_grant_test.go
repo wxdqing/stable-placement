@@ -24,7 +24,7 @@ func TestNodeRegistryReturnsConservativeLeaseGrants(t *testing.T) {
 	}
 
 	clock.Advance(time.Second)
-	renewed, err := registry.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID)
+	renewed, err := registry.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID})
 	if err != nil {
 		t.Fatalf("RenewNode: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestNodeRegistryReturnsConservativeLeaseGrants(t *testing.T) {
 		t.Fatalf("replace old=%+v grant=%+v", old, replaced)
 	}
 
-	bad, err := registry.RenewNode(ctx, node.NodeIdentity, "old-session")
+	bad, err := registry.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: "old-session"})
 	if err == nil || bad != (sp.NodeLeaseGrant{}) {
 		t.Fatalf("failed renew grant=%+v err=%v", bad, err)
 	}

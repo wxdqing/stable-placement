@@ -4,7 +4,7 @@ import "context"
 
 type NodeRegistry interface {
 	RegisterNode(ctx context.Context, node Node) (NodeLeaseGrant, error)
-	RenewNode(ctx context.Context, nodeIdentity string, nodeSessionID string) (NodeLeaseGrant, error)
+	RenewNode(ctx context.Context, cmd RenewNodeCommand) (NodeLeaseGrant, error)
 	ExpireNodeLeases(ctx context.Context, nodeType string, nodeGroup string, limit int64) (int, error)
 	UnregisterNode(ctx context.Context, nodeIdentity string, nodeSessionID string) error
 	ReplaceNodeSession(ctx context.Context, node Node) (*Node, NodeLeaseGrant, error)

@@ -83,12 +83,59 @@ func TestRedisDirectoryRegisterAndRenewNodeLease(t *testing.T) {
 		t.Fatalf("register renewed lease: %+v", got.Lease)
 	}
 	server.SetTime(time.UnixMilli(100001))
-	if _, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+	if _, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID}); err != nil {
 		t.Fatal(err)
 	}
 	renewed := readNode(t, ctx, dir, node.NodeIdentity)
 	if renewed.Lease.Version != 2 || renewed.Lease.TTLMillis != 2 || renewed.Lease.ExpireAtUnixMilli != 100003 {
 		t.Fatalf("renewed = %+v", renewed)
+	}
+}
+
+func TestRedisDirectoryRenewMetricsAtomically(t *testing.T) {
+	ctx := context.Background()
+	dir, _, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: 10 * time.Second})
+	server.SetTime(time.Unix(150, 0))
+	node := testNode("game-1", "session-a")
+	node.Metrics = sp.NodeMetrics{CPUAvailableMilliCores: 999, UpdatedAtUnixMilli: 1}
+	if _, err := dir.RegisterNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	if got := readNode(t, ctx, dir, node.NodeIdentity); got.Metrics != (sp.NodeMetrics{}) {
+		t.Fatalf("register accepted untrusted metrics: %+v", got.Metrics)
+	}
+
+	metrics := sp.NodeMetrics{CPUAvailableMilliCores: 500, MemoryAvailableBytes: 1 << 30, Goroutines: 20, UpdatedAtUnixMilli: 1}
+	server.SetTime(time.UnixMilli(151234))
+	if _, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, Metrics: &metrics}); err != nil {
+		t.Fatal(err)
+	}
+	withMetrics := readNode(t, ctx, dir, node.NodeIdentity)
+	if withMetrics.Metrics.CPUAvailableMilliCores != 500 || withMetrics.Metrics.MemoryAvailableBytes != 1<<30 || withMetrics.Metrics.Goroutines != 20 || withMetrics.Metrics.UpdatedAtUnixMilli != 151234 {
+		t.Fatalf("renewed metrics = %+v", withMetrics.Metrics)
+	}
+
+	server.SetTime(time.UnixMilli(152000))
+	if _, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID}); err != nil {
+		t.Fatal(err)
+	}
+	withoutMetrics := readNode(t, ctx, dir, node.NodeIdentity)
+	if withoutMetrics.Metrics != withMetrics.Metrics || withoutMetrics.Lease.Version != withMetrics.Lease.Version+1 {
+		t.Fatalf("nil-metrics renew = %+v", withoutMetrics)
+	}
+
+	before := withoutMetrics
+	bad := sp.NodeMetrics{MemoryAvailableBytes: -1}
+	for _, cmd := range []sp.RenewNodeCommand{
+		{NodeIdentity: node.NodeIdentity, NodeSessionID: "old-session", Metrics: &bad},
+		{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, Metrics: &bad},
+	} {
+		if _, err := dir.RenewNode(ctx, cmd); err == nil {
+			t.Fatalf("RenewNode(%+v) succeeded", cmd)
+		}
+		if after := readNode(t, ctx, dir, node.NodeIdentity); after != before {
+			t.Fatalf("failed renew changed node: before=%+v after=%+v", before, after)
+		}
 	}
 }
 
@@ -105,7 +152,7 @@ func TestRedisDirectoryRenewUsesPersistedTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.SetTime(time.UnixMilli(201000))
-	if _, err := other.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+	if _, err := other.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID}); err != nil {
 		t.Fatal(err)
 	}
 	got := readNode(t, ctx, other, node.NodeIdentity)
@@ -122,11 +169,11 @@ func TestRedisDirectoryRenewRejectsExpiredOfflineAndOldSession(t *testing.T) {
 	if _, err := dir.RegisterNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dir.RenewNode(ctx, node.NodeIdentity, "old"); !errors.Is(err, sp.ErrInvalidNodeSession) {
+	if _, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: "old"}); !errors.Is(err, sp.ErrInvalidNodeSession) {
 		t.Fatalf("old session: %v", err)
 	}
 	server.SetTime(time.Unix(301, 0))
-	if _, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeLeaseExpired) {
+	if _, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID}); !errors.Is(err, sp.ErrNodeLeaseExpired) {
 		t.Fatalf("expired: %v", err)
 	}
 	raw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
@@ -137,7 +184,7 @@ func TestRedisDirectoryRenewRejectsExpiredOfflineAndOldSession(t *testing.T) {
 	stored.Status = sp.NodeStatusOffline
 	b, _ := json.Marshal(stored)
 	client.Set(ctx, NodeKey(node.NodeIdentity), b, 0)
-	if _, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
+	if _, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID}); !errors.Is(err, sp.ErrNodeNotFound) {
 		t.Fatalf("offline: %v", err)
 	}
 }
@@ -230,7 +277,7 @@ func TestExpiredOfflineNodeTombstoneLifecycle(t *testing.T) {
 	t.Run("renew reports offline backend error", func(t *testing.T) {
 		dir, client, node, _ := setup(t, false)
 		before := snapshotRedisKeysV2(t, client, keys(node)...)
-		if _, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeNotFound) {
+		if _, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID}); !errors.Is(err, sp.ErrNodeNotFound) {
 			t.Fatalf("RenewNode err = %v", err)
 		}
 		requireRedisSnapshotV2(t, snapshotRedisKeysV2(t, client, keys(node)...), before)
@@ -311,7 +358,7 @@ func TestRedisNodeLifecycleLeaseScoreRulesAreAtomic(t *testing.T) {
 			return err
 		}},
 		{name: "renew", run: func(ctx context.Context, dir *Directory, node sp.Node) error {
-			_, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID)
+			_, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID})
 			return err
 		}},
 		{name: "replace", run: func(ctx context.Context, dir *Directory, node sp.Node) error {
@@ -465,10 +512,10 @@ func TestRedisDirectoryRegisterCannotBypassReplaceSessionEvent(t *testing.T) {
 	if stored.NodeSessionID != next.NodeSessionID || stored.Lease.Version != 1 {
 		t.Fatalf("replacement = %+v", stored)
 	}
-	if _, err := dir.RenewNode(ctx, next.NodeIdentity, old.NodeSessionID); !errors.Is(err, sp.ErrInvalidNodeSession) {
+	if _, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: next.NodeIdentity, NodeSessionID: old.NodeSessionID}); !errors.Is(err, sp.ErrInvalidNodeSession) {
 		t.Fatalf("old-session RenewNode err = %v", err)
 	}
-	if _, err := dir.RenewNode(ctx, next.NodeIdentity, next.NodeSessionID); err != nil {
+	if _, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: next.NodeIdentity, NodeSessionID: next.NodeSessionID}); err != nil {
 		t.Fatalf("new-session RenewNode err = %v", err)
 	}
 	events := client.XRange(ctx, EventsStreamKey(), "-", "+").Val()
@@ -496,7 +543,7 @@ func TestExpireNodeLeasesStaleCandidateDoesNotExpireRenewedLease(t *testing.T) {
 	hooked, err := NewDirectory(nodeLeaseEvalHookClient{UniversalClient: client, before: func(script string) {
 		if armed && script == expireNodeLeaseLua {
 			armed = false
-			if _, err := base.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err != nil {
+			if _, err := base.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID}); err != nil {
 				t.Fatalf("concurrent renew: %v", err)
 			}
 		}
@@ -577,7 +624,7 @@ func TestRedisDirectoryRenewNodeRejectsUnknownStatusWithoutMutation(t *testing.T
 	changed, _ := json.Marshal(stored)
 	client.Set(ctx, NodeKey(node.NodeIdentity), changed, 0)
 	before := captureLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity)
-	if _, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID); err == nil {
+	if _, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID}); err == nil {
 		t.Fatal("expected unknown status error")
 	}
 	requireLeaseBatchSnapshot(t, ctx, client, node.NodeIdentity, before)

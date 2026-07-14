@@ -1,6 +1,9 @@
 package stableplacement
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 type NodeStatus string
 
@@ -35,6 +38,20 @@ type NodeLeaseGrant struct {
 	ValidUntil time.Time
 }
 
+type NodeMetrics struct {
+	CPUAvailableMilliCores int64
+	MemoryAvailableBytes   int64
+	Goroutines             int64
+	UpdatedAtUnixMilli     int64
+}
+
+func ValidateNodeMetrics(metrics NodeMetrics) error {
+	if metrics.CPUAvailableMilliCores < 0 || metrics.MemoryAvailableBytes < 0 || metrics.Goroutines < 0 {
+		return fmt.Errorf("%w: node metrics must not be negative", ErrPlacementConfigInvalid)
+	}
+	return nil
+}
+
 func DefaultNodeLeaseConfig() NodeLeaseConfig {
 	return NodeLeaseConfig{TTL: time.Minute}
 }
@@ -65,8 +82,8 @@ type Node struct {
 	Address string
 	// Weight 是分配权重，供策略使用。
 	Weight int
-	// Load 是节点当前负载，供策略或观测使用。
-	Load int
+	// Metrics is the latest resource snapshot accepted during lease renewal.
+	Metrics NodeMetrics
 	// Status 是节点状态。
 	Status NodeStatus
 	// Lease 是当前 NodeSession 的租约。

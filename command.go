@@ -18,6 +18,12 @@ type ResolveRouteCommand struct {
 	TargetNodeGroup string
 }
 
+type RenewNodeCommand struct {
+	NodeIdentity  string
+	NodeSessionID string
+	Metrics       *NodeMetrics
+}
+
 type RenewCommand struct {
 	// GrainKey 唯一标识要续约的 Grain。
 	GrainKey GrainKey

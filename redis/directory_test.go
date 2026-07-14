@@ -85,6 +85,18 @@ func TestRedisNodeLeaseConfigRejectsNonPositiveTTLAndDefaultsToMinute(t *testing
 	}
 }
 
+func TestRedisDirectoryAcceptsResourceAwareMode(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: server.Addr()})
+	defer client.Close()
+	if _, err := NewDirectory(client, sp.StrategyModeRedisResourceAware, sp.NodeLeaseConfig{TTL: time.Second}); err != nil {
+		t.Fatalf("NewDirectory resource-aware mode: %v", err)
+	}
+	if _, err := NewDirectory(client, sp.StrategyMode("unknown"), sp.NodeLeaseConfig{TTL: time.Second}); !errors.Is(err, sp.ErrUnsupportedStrategyMode) {
+		t.Fatalf("unknown mode error = %v", err)
+	}
+}
+
 func readNode(t *testing.T, ctx context.Context, directory *Directory, identity string) sp.Node {
 	t.Helper()
 	nodes, err := directory.FindNodes(ctx, "game", "default")

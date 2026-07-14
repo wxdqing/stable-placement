@@ -157,7 +157,7 @@ func (d *Directory) chooseTargetLocked(ctx context.Context, cmd sp.ResolveRouteC
 	}
 	chosen, err := d.strategy.Choose(ctx, sp.StrategyInput{
 		GrainID: cmd.GrainID, Kind: cmd.Kind, NodeType: cmd.TargetNodeType,
-		NodeGroup: cmd.TargetNodeGroup, EffectiveNodes: nodes,
+		NodeGroup: cmd.TargetNodeGroup, EffectiveNodes: nodes, PlacementCounts: d.placementCountsLocked(nodes),
 	})
 	if err != nil {
 		return sp.Node{}, err
@@ -192,12 +192,12 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 	if placement, found, err := d.existingAllocation(key); found || err != nil {
 		return placement, err
 	}
-	nodes := d.effectiveNodes(cmd.TargetNodeType, cmd.TargetNodeGroup)
+	nodes, placementCounts := d.effectiveNodes(cmd.TargetNodeType, cmd.TargetNodeGroup)
 	if len(nodes) == 0 {
 		return nil, sp.ErrNoAvailableNode
 	}
 	chosen, err := d.strategy.Choose(ctx, sp.StrategyInput{
-		GrainID: cmd.GrainID, Kind: cmd.Kind, NodeType: cmd.TargetNodeType, NodeGroup: cmd.TargetNodeGroup, EffectiveNodes: nodes,
+		GrainID: cmd.GrainID, Kind: cmd.Kind, NodeType: cmd.TargetNodeType, NodeGroup: cmd.TargetNodeGroup, EffectiveNodes: nodes, PlacementCounts: placementCounts,
 	})
 	if err != nil {
 		return nil, err
@@ -463,7 +463,9 @@ func (d *Directory) existingAllocation(key sp.GrainKey) (*sp.Placement, bool, er
 	return copyPlacement(placement), true, nil
 }
 
-func (d *Directory) effectiveNodes(nodeType, nodeGroup string) []sp.Node {
+func (d *Directory) effectiveNodes(nodeType, nodeGroup string) ([]sp.Node, map[string]int) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	d.registry.mu.RLock()
 	defer d.registry.mu.RUnlock()
 	now := d.registry.now()
@@ -474,7 +476,15 @@ func (d *Directory) effectiveNodes(nodeType, nodeGroup string) []sp.Node {
 		}
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].NodeIdentity < nodes[j].NodeIdentity })
-	return nodes
+	return nodes, d.placementCountsLocked(nodes)
+}
+
+func (d *Directory) placementCountsLocked(nodes []sp.Node) map[string]int {
+	counts := make(map[string]int, len(nodes))
+	for _, node := range nodes {
+		counts[node.NodeIdentity] = len(d.byNode[node.NodeIdentity])
+	}
+	return counts
 }
 
 func (d *Directory) placementRouteableLocked(placement sp.Placement, now time.Time) bool {

@@ -49,6 +49,7 @@ func (r *NodeRegistry) RegisterNode(ctx context.Context, node sp.Node) (sp.NodeL
 	if err := normalizeNodeIdentity(&node); err != nil {
 		return sp.NodeLeaseGrant{}, err
 	}
+	node.Metrics = sp.NodeMetrics{}
 	now := r.now()
 	r.mu.Lock()
 	if existing, ok := r.nodes[node.NodeIdentity]; ok {
@@ -74,26 +75,35 @@ func (r *NodeRegistry) RegisterNode(ctx context.Context, node sp.Node) (sp.NodeL
 	return leaseGrant(node, now), nil
 }
 
-func (r *NodeRegistry) RenewNode(_ context.Context, nodeIdentity string, nodeSessionID string) (sp.NodeLeaseGrant, error) {
+func (r *NodeRegistry) RenewNode(_ context.Context, cmd sp.RenewNodeCommand) (sp.NodeLeaseGrant, error) {
 	now := r.now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	node, ok := r.nodes[nodeIdentity]
+	node, ok := r.nodes[cmd.NodeIdentity]
 	if !ok || node.Status == sp.NodeStatusOffline {
 		return sp.NodeLeaseGrant{}, sp.ErrNodeNotFound
 	}
-	if node.NodeSessionID != nodeSessionID {
+	if node.NodeSessionID != cmd.NodeSessionID {
 		return sp.NodeLeaseGrant{}, sp.ErrInvalidNodeSession
 	}
 	if leaseExpired(node, now) {
 		return sp.NodeLeaseGrant{}, sp.ErrNodeLeaseExpired
+	}
+	if cmd.Metrics != nil {
+		if err := sp.ValidateNodeMetrics(*cmd.Metrics); err != nil {
+			return sp.NodeLeaseGrant{}, err
+		}
 	}
 	node.Lease.Version++
 	newExpiry := now.Add(time.Duration(node.Lease.TTLMillis) * time.Millisecond).UnixMilli()
 	if newExpiry > node.Lease.ExpireAtUnixMilli {
 		node.Lease.ExpireAtUnixMilli = newExpiry
 	}
-	r.nodes[nodeIdentity] = node
+	if cmd.Metrics != nil {
+		node.Metrics = *cmd.Metrics
+		node.Metrics.UpdatedAtUnixMilli = now.UnixMilli()
+	}
+	r.nodes[cmd.NodeIdentity] = node
 	return leaseGrant(node, now), nil
 }
 
@@ -126,6 +136,7 @@ func (r *NodeRegistry) ReplaceNodeSession(ctx context.Context, node sp.Node) (*s
 	if err := normalizeNodeIdentity(&node); err != nil {
 		return nil, sp.NodeLeaseGrant{}, err
 	}
+	node.Metrics = sp.NodeMetrics{}
 	now := r.now()
 	r.mu.Lock()
 	old, ok := r.nodes[node.NodeIdentity]

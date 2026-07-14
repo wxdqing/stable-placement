@@ -502,7 +502,7 @@ func TestDirectoryConcurrentOperationsFollowDirectoryThenRegistryLockOrder(t *te
 }
 
 func registryRenew(registry *NodeRegistry, node sp.Node) error {
-	_, err := registry.RenewNode(context.Background(), node.NodeIdentity, node.NodeSessionID)
+	_, err := registry.RenewNode(context.Background(), sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID})
 	return err
 }
 

@@ -28,6 +28,45 @@ local function decimal_mod(value,divisor)
   for index=1,#value do remainder=(remainder*10+tonumber(string.sub(value,index,index)))%divisor end
   return remainder
 end
+local function valid_metric_number(value)
+  return type(value)=="number" and value==value and value>=0 and value<=9007199254740991
+end
+local function choose_candidate(candidates, round_robin, mode, now, max_age, min_memory, min_cpu, max_goroutines)
+  if mode=="redis_round_robin" then return candidates[decimal_mod(round_robin,#candidates)+1] end
+  if mode~="redis_resource_aware" then return nil end
+  local best={}
+  local best_memory=nil
+  local best_cpu=nil
+  local best_goroutines=nil
+  local best_placements=nil
+  for _,candidate in ipairs(candidates) do
+    local metrics=candidate.node["Metrics"]
+    if type(metrics)=="table" then
+      local memory=metrics["MemoryAvailableBytes"]
+      local cpu=metrics["CPUAvailableMilliCores"]
+      local goroutines=metrics["Goroutines"]
+      local updated=metrics["UpdatedAtUnixMilli"]
+      if valid_metric_number(memory) and valid_metric_number(cpu) and valid_metric_number(goroutines) and valid_metric_number(updated) and updated>0 and updated<=now and now-updated<=max_age and memory>=min_memory and cpu>=min_cpu and (max_goroutines==0 or goroutines<=max_goroutines) then
+        local memory_bucket=math.floor(memory/268435456)
+        local cpu_bucket=math.floor(cpu/100)
+        local goroutine_bucket=math.floor(goroutines/100)
+        local placements=redis.call("ZCARD",candidate.node["PlacementNodeKey"])
+        local better=best_memory==nil or memory_bucket>best_memory or
+          (memory_bucket==best_memory and cpu_bucket>best_cpu) or
+          (memory_bucket==best_memory and cpu_bucket==best_cpu and goroutine_bucket<best_goroutines) or
+          (memory_bucket==best_memory and cpu_bucket==best_cpu and goroutine_bucket==best_goroutines and placements<best_placements)
+        local tied=best_memory~=nil and memory_bucket==best_memory and cpu_bucket==best_cpu and goroutine_bucket==best_goroutines and placements==best_placements
+        if better then
+          best={candidate};best_memory=memory_bucket;best_cpu=cpu_bucket;best_goroutines=goroutine_bucket;best_placements=placements
+        elseif tied then
+          table.insert(best,candidate)
+        end
+      end
+    end
+  end
+  if #best==0 then return nil end
+  return best[decimal_mod(round_robin,#best)+1]
+end
 local function event(stream, kind, grain, node, session, placement_version, lease_version)
   redis.call("XADD", stream, "*", "type", kind, "grain_key", grain or "", "node_identity", node or "", "node_session_id", session or "", "node_type", "", "node_group", "", "node_name", "", "placement_version", placement_version or "0", "node_lease_version", lease_version or "0")
 end
@@ -70,6 +109,7 @@ if node["Status"]=="offline" then if score and tonumber(score)~=tonumber(node["L
 if node["Status"]~="active" and node["Status"]~="draining" then return redis.error_reply("INVALID_NODE_STATUS") end
 if not score or tonumber(score)~=tonumber(node["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end
 local now=now_millis();if tonumber(node["Lease"]["ExpireAtUnixMilli"] or 0)<=now then return "node_lease_expired" end
+if ARGV[3]~="" then local metrics,me=decode(ARGV[3],"metrics");if me then return me end;if not valid_metric_number(metrics["CPUAvailableMilliCores"]) or not valid_metric_number(metrics["MemoryAvailableBytes"]) or not valid_metric_number(metrics["Goroutines"]) then return "invalid_metrics" end;metrics["UpdatedAtUnixMilli"]=now;node["Metrics"]=metrics end
 node["Lease"]["Version"]=tonumber(node["Lease"]["Version"])+1
 local expiry=now+tonumber(node["Lease"]["TTLMillis"]);if expiry<tonumber(score) then expiry=tonumber(score) end
 node["Lease"]["ExpireAtUnixMilli"]=expiry
@@ -138,7 +178,7 @@ local node_keys=redis.call("SMEMBERS",KEYS[2]);table.sort(node_keys);local candi
 for _,key in ipairs(node_keys) do local te=expect_type(key,"string","candidate_node");if te then return te end;local nr=redis.call("GET",key);local n,ne=decode(nr,"candidate_node");if ne then return ne end;if n then local index_error=expect_type(n["PlacementNodeKey"],"zset","candidate_index");if index_error then return index_error end;local score=redis.call("ZSCORE",KEYS[5],key);if n["NodeKey"]==key and n["NodeType"]==ARGV[6] and n["NodeGroup"]==ARGV[7] and n["Status"]=="active" and redis.call("SISMEMBER",KEYS[3],n["NodeName"])==0 and score and tonumber(score)==tonumber(n["Lease"]["ExpireAtUnixMilli"] or -1) and tonumber(score)>now then table.insert(candidates,{key=key,node=n}) end end end
 if #candidates==0 then return "no_available_node" end
 local rr,re=read_counter(KEYS[4],"round_robin","9223372036854775807");if re then return re end;local seq,se=read_counter(KEYS[6],"sequence","9007199254740991");if se then return se end
-local chosen=candidates[decimal_mod(rr,#candidates)+1];local version=existing and tonumber(existing["Version"])+1 or 1;local p={GrainID=ARGV[1],Kind=ARGV[2],GrainKey=ARGV[3],NodeIdentity=chosen.node["NodeIdentity"],OwnerNodeSessionID=chosen.node["NodeSessionID"],Version=version,Status="active",CreateTimeUnixMilli=now,UpdateTimeUnixMilli=now};local encoded=cjson.encode(p)
+local chosen=choose_candidate(candidates,rr,ARGV[8],now,tonumber(ARGV[9]),tonumber(ARGV[10]),tonumber(ARGV[11]),tonumber(ARGV[12]));if not chosen then return "no_available_node" end;local version=existing and tonumber(existing["Version"])+1 or 1;local p={GrainID=ARGV[1],Kind=ARGV[2],GrainKey=ARGV[3],NodeIdentity=chosen.node["NodeIdentity"],OwnerNodeSessionID=chosen.node["NodeSessionID"],Version=version,Status="active",CreateTimeUnixMilli=now,UpdateTimeUnixMilli=now};local encoded=cjson.encode(p)
 redis.call("INCR",KEYS[4]);local nextseq=redis.call("INCR",KEYS[6]);if existing then redis.call("ZREM",KEYS[8],ARGV[3]) end;redis.call("SET",KEYS[1],encoded);redis.call("ZADD",chosen.node["PlacementNodeKey"],nextseq,ARGV[3]);event(KEYS[7],ARGV[5],ARGV[3],chosen.node["NodeIdentity"],chosen.node["NodeSessionID"],tostring(version),"0");return encoded
 `
 
@@ -173,7 +213,7 @@ end
 if #candidates==0 then return "no_available_node" end
 local rr,re=read_counter(KEYS[4],"round_robin","9223372036854775807");if re then return re end
 local seq,se=read_counter(KEYS[6],"sequence","9007199254740991");if se then return se end
-local chosen=candidates[decimal_mod(rr,#candidates)+1]
+local chosen=choose_candidate(candidates,rr,ARGV[12],now,tonumber(ARGV[13]),tonumber(ARGV[14]),tonumber(ARGV[15]),tonumber(ARGV[16]));if not chosen then return "no_available_node" end
 local recovering=existing and existing["Status"]=="active"
 local version=existing and tonumber(existing["Version"])+1 or 1
 local p

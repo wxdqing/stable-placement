@@ -18,11 +18,11 @@ func TestRedisDirectoryReturnsNodeLeaseGrants(t *testing.T) {
 	if err != nil || registered.Version != 1 || registered.ValidUntil.IsZero() {
 		t.Fatalf("RegisterNode grant=%+v err=%v", registered, err)
 	}
-	renewed, err := dir.RenewNode(ctx, node.NodeIdentity, node.NodeSessionID)
+	renewed, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID})
 	if err != nil || renewed.Version != 2 || renewed.ValidUntil.IsZero() {
 		t.Fatalf("RenewNode grant=%+v err=%v", renewed, err)
 	}
-	bad, err := dir.RenewNode(ctx, node.NodeIdentity, "old-session")
+	bad, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: node.NodeIdentity, NodeSessionID: "old-session"})
 	if err == nil || bad != (sp.NodeLeaseGrant{}) {
 		t.Fatalf("failed RenewNode grant=%+v err=%v", bad, err)
 	}

@@ -360,7 +360,7 @@ func TestRedisDirectoryTransferAndRecoverUseCurrentTargetSession(t *testing.T) {
 		t.Fatalf("healthy recover = %v", err)
 	}
 	server.SetTime(time.UnixMilli(700500))
-	if _, err := dir.RenewNode(ctx, p.NodeIdentity, p.OwnerNodeSessionID); err != nil {
+	if _, err := dir.RenewNode(ctx, sp.RenewNodeCommand{NodeIdentity: p.NodeIdentity, NodeSessionID: p.OwnerNodeSessionID}); err != nil {
 		t.Fatal(err)
 	}
 	server.SetTime(time.Unix(701, 0))

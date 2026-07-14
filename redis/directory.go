@@ -16,9 +16,10 @@ import (
 )
 
 type Directory struct {
-	client goredis.UniversalClient
-	mode   sp.StrategyMode
-	config sp.NodeLeaseConfig
+	client         goredis.UniversalClient
+	mode           sp.StrategyMode
+	config         sp.NodeLeaseConfig
+	resourceConfig sp.ResourceAwareConfig
 }
 
 type redisNode struct {
@@ -59,12 +60,23 @@ func (placement redisPlacement) placement() sp.Placement {
 
 const maxPlacementIndexScore = int64(1<<53 - 1)
 
-func NewDirectory(client goredis.UniversalClient, mode sp.StrategyMode, config sp.NodeLeaseConfig) (*Directory, error) {
-	if mode != sp.StrategyModeRedisRoundRobin {
+func NewDirectory(client goredis.UniversalClient, mode sp.StrategyMode, config sp.NodeLeaseConfig, resourceConfigs ...sp.ResourceAwareConfig) (*Directory, error) {
+	if mode != sp.StrategyModeRedisRoundRobin && mode != sp.StrategyModeRedisResourceAware {
 		return nil, sp.ErrUnsupportedStrategyMode
 	}
 	if config.TTL <= 0 {
 		return nil, sp.ErrInvalidNodeLeaseTTL
+	}
+	if len(resourceConfigs) > 1 {
+		return nil, fmt.Errorf("%w: multiple resource-aware configs", sp.ErrPlacementConfigInvalid)
+	}
+	resourceConfig := sp.ResourceAwareConfig{}
+	if len(resourceConfigs) == 1 {
+		resourceConfig = resourceConfigs[0]
+	}
+	resourceConfig, err := sp.NormalizeResourceAwareConfig(resourceConfig)
+	if err != nil {
+		return nil, err
 	}
 	ttlMillis := config.TTL.Milliseconds()
 	maxTTLMillis := time.Duration(1<<63 - 1).Milliseconds()
@@ -75,13 +87,14 @@ func NewDirectory(client goredis.UniversalClient, mode sp.StrategyMode, config s
 		ttlMillis = 1
 	}
 	config.TTL = time.Duration(ttlMillis) * time.Millisecond
-	return &Directory{client: client, mode: mode, config: config}, nil
+	return &Directory{client: client, mode: mode, config: config, resourceConfig: resourceConfig}, nil
 }
 
 func (d *Directory) RegisterNode(ctx context.Context, node sp.Node) (sp.NodeLeaseGrant, error) {
 	if err := normalizeNode(&node); err != nil {
 		return sp.NodeLeaseGrant{}, err
 	}
+	node.Metrics = sp.NodeMetrics{}
 	encoded, err := json.Marshal(redisNode{Node: node, PlacementNodeKey: PlacementNodeKey(node.NodeIdentity), NodeKey: NodeKey(node.NodeIdentity)})
 	if err != nil {
 		return sp.NodeLeaseGrant{}, err
@@ -94,13 +107,21 @@ func (d *Directory) RegisterNode(ctx context.Context, node sp.Node) (sp.NodeLeas
 	return nodeLeaseGrantResult(requestStart, result, 1, 2)
 }
 
-func (d *Directory) RenewNode(ctx context.Context, identity, session string) (sp.NodeLeaseGrant, error) {
-	node, err := d.getNode(ctx, identity)
+func (d *Directory) RenewNode(ctx context.Context, cmd sp.RenewNodeCommand) (sp.NodeLeaseGrant, error) {
+	metricsJSON := ""
+	if cmd.Metrics != nil {
+		encoded, err := json.Marshal(cmd.Metrics)
+		if err != nil {
+			return sp.NodeLeaseGrant{}, err
+		}
+		metricsJSON = string(encoded)
+	}
+	node, err := d.getNode(ctx, cmd.NodeIdentity)
 	if err != nil {
 		return sp.NodeLeaseGrant{}, err
 	}
 	requestStart := time.Now()
-	result, err := d.client.Eval(ctx, renewNodeLua, []string{NodeKey(identity), NodeLeaseKey(node.NodeType, node.NodeGroup)}, session, NodeKey(identity)).Result()
+	result, err := d.client.Eval(ctx, renewNodeLua, []string{NodeKey(cmd.NodeIdentity), NodeLeaseKey(node.NodeType, node.NodeGroup)}, cmd.NodeSessionID, NodeKey(cmd.NodeIdentity), metricsJSON).Result()
 	if err != nil {
 		return sp.NodeLeaseGrant{}, err
 	}
@@ -111,6 +132,7 @@ func (d *Directory) ReplaceNodeSession(ctx context.Context, node sp.Node) (*sp.N
 	if err := normalizeNode(&node); err != nil {
 		return nil, sp.NodeLeaseGrant{}, err
 	}
+	node.Metrics = sp.NodeMetrics{}
 	encoded, err := json.Marshal(redisNode{Node: node, PlacementNodeKey: PlacementNodeKey(node.NodeIdentity), NodeKey: NodeKey(node.NodeIdentity)})
 	if err != nil {
 		return nil, sp.NodeLeaseGrant{}, err
@@ -317,14 +339,18 @@ func (d *Directory) resolveRouteOnce(ctx context.Context, key sp.GrainKey, cmd s
 		return nil, err
 	}
 	requestStart := time.Now()
+	args := []interface{}{
+		cmd.GrainID, cmd.Kind, key.String(), oldRaw, string(sp.EventPlacementCreated),
+		cmd.TargetNodeType, cmd.TargetNodeGroup, string(sp.EventPlacementRecovered),
+		ownerType, ownerGroup, ownerName,
+	}
+	args = append(args, d.resourceStrategyArgs()...)
 	result, err := d.client.Eval(ctx, resolveRouteLua, []string{
 		PlacementKey(key), NodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup),
 		InvalidNodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup), StrategyRoundRobinKey(cmd.TargetNodeType, cmd.TargetNodeGroup),
 		NodeLeaseKey(cmd.TargetNodeType, cmd.TargetNodeGroup), SequenceKey(), EventsStreamKey(),
 		oldIndex, oldNode, ownerLease,
-	}, cmd.GrainID, cmd.Kind, key.String(), oldRaw, string(sp.EventPlacementCreated),
-		cmd.TargetNodeType, cmd.TargetNodeGroup, string(sp.EventPlacementRecovered),
-		ownerType, ownerGroup, ownerName).Result()
+	}, args...).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -395,7 +421,9 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 		id := sp.NodeIdentity(oldNodeIdentity(oldNode, oldRaw))
 		ownerLease = NodeLeaseKey(id.NodeType(), id.NodeGroup())
 	}
-	result, err := d.client.Eval(ctx, allocateLua, []string{PlacementKey(key), NodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup), InvalidNodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup), StrategyRoundRobinKey(cmd.TargetNodeType, cmd.TargetNodeGroup), NodeLeaseKey(cmd.TargetNodeType, cmd.TargetNodeGroup), SequenceKey(), EventsStreamKey(), oldIndex, oldNode, ownerLease}, cmd.GrainID, cmd.Kind, key.String(), oldRaw, string(sp.EventPlacementCreated), cmd.TargetNodeType, cmd.TargetNodeGroup).Result()
+	args := []interface{}{cmd.GrainID, cmd.Kind, key.String(), oldRaw, string(sp.EventPlacementCreated), cmd.TargetNodeType, cmd.TargetNodeGroup}
+	args = append(args, d.resourceStrategyArgs()...)
+	result, err := d.client.Eval(ctx, allocateLua, []string{PlacementKey(key), NodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup), InvalidNodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup), StrategyRoundRobinKey(cmd.TargetNodeType, cmd.TargetNodeGroup), NodeLeaseKey(cmd.TargetNodeType, cmd.TargetNodeGroup), SequenceKey(), EventsStreamKey(), oldIndex, oldNode, ownerLease}, args...).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -410,6 +438,16 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 		}
 	}
 	return decodePlacement(result)
+}
+
+func (d *Directory) resourceStrategyArgs() []interface{} {
+	return []interface{}{
+		string(d.mode),
+		strconv.FormatInt(d.resourceConfig.MetricsMaxAge.Milliseconds(), 10),
+		strconv.FormatInt(d.resourceConfig.MinMemoryAvailableBytes, 10),
+		strconv.FormatInt(d.resourceConfig.MinCPUAvailableMilliCores, 10),
+		strconv.FormatInt(d.resourceConfig.MaxGoroutines, 10),
+	}
 }
 
 func (d *Directory) Renew(ctx context.Context, cmd sp.RenewCommand) (*sp.Placement, error) {
@@ -660,6 +698,8 @@ func nodeResultError(s string) error {
 		return sp.ErrInvalidNodeSession
 	case "node_lease_expired":
 		return sp.ErrNodeLeaseExpired
+	case "invalid_metrics":
+		return fmt.Errorf("%w: node metrics must not be negative or overflow Redis integers", sp.ErrPlacementConfigInvalid)
 	case "node_has_placements":
 		return sp.ErrNodeHasPlacements
 	case "node_not_invalid":
