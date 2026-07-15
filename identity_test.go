@@ -75,11 +75,11 @@ func TestIdentityRejectsInvalidParts(t *testing.T) {
 }
 
 func TestIdentityLengthBoundaries(t *testing.T) {
-	if _, err := NewNodeIdentity(strings.Repeat("n", 128), "default", "game-1"); err != nil {
-		t.Fatalf("128-byte node type rejected: %v", err)
+	if _, err := NewNodeIdentity(strings.Repeat("n", MaxIdentityPartBytes), "default", "game-1"); err != nil {
+		t.Fatalf("max-length node type rejected: %v", err)
 	}
-	if _, err := NewGrainKey("player", strings.Repeat("a", 256)); err != nil {
-		t.Fatalf("256-byte grain id rejected: %v", err)
+	if _, err := NewGrainKey("player", strings.Repeat("a", MaxGrainIDBytes)); err != nil {
+		t.Fatalf("max-length grain id rejected: %v", err)
 	}
 	if _, err := NewGrainKey("player", strings.Repeat("a", 257)); err == nil {
 		t.Fatal("257-byte grain id accepted")

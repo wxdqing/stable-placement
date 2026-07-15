@@ -15,6 +15,8 @@ type Context struct {
 	resolver PIDResolver
 }
 
+const DefaultGrainCallRetryCount = 1
+
 var _ cluster.Context = (*Context)(nil)
 
 func NewContext(resolver PIDResolver) cluster.ContextProducer {
@@ -73,7 +75,7 @@ func (c *Context) callConfig(opts []cluster.GrainCallOption) *cluster.GrainCallC
 		option(config)
 	}
 	if config.RetryCount <= 0 {
-		config.RetryCount = 1
+		config.RetryCount = DefaultGrainCallRetryCount
 	}
 	return config
 }

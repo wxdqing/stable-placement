@@ -10,6 +10,7 @@ import (
 var luaFiles embed.FS
 
 func mustLua(paths ...string) string {
+	paths = append([]string{"lua/shared/constants.lua"}, paths...)
 	parts := make([]string, 0, len(paths))
 	for _, path := range paths {
 		content, err := luaFiles.ReadFile(path)

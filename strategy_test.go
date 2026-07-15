@@ -3,7 +3,6 @@ package stableplacement
 import (
 	"errors"
 	"testing"
-	"time"
 )
 
 func TestStrategyModeConstants(t *testing.T) {
@@ -17,7 +16,7 @@ func TestNormalizeResourceAwareConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.MetricsMaxAge != 10*time.Second || config.MinMemoryAvailableBytes != 256<<20 || config.MinCPUAvailableMilliCores != 100 || config.Now == nil {
+	if config.MetricsMaxAge != DefaultResourceMetricsMaxAge || config.MinMemoryAvailableBytes != DefaultResourceMinMemoryAvailableBytes || config.MinCPUAvailableMilliCores != DefaultResourceMinCPUAvailableMilliCores || config.Now == nil {
 		t.Fatalf("resource config = %+v", config)
 	}
 	if _, err := NormalizeResourceAwareConfig(ResourceAwareConfig{MaxGoroutines: -1}); !errors.Is(err, ErrPlacementConfigInvalid) {

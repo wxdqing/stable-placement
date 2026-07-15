@@ -13,11 +13,13 @@ type IdentityLookup struct {
 	timeout  time.Duration
 }
 
+const DefaultIdentityLookupTimeout = time.Second
+
 var _ cluster.IdentityLookup = (*IdentityLookup)(nil)
 
 func NewIdentityLookup(resolver PIDResolver, timeout time.Duration) *IdentityLookup {
 	if timeout <= 0 {
-		timeout = time.Second
+		timeout = DefaultIdentityLookupTimeout
 	}
 	return &IdentityLookup{resolver: resolver, timeout: timeout}
 }

@@ -1,6 +1,7 @@
 package stableplacement
 
 import (
+	"encoding/hex"
 	"errors"
 	"testing"
 	"time"
@@ -20,8 +21,8 @@ func TestStatusesAndErrorsAreStable(t *testing.T) {
 
 func TestDefaultNodeLeaseConfig(t *testing.T) {
 	config := DefaultNodeLeaseConfig()
-	if config.TTL != time.Minute {
-		t.Fatalf("default node lease TTL = %v, want %v", config.TTL, time.Minute)
+	if config.TTL != DefaultNodeLeaseTTL {
+		t.Fatalf("default node lease TTL = %v, want %v", config.TTL, DefaultNodeLeaseTTL)
 	}
 }
 
@@ -34,7 +35,7 @@ func TestNewPlacementIDIsUniqueAndNonEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first) != 32 || len(second) != 32 || first == second {
+	if len(first) != hex.EncodedLen(PlacementIDByteLength) || len(second) != hex.EncodedLen(PlacementIDByteLength) || first == second {
 		t.Fatalf("placement IDs = %q / %q", first, second)
 	}
 }

@@ -55,7 +55,7 @@ func ValidateNodeMetrics(metrics NodeMetrics) error {
 }
 
 func DefaultNodeLeaseConfig() NodeLeaseConfig {
-	return NodeLeaseConfig{TTL: time.Minute}
+	return NodeLeaseConfig{TTL: DefaultNodeLeaseTTL}
 }
 
 type Grain struct {
@@ -141,7 +141,7 @@ type PlacementRoute struct {
 }
 
 func NewPlacementID() (string, error) {
-	var id [16]byte
+	var id [PlacementIDByteLength]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return "", fmt.Errorf("generate placement id: %w", err)
 	}

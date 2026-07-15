@@ -14,7 +14,7 @@ end
 
 local function now_millis()
   local t = redis.call("TIME")
-  return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+  return tonumber(t[REDIS_TIME_SECONDS_INDEX]) * MILLISECONDS_PER_SECOND + math.floor(tonumber(t[REDIS_TIME_MICROSECONDS_INDEX]) / MICROSECONDS_PER_MILLISECOND)
 end
 
 local function read_counter(key, label, maximum)

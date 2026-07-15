@@ -132,7 +132,7 @@ func (d *Directory) ResolveRoute(ctx context.Context, cmd sp.ResolveRouteCommand
 		placement = sp.Placement{
 			GrainID: cmd.GrainID, Kind: cmd.Kind, GrainKey: key, PlacementID: placementID,
 			NodeIdentity: target.NodeIdentity, OwnerNodeSessionID: target.NodeSessionID,
-			Version: 1, Status: sp.PlacementStatusActive, CreateTime: now, UpdateTime: now,
+			Version: sp.InitialPlacementVersion, Status: sp.PlacementStatusActive, CreateTime: now, UpdateTime: now,
 		}
 		d.placements[key] = placement
 		d.addNodeIndexLocked(target.NodeIdentity, key)
@@ -234,7 +234,7 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 	}
 	placement := sp.Placement{
 		GrainID: cmd.GrainID, Kind: cmd.Kind, GrainKey: key, PlacementID: placementID, NodeIdentity: current.NodeIdentity,
-		OwnerNodeSessionID: current.NodeSessionID, Version: 1, Status: sp.PlacementStatusActive,
+		OwnerNodeSessionID: current.NodeSessionID, Version: sp.InitialPlacementVersion, Status: sp.PlacementStatusActive,
 		CreateTime: now, UpdateTime: now,
 	}
 	d.placements[key] = placement
@@ -435,7 +435,7 @@ func (d *Directory) FindByNode(_ context.Context, query sp.FindByNodeQuery) (sp.
 	}
 	limit := query.Limit
 	if limit <= 0 {
-		limit = 100
+		limit = sp.DefaultPlacementPageLimit
 	}
 	start := 0
 	if query.Cursor != "" {

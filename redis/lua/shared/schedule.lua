@@ -5,7 +5,7 @@ local function decimal_mod(value,divisor)
 end
 
 local function valid_metric_number(value)
-  return type(value)=="number" and value==value and value>=0 and value<=9007199254740991
+  return type(value)=="number" and value==value and value>=0 and value<=MAX_EXACT_LUA_INTEGER
 end
 
 local function choose_candidate(candidates, round_robin, mode, now, max_age, min_memory, min_cpu, max_goroutines)
@@ -24,9 +24,9 @@ local function choose_candidate(candidates, round_robin, mode, now, max_age, min
       local goroutines=metrics["Goroutines"]
       local updated=metrics["UpdatedAtUnixMilli"]
       if valid_metric_number(memory) and valid_metric_number(cpu) and valid_metric_number(goroutines) and valid_metric_number(updated) and updated>0 and updated<=now and now-updated<=max_age and memory>=min_memory and cpu>=min_cpu and (max_goroutines==0 or goroutines<=max_goroutines) then
-        local memory_bucket=math.floor(memory/268435456)
-        local cpu_bucket=math.floor(cpu/100)
-        local goroutine_bucket=math.floor(goroutines/100)
+        local memory_bucket=math.floor(memory/RESOURCE_MEMORY_BUCKET_BYTES)
+        local cpu_bucket=math.floor(cpu/RESOURCE_CPU_BUCKET_MILLICORES)
+        local goroutine_bucket=math.floor(goroutines/RESOURCE_GOROUTINE_BUCKET_SIZE)
         local placements=redis.call("ZCARD",candidate.node["PlacementNodeKey"])
         local better=best_memory==nil or memory_bucket>best_memory or
           (memory_bucket==best_memory and cpu_bucket>best_cpu) or

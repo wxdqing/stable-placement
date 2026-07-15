@@ -9,14 +9,26 @@ import (
 
 type GrainKey string
 
+const (
+	nodeTypePartIndex = iota
+	nodeGroupPartIndex
+	nodeNamePartIndex
+	nodeIdentityPartCount
+	identitySeparatorRune = '/'
+	maxASCIIControlRune   = '\x1f'
+	asciiDeleteRune       = '\x7f'
+)
+
+const identitySeparator = "/"
+
 func NewGrainKey(kind string, grainID string) (GrainKey, error) {
-	if err := ValidateIdentityPart(kind, 128); err != nil {
+	if err := ValidateIdentityPart(kind, MaxIdentityPartBytes); err != nil {
 		return "", fmt.Errorf("kind: %w", err)
 	}
-	if err := ValidateIdentityPart(grainID, 256); err != nil {
+	if err := ValidateIdentityPart(grainID, MaxGrainIDBytes); err != nil {
 		return "", fmt.Errorf("grain id: %w", err)
 	}
-	return GrainKey(kind + "/" + grainID), nil
+	return GrainKey(kind + identitySeparator + grainID), nil
 }
 
 func (k GrainKey) String() string {
@@ -26,16 +38,16 @@ func (k GrainKey) String() string {
 type NodeIdentity string
 
 func NewNodeIdentity(nodeType string, nodeGroup string, nodeName string) (NodeIdentity, error) {
-	if err := ValidateIdentityPart(nodeType, 128); err != nil {
+	if err := ValidateIdentityPart(nodeType, MaxIdentityPartBytes); err != nil {
 		return "", fmt.Errorf("node type: %w", err)
 	}
-	if err := ValidateIdentityPart(nodeGroup, 128); err != nil {
+	if err := ValidateIdentityPart(nodeGroup, MaxIdentityPartBytes); err != nil {
 		return "", fmt.Errorf("node group: %w", err)
 	}
-	if err := ValidateIdentityPart(nodeName, 128); err != nil {
+	if err := ValidateIdentityPart(nodeName, MaxIdentityPartBytes); err != nil {
 		return "", fmt.Errorf("node name: %w", err)
 	}
-	return NodeIdentity(nodeType + "/" + nodeGroup + "/" + nodeName), nil
+	return NodeIdentity(nodeType + identitySeparator + nodeGroup + identitySeparator + nodeName), nil
 }
 
 func ValidateIdentityPart(value string, maxBytes int) error {
@@ -52,7 +64,7 @@ func ValidateIdentityPart(value string, maxBytes int) error {
 		return errors.New("value has surrounding whitespace")
 	}
 	for _, r := range value {
-		if r == '/' || r <= 0x1f || r == 0x7f {
+		if r == identitySeparatorRune || r <= maxASCIIControlRune || r == asciiDeleteRune {
 			return errors.New("value contains a reserved character")
 		}
 	}
@@ -64,20 +76,20 @@ func (i NodeIdentity) String() string {
 }
 
 func (i NodeIdentity) NodeType() string {
-	return i.part(0)
+	return i.part(nodeTypePartIndex)
 }
 
 func (i NodeIdentity) NodeGroup() string {
-	return i.part(1)
+	return i.part(nodeGroupPartIndex)
 }
 
 func (i NodeIdentity) NodeName() string {
-	return i.part(2)
+	return i.part(nodeNamePartIndex)
 }
 
 func (i NodeIdentity) part(index int) string {
-	parts := strings.Split(string(i), "/")
-	if len(parts) != 3 {
+	parts := strings.Split(string(i), identitySeparator)
+	if len(parts) != nodeIdentityPartCount {
 		return ""
 	}
 	return parts[index]

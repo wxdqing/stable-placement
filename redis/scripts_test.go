@@ -1,14 +1,18 @@
 package redis
 
 import (
+	"fmt"
 	"io/fs"
 	"strings"
 	"testing"
+
+	sp "github.com/wxdqing/stable-placement"
 )
 
 func TestEmbeddedLuaFilesAndComposedScriptsAreComplete(t *testing.T) {
 	wantFiles := map[string]bool{
-		"lua/shared/helper.lua": true, "lua/shared/event.lua": true, "lua/shared/schedule.lua": true,
+		"lua/shared/constants.lua": true, "lua/shared/helper.lua": true,
+		"lua/shared/event.lua": true, "lua/shared/schedule.lua": true,
 		"lua/node/register.lua": true, "lua/node/renew.lua": true, "lua/node/replace_session.lua": true,
 		"lua/node/unregister.lua": true, "lua/node/drain.lua": true, "lua/node/mark_invalid.lua": true,
 		"lua/node/restore.lua": true, "lua/lease/expire_node.lua": true,
@@ -62,6 +66,27 @@ func TestEmbeddedLuaFilesAndComposedScriptsAreComplete(t *testing.T) {
 	for name, script := range composed {
 		if strings.TrimSpace(script) == "" {
 			t.Fatalf("composed Lua script %q is empty", name)
+		}
+	}
+}
+
+func TestLuaConstantsMatchGoContracts(t *testing.T) {
+	content, err := luaFiles.ReadFile("lua/shared/constants.lua")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lua := string(content)
+	want := []string{
+		fmt.Sprintf("local MAX_EXACT_LUA_INTEGER = %d", maxPlacementIndexScore),
+		fmt.Sprintf("local RESOURCE_MEMORY_BUCKET_BYTES = %d", sp.ResourceMemoryBucketBytes),
+		fmt.Sprintf("local RESOURCE_CPU_BUCKET_MILLICORES = %d", sp.ResourceCPUBucketMilliCores),
+		fmt.Sprintf("local RESOURCE_GOROUTINE_BUCKET_SIZE = %d", sp.ResourceGoroutineBucketSize),
+		fmt.Sprintf("local INITIAL_PLACEMENT_VERSION = %d", sp.InitialPlacementVersion),
+		fmt.Sprintf("local INITIAL_NODE_LEASE_VERSION = %d", sp.InitialNodeLeaseVersion),
+	}
+	for _, declaration := range want {
+		if !strings.Contains(lua, declaration) {
+			t.Fatalf("Lua constants missing %q", declaration)
 		}
 	}
 }

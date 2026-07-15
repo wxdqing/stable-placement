@@ -1,1 +1,1 @@
-local e=expect_type(KEYS[1],"set","invalid") or expect_type(KEYS[2],"stream","events");if e then return e end;redis.call("SADD",KEYS[1],ARGV[1]);node_event(KEYS[2],ARGV[5],ARGV[2],"",ARGV[3],ARGV[4],ARGV[1],"0");return "ok"
+local e=expect_type(KEYS[1],"set","invalid") or expect_type(KEYS[2],"stream","events");if e then return e end;redis.call("SADD",KEYS[1],ARGV[1]);node_event(KEYS[2],ARGV[5],ARGV[2],"",ARGV[3],ARGV[4],ARGV[1],NO_VERSION_STRING);return "ok"

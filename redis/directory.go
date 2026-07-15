@@ -61,12 +61,31 @@ func (placement redisPlacement) placement() sp.Placement {
 
 const maxPlacementIndexScore = int64(1<<53 - 1)
 
+const (
+	resolveRouteMaxAttempts       = 3
+	minimumPlacementScanBatchSize = sp.DefaultPlacementPageLimit
+
+	scriptStatusResultIndex             = 0
+	replaceNodeSessionResultLength      = 4
+	replaceNodeSessionPreviousNodeIndex = 1
+	replaceNodeSessionLeaseVersionIndex = 2
+	replaceNodeSessionRemainingTTLIndex = 3
+	nodeLeaseVersionResultIndex         = 1
+	nodeLeaseRemainingTTLResultIndex    = 2
+	routeResultLength                   = 3
+	routePlacementResultIndex           = 0
+	routeNodeLeaseVersionResultIndex    = 1
+	routeRemainingTTLMillisResultIndex  = 2
+)
+
 func NewDirectory(client goredis.UniversalClient, mode sp.StrategyMode, config sp.NodeLeaseConfig, resourceConfigs ...sp.ResourceAwareConfig) (*Directory, error) {
 	if mode != sp.StrategyModeRedisRoundRobin && mode != sp.StrategyModeRedisResourceAware {
 		return nil, sp.ErrUnsupportedStrategyMode
 	}
-	if config.TTL <= 0 {
-		return nil, sp.ErrInvalidNodeLeaseTTL
+	var err error
+	config, err = sp.NormalizeNodeLeaseConfig(config)
+	if err != nil {
+		return nil, err
 	}
 	if len(resourceConfigs) > 1 {
 		return nil, fmt.Errorf("%w: multiple resource-aware configs", sp.ErrPlacementConfigInvalid)
@@ -75,19 +94,10 @@ func NewDirectory(client goredis.UniversalClient, mode sp.StrategyMode, config s
 	if len(resourceConfigs) == 1 {
 		resourceConfig = resourceConfigs[0]
 	}
-	resourceConfig, err := sp.NormalizeResourceAwareConfig(resourceConfig)
+	resourceConfig, err = sp.NormalizeResourceAwareConfig(resourceConfig)
 	if err != nil {
 		return nil, err
 	}
-	ttlMillis := config.TTL.Milliseconds()
-	maxTTLMillis := time.Duration(1<<63 - 1).Milliseconds()
-	if config.TTL%time.Millisecond != 0 && ttlMillis < maxTTLMillis {
-		ttlMillis++
-	}
-	if ttlMillis <= 0 {
-		ttlMillis = 1
-	}
-	config.TTL = time.Duration(ttlMillis) * time.Millisecond
 	return &Directory{client: client, mode: mode, config: config, resourceConfig: resourceConfig}, nil
 }
 
@@ -105,7 +115,7 @@ func (d *Directory) RegisterNode(ctx context.Context, node sp.Node) (sp.NodeLeas
 	if err != nil {
 		return sp.NodeLeaseGrant{}, err
 	}
-	return nodeLeaseGrantResult(requestStart, result, 1, 2)
+	return nodeLeaseGrantResult(requestStart, result, nodeLeaseVersionResultIndex, nodeLeaseRemainingTTLResultIndex)
 }
 
 func (d *Directory) RenewNode(ctx context.Context, cmd sp.RenewNodeCommand) (sp.NodeLeaseGrant, error) {
@@ -126,7 +136,7 @@ func (d *Directory) RenewNode(ctx context.Context, cmd sp.RenewNodeCommand) (sp.
 	if err != nil {
 		return sp.NodeLeaseGrant{}, err
 	}
-	return nodeLeaseGrantResult(requestStart, result, 1, 2)
+	return nodeLeaseGrantResult(requestStart, result, nodeLeaseVersionResultIndex, nodeLeaseRemainingTTLResultIndex)
 }
 
 func (d *Directory) ReplaceNodeSession(ctx context.Context, node sp.Node) (*sp.Node, sp.NodeLeaseGrant, error) {
@@ -150,19 +160,19 @@ func (d *Directory) ReplaceNodeSession(ctx context.Context, node sp.Node) (*sp.N
 		return nil, sp.NodeLeaseGrant{}, fmt.Errorf("unexpected replace result %q", s)
 	}
 	raw, ok := result.([]interface{})
-	if !ok || len(raw) != 4 {
+	if !ok || len(raw) != replaceNodeSessionResultLength {
 		return nil, sp.NodeLeaseGrant{}, fmt.Errorf("unexpected replace result %T", result)
 	}
-	if status := fmt.Sprint(raw[0]); status != "ok" {
+	if status := fmt.Sprint(raw[scriptStatusResultIndex]); status != "ok" {
 		return nil, sp.NodeLeaseGrant{}, nodeResultError(status)
 	}
 	var old redisNode
-	if fmt.Sprint(raw[1]) != "" {
-		if err := json.Unmarshal([]byte(fmt.Sprint(raw[1])), &old); err != nil {
+	if fmt.Sprint(raw[replaceNodeSessionPreviousNodeIndex]) != "" {
+		if err := json.Unmarshal([]byte(fmt.Sprint(raw[replaceNodeSessionPreviousNodeIndex])), &old); err != nil {
 			return nil, sp.NodeLeaseGrant{}, err
 		}
 	}
-	grant, err := nodeLeaseGrantResult(requestStart, []interface{}{raw[0], raw[2], raw[3]}, 1, 2)
+	grant, err := nodeLeaseGrantResult(requestStart, raw, replaceNodeSessionLeaseVersionIndex, replaceNodeSessionRemainingTTLIndex)
 	if err != nil {
 		return nil, sp.NodeLeaseGrant{}, err
 	}
@@ -174,7 +184,7 @@ func nodeLeaseGrantResult(requestStart time.Time, result interface{}, versionInd
 		return sp.NodeLeaseGrant{}, nodeResultError(status)
 	}
 	items, ok := result.([]interface{})
-	if !ok || len(items) <= versionIndex || len(items) <= ttlIndex || fmt.Sprint(items[0]) != "ok" {
+	if !ok || len(items) <= versionIndex || len(items) <= ttlIndex || fmt.Sprint(items[scriptStatusResultIndex]) != "ok" {
 		return sp.NodeLeaseGrant{}, fmt.Errorf("unexpected node lease result %T", result)
 	}
 	version, err := strconv.ParseInt(fmt.Sprint(items[versionIndex]), 10, 64)
@@ -277,23 +287,23 @@ func (d *Directory) Lookup(ctx context.Context, key sp.GrainKey) (*sp.PlacementR
 		return nil, err
 	}
 	items, ok := result.([]interface{})
-	if !ok || len(items) != 3 {
+	if !ok || len(items) != routeResultLength {
 		return nil, sp.ErrPlacementNotFound
 	}
 	var currentWire redisPlacement
-	if err := json.Unmarshal([]byte(fmt.Sprint(items[0])), &currentWire); err != nil {
+	if err := json.Unmarshal([]byte(fmt.Sprint(items[routePlacementResultIndex])), &currentWire); err != nil {
 		return nil, err
 	}
 	current := currentWire.placement()
-	leaseVersion, err := strconv.ParseInt(fmt.Sprint(items[1]), 10, 64)
+	leaseVersion, err := strconv.ParseInt(fmt.Sprint(items[routeNodeLeaseVersionResultIndex]), 10, 64)
 	if err != nil {
 		return nil, err
 	}
-	remaining, err := strconv.ParseInt(fmt.Sprint(items[2]), 10, 64)
+	remaining, err := strconv.ParseInt(fmt.Sprint(items[routeRemainingTTLMillisResultIndex]), 10, 64)
 	if err != nil {
 		return nil, err
 	}
-	if remaining <= 0 || remaining > time.Duration(1<<63-1).Milliseconds() {
+	if remaining <= 0 || remaining > sp.MaxNodeLeaseTTLMillis {
 		return nil, sp.ErrPlacementNotFound
 	}
 	validUntil := requestStart.Add(time.Duration(remaining) * time.Millisecond)
@@ -311,7 +321,7 @@ func (d *Directory) ResolveRoute(ctx context.Context, cmd sp.ResolveRouteCommand
 	if _, err := sp.NewNodeIdentity(cmd.TargetNodeType, cmd.TargetNodeGroup, "target"); err != nil {
 		return nil, err
 	}
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < resolveRouteMaxAttempts; attempt++ {
 		route, err := d.resolveRouteOnce(ctx, key, cmd)
 		if !errors.Is(err, sp.ErrVersionConflict) {
 			return route, err
@@ -375,19 +385,19 @@ func (d *Directory) resolveRouteOnce(ctx context.Context, key sp.GrainKey, cmd s
 		}
 	}
 	items, ok := result.([]interface{})
-	if !ok || len(items) != 3 {
+	if !ok || len(items) != routeResultLength {
 		return nil, fmt.Errorf("unexpected resolve route result %T", result)
 	}
 	var wire redisPlacement
-	if err := json.Unmarshal([]byte(fmt.Sprint(items[0])), &wire); err != nil {
+	if err := json.Unmarshal([]byte(fmt.Sprint(items[routePlacementResultIndex])), &wire); err != nil {
 		return nil, err
 	}
-	leaseVersion, err := strconv.ParseInt(fmt.Sprint(items[1]), 10, 64)
+	leaseVersion, err := strconv.ParseInt(fmt.Sprint(items[routeNodeLeaseVersionResultIndex]), 10, 64)
 	if err != nil || leaseVersion <= 0 {
-		return nil, fmt.Errorf("invalid route lease version %q", items[1])
+		return nil, fmt.Errorf("invalid route lease version %q", items[routeNodeLeaseVersionResultIndex])
 	}
-	remaining, err := strconv.ParseInt(fmt.Sprint(items[2]), 10, 64)
-	if err != nil || remaining <= 0 || remaining > time.Duration(1<<63-1).Milliseconds() {
+	remaining, err := strconv.ParseInt(fmt.Sprint(items[routeRemainingTTLMillisResultIndex]), 10, 64)
+	if err != nil || remaining <= 0 || remaining > sp.MaxNodeLeaseTTLMillis {
 		return nil, sp.ErrPlacementOwnerUnavailable
 	}
 	validUntil := requestStart.Add(time.Duration(remaining) * time.Millisecond)
@@ -529,9 +539,9 @@ func (d *Directory) Exists(ctx context.Context, key sp.GrainKey) (bool, error) {
 func (d *Directory) FindByNode(ctx context.Context, query sp.FindByNodeQuery) (sp.PlacementPage, error) {
 	limit := query.Limit
 	if limit <= 0 {
-		limit = 100
+		limit = sp.DefaultPlacementPageLimit
 	}
-	batchSize := int64(max(limit, 100))
+	batchSize := int64(max(limit, minimumPlacementScanBatchSize))
 	min := "-inf"
 	var boundaryScore int64
 	var boundaryKey string

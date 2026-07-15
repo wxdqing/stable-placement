@@ -22,6 +22,21 @@ type EventBus struct {
 	degraded bool
 }
 
+const (
+	redisScriptResultOK      int64 = 0
+	redisScriptResultPending int64 = 1
+
+	singleStreamEntryReadCount int64 = 1
+	continuityMaxAttempts            = 3
+	pendingPayloadBatchSize    int64 = 100
+	eventReadBatchSize         int64 = 10
+	eventReadBlockTimeout            = 50 * time.Millisecond
+
+	redisStreamBeginningID  = "0"
+	redisStreamNewEntriesID = ">"
+	redisStreamNoDeletionID = "0-0"
+)
+
 func NewEventBus(client goredis.UniversalClient, consumer StreamConsumer) *EventBus {
 	return &EventBus{
 		client:   client,
@@ -124,10 +139,10 @@ func (b *EventBus) CloseConsumerGroupIfIdle(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if result == 1 {
+	if result == redisScriptResultPending {
 		return ErrPendingMessages
 	}
-	if result != 0 {
+	if result != redisScriptResultOK {
 		return errors.New("redis consumer close returned an invalid result")
 	}
 	return nil
@@ -161,11 +176,11 @@ func (b *EventBus) ReplaceConsumer(ctx context.Context, old StreamConsumer) erro
 		}
 		return err
 	}
-	if result == 1 {
+	if result == redisScriptResultPending {
 		b.setDegraded()
 		return ErrPendingMessages
 	}
-	if result != 0 {
+	if result != redisScriptResultOK {
 		b.setDegraded()
 		return errors.New("redis consumer replacement returned an invalid result")
 	}
@@ -189,7 +204,7 @@ func (b *EventBus) CheckPending(ctx context.Context, threshold time.Duration) er
 		Idle:   threshold,
 		Start:  "-",
 		End:    "+",
-		Count:  1,
+		Count:  singleStreamEntryReadCount,
 	}).Result()
 	if err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
@@ -237,8 +252,7 @@ func (b *EventBus) RunTrimLoop(ctx context.Context, interval time.Duration, maxL
 
 // CheckContinuity enters degraded mode when Redis reports that this group may have missed trimmed events.
 func (b *EventBus) CheckContinuity(ctx context.Context) error {
-	const maxAttempts = 3
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	for attempt := 0; attempt < continuityMaxAttempts; attempt++ {
 		info, err := b.client.XInfoStream(ctx, b.stream).Result()
 		if err != nil {
 			if strings.Contains(err.Error(), "no such key") {
@@ -299,7 +313,7 @@ func (b *EventBus) checkContinuitySnapshot(ctx context.Context, info *goredis.XI
 	}
 	firstEntryID := info.FirstEntry.ID
 	if firstEntryID == "" && info.Length > 0 {
-		messages, err := b.client.XRangeN(ctx, b.stream, "-", "+", 1).Result()
+		messages, err := b.client.XRangeN(ctx, b.stream, "-", "+", singleStreamEntryReadCount).Result()
 		if err != nil {
 			return false, err
 		}
@@ -307,7 +321,7 @@ func (b *EventBus) checkContinuitySnapshot(ctx context.Context, info *goredis.XI
 			firstEntryID = messages[0].ID
 		}
 	}
-	maxDeleted := info.MaxDeletedEntryID != "" && info.MaxDeletedEntryID != "0-0"
+	maxDeleted := info.MaxDeletedEntryID != "" && info.MaxDeletedEntryID != redisStreamNoDeletionID
 	deletionObserved := maxDeleted || info.EntriesAdded > info.Length
 	if pending.Count > 0 {
 		pendingMissing := info.Length == 0
@@ -348,7 +362,6 @@ func (b *EventBus) checkContinuitySnapshot(ctx context.Context, info *goredis.XI
 }
 
 func (b *EventBus) pendingPayloadMissing(ctx context.Context, pendingCount int64) (bool, error) {
-	const batchSize = int64(100)
 	start := "-"
 	var checked int64
 	for checked < pendingCount {
@@ -357,7 +370,7 @@ func (b *EventBus) pendingPayloadMissing(ctx context.Context, pendingCount int64
 			Group:  b.consumer.Group,
 			Start:  start,
 			End:    "+",
-			Count:  batchSize,
+			Count:  pendingPayloadBatchSize,
 		}).Result()
 		if err != nil {
 			return false, err
@@ -368,7 +381,7 @@ func (b *EventBus) pendingPayloadMissing(ctx context.Context, pendingCount int64
 		commands := make([]*goredis.XMessageSliceCmd, len(entries))
 		_, err = b.client.Pipelined(ctx, func(pipe goredis.Pipeliner) error {
 			for i, entry := range entries {
-				commands[i] = pipe.XRangeN(ctx, b.stream, entry.ID, entry.ID, 1)
+				commands[i] = pipe.XRangeN(ctx, b.stream, entry.ID, entry.ID, singleStreamEntryReadCount)
 			}
 			return nil
 		})
@@ -386,7 +399,7 @@ func (b *EventBus) pendingPayloadMissing(ctx context.Context, pendingCount int64
 			}
 		}
 		checked += int64(len(entries))
-		if int64(len(entries)) < batchSize {
+		if int64(len(entries)) < pendingPayloadBatchSize {
 			return false, nil
 		}
 		start = "(" + entries[len(entries)-1].ID
@@ -415,10 +428,10 @@ func (b *EventBus) Subscribe(ctx context.Context, handler func(sp.PlacementEvent
 	if err := b.CheckContinuity(ctx); err != nil {
 		return err
 	}
-	if err := b.consume(ctx, "0", handler); err != nil {
+	if err := b.consume(ctx, redisStreamBeginningID, handler); err != nil {
 		return err
 	}
-	return b.consume(ctx, ">", handler)
+	return b.consume(ctx, redisStreamNewEntriesID, handler)
 }
 
 func (b *EventBus) consume(ctx context.Context, id string, handler func(sp.PlacementEvent) error) error {
@@ -433,11 +446,11 @@ func (b *EventBus) consume(ctx context.Context, id string, handler func(sp.Place
 			Group:    b.consumer.Group,
 			Consumer: b.consumer.NodeSessionID,
 			Streams:  []string{b.stream, id},
-			Count:    10,
-			Block:    50 * time.Millisecond,
+			Count:    eventReadBatchSize,
+			Block:    eventReadBlockTimeout,
 		}).Result()
 		if errors.Is(err, goredis.Nil) {
-			if id == "0" {
+			if id == redisStreamBeginningID {
 				return nil
 			}
 			continue
@@ -450,7 +463,7 @@ func (b *EventBus) consume(ctx context.Context, id string, handler func(sp.Place
 			return err
 		}
 		if len(streams) == 0 || len(streams[0].Messages) == 0 {
-			if id == "0" {
+			if id == redisStreamBeginningID {
 				return nil
 			}
 			continue

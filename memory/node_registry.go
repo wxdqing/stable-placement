@@ -27,15 +27,10 @@ func NewNodeRegistry(publisher sp.EventPublisher, config sp.NodeLeaseConfig) (*N
 }
 
 func newNodeRegistry(publisher sp.EventPublisher, config sp.NodeLeaseConfig, now nowFunc) (*NodeRegistry, error) {
-	if config.TTL <= 0 {
-		return nil, sp.ErrInvalidNodeLeaseTTL
+	config, err := sp.NormalizeNodeLeaseConfig(config)
+	if err != nil {
+		return nil, err
 	}
-	ttlMillis := config.TTL.Milliseconds()
-	maxTTLMillis := time.Duration(1<<63 - 1).Milliseconds()
-	if config.TTL%time.Millisecond != 0 && ttlMillis < maxTTLMillis {
-		ttlMillis++
-	}
-	config.TTL = time.Duration(ttlMillis) * time.Millisecond
 	return &NodeRegistry{
 		nodes:     make(map[string]sp.Node),
 		invalid:   make(map[string]map[string]struct{}),
@@ -298,7 +293,7 @@ func (r *NodeRegistry) Node(nodeIdentity string) (sp.Node, bool) {
 }
 
 func (r *NodeRegistry) newLease(now time.Time) sp.NodeLease {
-	return sp.NodeLease{Version: 1, TTLMillis: r.config.TTL.Milliseconds(), ExpireAtUnixMilli: now.Add(r.config.TTL).UnixMilli()}
+	return sp.NodeLease{Version: sp.InitialNodeLeaseVersion, TTLMillis: r.config.TTL.Milliseconds(), ExpireAtUnixMilli: now.Add(r.config.TTL).UnixMilli()}
 }
 
 func (r *NodeRegistry) nodeEvent(eventType sp.EventType, node sp.Node, now time.Time) sp.PlacementEvent {

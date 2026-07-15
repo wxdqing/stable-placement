@@ -14,9 +14,8 @@ local now = now_millis()
 	  if tonumber(existing["Lease"]["ExpireAtUnixMilli"] or 0) <= now then return "node_lease_expired" end
 	  return {"ok",tostring(existing["Lease"]["Version"]),tostring(tonumber(existing["Lease"]["ExpireAtUnixMilli"])-now)}
 	end
-incoming["Status"]="active"; incoming["Lease"]={Version=1,TTLMillis=tonumber(ARGV[2]),ExpireAtUnixMilli=now+tonumber(ARGV[2])}
+incoming["Status"]="active"; incoming["Lease"]={Version=INITIAL_NODE_LEASE_VERSION,TTLMillis=tonumber(ARGV[2]),ExpireAtUnixMilli=now+tonumber(ARGV[2])}
 local encoded=cjson.encode(incoming)
 redis.call("SET",KEYS[1],encoded);redis.call("SADD",KEYS[2],ARGV[3]);redis.call("ZADD",KEYS[3],incoming["Lease"]["ExpireAtUnixMilli"],ARGV[3])
-node_event(KEYS[4],ARGV[4],incoming["NodeIdentity"],incoming["NodeSessionID"],incoming["NodeType"],incoming["NodeGroup"],incoming["NodeName"],"1")
-return {"ok","1",tostring(tonumber(ARGV[2]))}
-
+node_event(KEYS[4],ARGV[4],incoming["NodeIdentity"],incoming["NodeSessionID"],incoming["NodeType"],incoming["NodeGroup"],incoming["NodeName"],tostring(INITIAL_NODE_LEASE_VERSION))
+return {"ok",tostring(INITIAL_NODE_LEASE_VERSION),tostring(tonumber(ARGV[2]))}
