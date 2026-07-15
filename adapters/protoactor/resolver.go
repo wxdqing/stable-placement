@@ -145,11 +145,11 @@ func (r *Resolver) Fence() {
 func (r *Resolver) store(route PIDRoute) { r.mu.Lock(); r.cache[route.GrainKey] = route; r.mu.Unlock() }
 
 func pidRoute(pid *actor.PID, route *sp.PlacementRoute) PIDRoute {
-	return PIDRoute{PID: pid, GrainKey: route.GrainKey, NodeIdentity: route.NodeIdentity, NodeSessionID: route.OwnerNodeSessionID, PlacementVersion: route.Version, NodeLeaseVersion: route.NodeLeaseVersion, ValidUntil: route.ValidUntil}
+	return PIDRoute{PID: pid, GrainKey: route.GrainKey, PlacementID: route.PlacementID, NodeIdentity: route.NodeIdentity, NodeSessionID: route.OwnerNodeSessionID, PlacementVersion: route.Version, NodeLeaseVersion: route.NodeLeaseVersion, ValidUntil: route.ValidUntil}
 }
 
 func sameAuthorization(cached PIDRoute, route *sp.PlacementRoute) bool {
-	return cached.GrainKey == route.GrainKey && cached.NodeIdentity == route.NodeIdentity && cached.NodeSessionID == route.OwnerNodeSessionID && cached.PlacementVersion == route.Version
+	return cached.GrainKey == route.GrainKey && cached.PlacementID == route.PlacementID && cached.NodeIdentity == route.NodeIdentity && cached.NodeSessionID == route.OwnerNodeSessionID && cached.PlacementVersion == route.Version
 }
 
 func routeTargetMatches(identity string, target sp.NodeTarget) bool {

@@ -33,7 +33,8 @@ func (r *LocalActivationResolver) ResolveLocalPID(
 	if err != nil {
 		return PIDRoute{}, err
 	}
-	if route.NodeIdentity != expected.NodeIdentity ||
+	if route.PlacementID != expected.PlacementID ||
+		route.NodeIdentity != expected.NodeIdentity ||
 		route.NodeSessionID != expected.OwnerNodeSessionID ||
 		route.PlacementVersion != expected.PlacementVersion {
 		return PIDRoute{}, sp.ErrVersionConflict

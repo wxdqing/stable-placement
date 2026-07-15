@@ -164,10 +164,7 @@ func TestResolveRouteOwnerLifecycle(t *testing.T) {
 				if !sameRoute(first, retained) {
 					t.Fatalf("healthy invalid owner changed: first=%+v retained=%+v", first, retained)
 				}
-				transferred, err := b.directory.Transfer(context.Background(), sp.TransferCommand{
-					GrainKey: first.GrainKey, FromNodeIdentity: owner.NodeIdentity,
-					ToNodeIdentity: target.NodeIdentity, PlacementVersion: first.Version,
-				})
+				transferred, err := b.directory.Transfer(context.Background(), sp.TransferCommand{GrainKey: first.GrainKey, PlacementID: first.PlacementID, FromNodeIdentity: owner.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: first.Version})
 				if err != nil {
 					t.Fatalf("Transfer: %v", err)
 				}
@@ -307,10 +304,7 @@ func releaseRoute(t *testing.T, b routeTestBackend, route *sp.PlacementRoute) {
 
 func releasePlacement(t *testing.T, b routeTestBackend, placement *sp.Placement) {
 	t.Helper()
-	if err := b.directory.Release(context.Background(), sp.ReleaseCommand{
-		GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity,
-		NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version,
-	}); err != nil {
+	if err := b.directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version}); err != nil {
 		t.Fatalf("Release %s: %v", placement.GrainKey, err)
 	}
 }

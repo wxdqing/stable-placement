@@ -47,12 +47,7 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 		leaseBefore := s.dirNode(node.NodeIdentity).Lease
 
 		s.step("When Renew")
-		renewed, err := s.dir.Renew(s.ctx, sp.RenewCommand{
-			GrainKey:         placement.GrainKey,
-			NodeIdentity:     placement.NodeIdentity,
-			NodeSessionID:    placement.OwnerNodeSessionID,
-			PlacementVersion: placement.Version,
-		})
+		renewed, err := s.dir.Renew(s.ctx, sp.RenewCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version})
 		if err != nil {
 			t.Fatalf("Renew error: %v", err)
 		}
@@ -76,21 +71,12 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 		placement := s.allocate(grainID)
 
 		s.step("When Release")
-		if err := s.dir.Release(s.ctx, sp.ReleaseCommand{
-			GrainKey:         placement.GrainKey,
-			NodeIdentity:     placement.NodeIdentity,
-			NodeSessionID:    placement.OwnerNodeSessionID,
-			PlacementVersion: placement.Version,
-		}); err != nil {
+		if err := s.dir.Release(s.ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version}); err != nil {
 			t.Fatalf("Release error: %v", err)
 		}
 
 		s.step("Then Recover 返回 ErrPlacementNotRecoverable")
-		_, err := s.dir.Recover(s.ctx, sp.RecoverCommand{
-			GrainKey:         placement.GrainKey,
-			NewNodeIdentity:  node2.NodeIdentity,
-			PlacementVersion: placement.Version + 1,
-		})
+		_, err := s.dir.Recover(s.ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NewNodeIdentity: node2.NodeIdentity, PlacementVersion: placement.Version + 1})
 		if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
 			t.Fatalf("Recover err = %v, want ErrPlacementNotRecoverable", err)
 		}
@@ -136,11 +122,7 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 		node2 := s.registerNode("game-2", "session-b")
 		placement := s.allocate(s.grainID("healthy-recover"))
 
-		_, err := s.dir.Recover(s.ctx, sp.RecoverCommand{
-			GrainKey:         placement.GrainKey,
-			NewNodeIdentity:  node2.NodeIdentity,
-			PlacementVersion: placement.Version,
-		})
+		_, err := s.dir.Recover(s.ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NewNodeIdentity: node2.NodeIdentity, PlacementVersion: placement.Version})
 		if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
 			t.Fatalf("Recover err = %v, want ErrPlacementNotRecoverable", err)
 		}
@@ -178,12 +160,7 @@ func TestStablePlacementRedisBDD(t *testing.T) {
 		placement := s.allocate(grainID)
 
 		s.step("When Transfer 到 game-2")
-		transferred, err := s.dir.Transfer(s.ctx, sp.TransferCommand{
-			GrainKey:         placement.GrainKey,
-			FromNodeIdentity: placement.NodeIdentity,
-			ToNodeIdentity:   node2.NodeIdentity,
-			PlacementVersion: placement.Version,
-		})
+		transferred, err := s.dir.Transfer(s.ctx, sp.TransferCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, FromNodeIdentity: placement.NodeIdentity, ToNodeIdentity: node2.NodeIdentity, PlacementVersion: placement.Version})
 		if err != nil {
 			t.Fatalf("Transfer error: %v", err)
 		}

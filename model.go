@@ -1,6 +1,8 @@
 package stableplacement
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"time"
 )
@@ -97,6 +99,8 @@ type Placement struct {
 	Kind string
 	// GrainKey 是 Kind + GrainID 组成的唯一键。
 	GrainKey GrainKey
+	// PlacementID identifies one allocation lifetime of a Grain.
+	PlacementID string
 	// NodeIdentity 是当前 Owner 节点身份。
 	NodeIdentity string
 	// OwnerNodeSessionID 是分配时的 Owner 运行实例快照。
@@ -120,6 +124,8 @@ func PlacementRecoverable(status PlacementStatus) bool {
 type PlacementRoute struct {
 	// GrainKey 是缓存路由对应的 Grain。
 	GrainKey GrainKey
+	// PlacementID identifies the allocation lifetime observed by this route.
+	PlacementID string
 	// NodeIdentity 是缓存路由指向的 Owner 节点。
 	NodeIdentity string
 	// OwnerNodeSessionID 是缓存路由指向的 Owner 运行实例。
@@ -132,4 +138,12 @@ type PlacementRoute struct {
 	NodeLeaseVersion int64
 	// ValidUntil 是当前进程可使用该路由的保守截止时间。
 	ValidUntil time.Time
+}
+
+func NewPlacementID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("generate placement id: %w", err)
+	}
+	return hex.EncodeToString(id[:]), nil
 }

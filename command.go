@@ -27,6 +27,8 @@ type RenewNodeCommand struct {
 type RenewCommand struct {
 	// GrainKey 唯一标识要续约的 Grain。
 	GrainKey GrainKey
+	// PlacementID identifies the allocation lifetime being renewed.
+	PlacementID string
 	// NodeIdentity 是当前 Owner 的稳定节点身份。
 	NodeIdentity string
 	// NodeSessionID 是当前 Owner 的运行实例 ID。
@@ -38,6 +40,8 @@ type RenewCommand struct {
 type ReleaseCommand struct {
 	// GrainKey 唯一标识要释放的 Grain。
 	GrainKey GrainKey
+	// PlacementID identifies the allocation lifetime being released.
+	PlacementID string
 	// NodeIdentity 是当前 Owner 的稳定节点身份。
 	NodeIdentity string
 	// NodeSessionID 是当前 Owner 的运行实例 ID。
@@ -49,6 +53,8 @@ type ReleaseCommand struct {
 type TransferCommand struct {
 	// GrainKey 唯一标识要迁移的 Grain。
 	GrainKey GrainKey
+	// PlacementID identifies the allocation lifetime being transferred.
+	PlacementID string
 	// FromNodeIdentity 是迁移前的 Owner，非空时必须和当前 Placement 匹配。
 	FromNodeIdentity string
 	// ToNodeIdentity 是迁移目标节点。
@@ -60,6 +66,8 @@ type TransferCommand struct {
 type RecoverCommand struct {
 	// GrainKey 唯一标识要恢复的 Grain。
 	GrainKey GrainKey
+	// PlacementID identifies the allocation lifetime being recovered.
+	PlacementID string
 	// NewNodeIdentity 是恢复后的新 Owner。
 	NewNodeIdentity string
 	// PlacementVersion 是调用方看到的 Placement 版本。

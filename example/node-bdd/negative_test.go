@@ -54,12 +54,7 @@ func TestNegative_F3_TransferToDrainingNodeFails(t *testing.T) {
 	h.must(h.dir.MarkNodeInvalid(h.ctx, h.nodeType, h.nodeGroup, "game-2"), "MarkNodeInvalid")
 	h.must(h.dir.DrainNode(h.ctx, node2.NodeIdentity), "DrainNode")
 
-	_, err := h.dir.Transfer(h.ctx, sp.TransferCommand{
-		GrainKey:         placement.GrainKey,
-		FromNodeIdentity: node1.NodeIdentity,
-		ToNodeIdentity:   node2.NodeIdentity,
-		PlacementVersion: placement.Version,
-	})
+	_, err := h.dir.Transfer(h.ctx, sp.TransferCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, FromNodeIdentity: node1.NodeIdentity, ToNodeIdentity: node2.NodeIdentity, PlacementVersion: placement.Version})
 	h.mustErrIs(err, sp.ErrNoAvailableNode, "Transfer to draining")
 }
 
@@ -71,20 +66,10 @@ func TestNegative_F4_VersionConflictOnRenewAndRelease(t *testing.T) {
 	h.registerGame("game-1", "session-a")
 	placement := h.allocate(h.grainID("f4"))
 
-	_, err := h.dir.Renew(h.ctx, sp.RenewCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     placement.NodeIdentity,
-		NodeSessionID:    placement.OwnerNodeSessionID,
-		PlacementVersion: placement.Version + 99,
-	})
+	_, err := h.dir.Renew(h.ctx, sp.RenewCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version + 99})
 	h.mustErrIs(err, sp.ErrVersionConflict, "Renew version conflict")
 
-	err = h.dir.Release(h.ctx, sp.ReleaseCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     placement.NodeIdentity,
-		NodeSessionID:    placement.OwnerNodeSessionID,
-		PlacementVersion: placement.Version + 99,
-	})
+	err = h.dir.Release(h.ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version + 99})
 	h.mustErrIs(err, sp.ErrVersionConflict, "Release version conflict")
 
 	found := h.lookup(placement.GrainKey)

@@ -182,6 +182,7 @@ func (r *CachedRouter) matchesSynchronousCreatedLocked(epoch uint64, placement s
 		r.lastEventEpoch == r.epoch &&
 		r.lastEvent.Type == sp.EventPlacementCreated &&
 		r.lastEvent.GrainKey == placement.GrainKey &&
+		r.lastEvent.PlacementID == placement.PlacementID &&
 		r.lastEvent.PlacementVersion > 0 &&
 		r.lastEvent.PlacementVersion == placement.Version
 }

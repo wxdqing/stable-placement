@@ -56,6 +56,7 @@ func (d *Directory) Lookup(_ context.Context, key sp.GrainKey) (*sp.PlacementRou
 	node := d.registry.nodes[placement.NodeIdentity]
 	route := sp.PlacementRoute{
 		GrainKey:           placement.GrainKey,
+		PlacementID:        placement.PlacementID,
 		NodeIdentity:       placement.NodeIdentity,
 		OwnerNodeSessionID: placement.OwnerNodeSessionID,
 		Version:            placement.Version,
@@ -74,6 +75,10 @@ func (d *Directory) ResolveRoute(ctx context.Context, cmd sp.ResolveRouteCommand
 		return nil, err
 	}
 	if _, err := sp.NewNodeIdentity(cmd.TargetNodeType, cmd.TargetNodeGroup, "target"); err != nil {
+		return nil, err
+	}
+	placementID, err := sp.NewPlacementID()
+	if err != nil {
 		return nil, err
 	}
 
@@ -121,15 +126,13 @@ func (d *Directory) ResolveRoute(ctx context.Context, cmd sp.ResolveRouteCommand
 			d.mu.Unlock()
 			return nil, chooseErr
 		}
-		version := int64(1)
 		if exists {
-			version = placement.Version + 1
 			d.deleteNodeIndexLocked(placement.NodeIdentity, key)
 		}
 		placement = sp.Placement{
-			GrainID: cmd.GrainID, Kind: cmd.Kind, GrainKey: key,
+			GrainID: cmd.GrainID, Kind: cmd.Kind, GrainKey: key, PlacementID: placementID,
 			NodeIdentity: target.NodeIdentity, OwnerNodeSessionID: target.NodeSessionID,
-			Version: version, Status: sp.PlacementStatusActive, CreateTime: now, UpdateTime: now,
+			Version: 1, Status: sp.PlacementStatusActive, CreateTime: now, UpdateTime: now,
 		}
 		d.placements[key] = placement
 		d.addNodeIndexLocked(target.NodeIdentity, key)
@@ -172,7 +175,7 @@ func (d *Directory) chooseTargetLocked(ctx context.Context, cmd sp.ResolveRouteC
 
 func (d *Directory) routeLocked(placement sp.Placement, node sp.Node, now time.Time) *sp.PlacementRoute {
 	return &sp.PlacementRoute{
-		GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity,
+		GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity,
 		OwnerNodeSessionID: placement.OwnerNodeSessionID, Version: placement.Version,
 		Status: placement.Status, NodeLeaseVersion: node.Lease.Version,
 		ValidUntil: now.Add(time.UnixMilli(node.Lease.ExpireAtUnixMilli).Sub(now)),
@@ -191,6 +194,10 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 
 	if placement, found, err := d.existingAllocation(key); found || err != nil {
 		return placement, err
+	}
+	placementID, err := sp.NewPlacementID()
+	if err != nil {
+		return nil, err
 	}
 	nodes, placementCounts := d.effectiveNodes(cmd.TargetNodeType, cmd.TargetNodeGroup)
 	if len(nodes) == 0 {
@@ -222,14 +229,12 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 		d.mu.Unlock()
 		return nil, sp.ErrNoAvailableNode
 	}
-	version := int64(1)
 	if existing, ok := d.placements[key]; ok {
-		version = existing.Version + 1
 		d.deleteNodeIndexLocked(existing.NodeIdentity, key)
 	}
 	placement := sp.Placement{
-		GrainID: cmd.GrainID, Kind: cmd.Kind, GrainKey: key, NodeIdentity: current.NodeIdentity,
-		OwnerNodeSessionID: current.NodeSessionID, Version: version, Status: sp.PlacementStatusActive,
+		GrainID: cmd.GrainID, Kind: cmd.Kind, GrainKey: key, PlacementID: placementID, NodeIdentity: current.NodeIdentity,
+		OwnerNodeSessionID: current.NodeSessionID, Version: 1, Status: sp.PlacementStatusActive,
 		CreateTime: now, UpdateTime: now,
 	}
 	d.placements[key] = placement
@@ -255,6 +260,11 @@ func (d *Directory) Renew(ctx context.Context, cmd sp.RenewCommand) (*sp.Placeme
 		d.registry.mu.RUnlock()
 		d.mu.RUnlock()
 		return nil, sp.ErrInvalidOwner
+	}
+	if placement.PlacementID != cmd.PlacementID {
+		d.registry.mu.RUnlock()
+		d.mu.RUnlock()
+		return nil, sp.ErrVersionConflict
 	}
 	if placement.Version != cmd.PlacementVersion {
 		d.registry.mu.RUnlock()
@@ -300,6 +310,11 @@ func (d *Directory) Release(ctx context.Context, cmd sp.ReleaseCommand) error {
 		d.mu.Unlock()
 		return sp.ErrInvalidOwner
 	}
+	if placement.PlacementID != cmd.PlacementID {
+		d.registry.mu.RUnlock()
+		d.mu.Unlock()
+		return sp.ErrVersionConflict
+	}
 	if placement.Version != cmd.PlacementVersion {
 		d.registry.mu.RUnlock()
 		d.mu.Unlock()
@@ -317,9 +332,8 @@ func (d *Directory) Release(ctx context.Context, cmd sp.ReleaseCommand) error {
 		return sp.ErrInvalidNodeSession
 	}
 	placement.Version++
-	placement.Status = sp.PlacementStatusReleased
 	placement.UpdateTime = d.registry.now()
-	d.placements[cmd.GrainKey] = placement
+	delete(d.placements, cmd.GrainKey)
 	d.deleteNodeIndexLocked(placement.NodeIdentity, cmd.GrainKey)
 	d.registry.mu.RUnlock()
 	d.mu.Unlock()
@@ -335,6 +349,11 @@ func (d *Directory) Transfer(ctx context.Context, cmd sp.TransferCommand) (*sp.P
 		d.registry.mu.RUnlock()
 		d.mu.Unlock()
 		return nil, sp.ErrPlacementNotFound
+	}
+	if placement.PlacementID != cmd.PlacementID {
+		d.registry.mu.RUnlock()
+		d.mu.Unlock()
+		return nil, sp.ErrVersionConflict
 	}
 	if placement.Version != cmd.PlacementVersion {
 		d.registry.mu.RUnlock()
@@ -368,6 +387,11 @@ func (d *Directory) Recover(ctx context.Context, cmd sp.RecoverCommand) (*sp.Pla
 		d.registry.mu.RUnlock()
 		d.mu.Unlock()
 		return nil, sp.ErrPlacementNotFound
+	}
+	if placement.PlacementID != cmd.PlacementID {
+		d.registry.mu.RUnlock()
+		d.mu.Unlock()
+		return nil, sp.ErrVersionConflict
 	}
 	if placement.Version != cmd.PlacementVersion {
 		d.registry.mu.RUnlock()
@@ -531,7 +555,7 @@ func (d *Directory) publish(ctx context.Context, placement sp.Placement, eventTy
 		return nil
 	}
 	return d.publisher.Publish(ctx, sp.PlacementEvent{
-		Type: eventType, GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity,
+		Type: eventType, GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity,
 		NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version, Time: d.registry.now(),
 	})
 }

@@ -110,30 +110,16 @@ func (s *suite) placementsOn(nodeIdentity string) ([]sp.Placement, error) {
 }
 
 func (s *suite) releasePlacement(placement sp.Placement) error {
-	err := s.dir.Release(s.ctx, sp.ReleaseCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     placement.NodeIdentity,
-		NodeSessionID:    placement.OwnerNodeSessionID,
-		PlacementVersion: placement.Version,
-	})
+	err := s.dir.Release(s.ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version})
 	if err == nil {
 		return nil
 	}
 	for _, node := range s.nodes {
-		recovered, recoverErr := s.dir.Recover(s.ctx, sp.RecoverCommand{
-			GrainKey:         placement.GrainKey,
-			NewNodeIdentity:  node.NodeIdentity,
-			PlacementVersion: placement.Version,
-		})
+		recovered, recoverErr := s.dir.Recover(s.ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NewNodeIdentity: node.NodeIdentity, PlacementVersion: placement.Version})
 		if recoverErr != nil {
 			continue
 		}
-		return s.dir.Release(s.ctx, sp.ReleaseCommand{
-			GrainKey:         recovered.GrainKey,
-			NodeIdentity:     recovered.NodeIdentity,
-			NodeSessionID:    recovered.OwnerNodeSessionID,
-			PlacementVersion: recovered.Version,
-		})
+		return s.dir.Release(s.ctx, sp.ReleaseCommand{GrainKey: recovered.GrainKey, PlacementID: recovered.PlacementID, NodeIdentity: recovered.NodeIdentity, NodeSessionID: recovered.OwnerNodeSessionID, PlacementVersion: recovered.Version})
 	}
 	return err
 }

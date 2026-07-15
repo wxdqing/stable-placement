@@ -85,7 +85,7 @@ func TestRedisDirectoryAllocateLookupRenewAndReleaseRoute(t *testing.T) {
 	nodeRaw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
 	leaseScore := client.ZScore(ctx, NodeLeaseKey("game", "default"), NodeKey(node.NodeIdentity)).Val()
 	reliableEvents := client.XLen(ctx, EventsStreamKey()).Val()
-	renewed, err := dir.Renew(ctx, sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version})
+	renewed, err := dir.Renew(ctx, sp.RenewCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version})
 	if err != nil || renewed.Version != placement.Version {
 		t.Fatalf("renew = %+v, %v", renewed, err)
 	}
@@ -105,7 +105,7 @@ func TestRedisDirectoryAllocateLookupRenewAndReleaseRoute(t *testing.T) {
 	if _, err := dir.Allocate(ctx, sp.AllocateCommand{GrainID: "1", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"}); !errors.Is(err, sp.ErrPlacementOwnerUnavailable) {
 		t.Fatalf("allocate unavailable = %v", err)
 	}
-	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version}); err != nil {
+	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -151,7 +151,7 @@ func TestRedisDirectoryPlacementTimestampContract(t *testing.T) {
 	assertPersisted(t, placement)
 
 	server.SetTime(time.UnixMilli(501123))
-	renewed, err := dir.Renew(ctx, sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version})
+	renewed, err := dir.Renew(ctx, sp.RenewCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestRedisDirectoryPlacementTimestampContract(t *testing.T) {
 		target = b
 	}
 	server.SetTime(time.UnixMilli(502123))
-	transferred, err := dir.Transfer(ctx, sp.TransferCommand{GrainKey: placement.GrainKey, FromNodeIdentity: placement.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
+	transferred, err := dir.Transfer(ctx, sp.TransferCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, FromNodeIdentity: placement.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestRedisDirectoryPlacementTimestampContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.SetTime(time.UnixMilli(503123))
-	recovered, err := dir.Recover(ctx, sp.RecoverCommand{GrainKey: transferred.GrainKey, NewNodeIdentity: placement.NodeIdentity, PlacementVersion: transferred.Version})
+	recovered, err := dir.Recover(ctx, sp.RecoverCommand{GrainKey: transferred.GrainKey, PlacementID: transferred.PlacementID, NewNodeIdentity: placement.NodeIdentity, PlacementVersion: transferred.Version})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestRedisDirectoryPlacementTimestampContract(t *testing.T) {
 	assertPersisted(t, recovered)
 }
 
-func TestRedisDirectoryReleaseAndReallocateTimestampContract(t *testing.T) {
+func TestRedisDirectoryReleaseDeletesAndReallocateUsesNewID(t *testing.T) {
 	ctx := context.Background()
 	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: 10 * time.Second})
 	server.SetTime(time.UnixMilli(600123))
@@ -203,22 +203,11 @@ func TestRedisDirectoryReleaseAndReallocateTimestampContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.SetTime(time.UnixMilli(601123))
-	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: first.GrainKey, NodeIdentity: first.NodeIdentity, NodeSessionID: first.OwnerNodeSessionID, PlacementVersion: first.Version}); err != nil {
+	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: first.GrainKey, PlacementID: first.PlacementID, NodeIdentity: first.NodeIdentity, NodeSessionID: first.OwnerNodeSessionID, PlacementVersion: first.Version}); err != nil {
 		t.Fatal(err)
 	}
-	released, err := dir.getPlacement(ctx, first.GrainKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if released.CreateTime != first.CreateTime || released.UpdateTime != time.UnixMilli(601123) {
-		t.Fatalf("released timestamps = %v / %v, first = %v / %v", released.CreateTime, released.UpdateTime, first.CreateTime, first.UpdateTime)
-	}
-	var wire map[string]any
-	if err := json.Unmarshal([]byte(client.Get(ctx, PlacementKey(first.GrainKey)).Val()), &wire); err != nil {
-		t.Fatal(err)
-	}
-	if wire["CreateTimeUnixMilli"] != float64(first.CreateTime.UnixMilli()) || wire["UpdateTimeUnixMilli"] != float64(601123) {
-		t.Fatalf("released wire timestamps = %#v", wire)
+	if client.Exists(ctx, PlacementKey(first.GrainKey)).Val() != 0 {
+		t.Fatal("released placement key was retained")
 	}
 
 	server.SetTime(time.UnixMilli(602123))
@@ -226,14 +215,17 @@ func TestRedisDirectoryReleaseAndReallocateTimestampContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Version != first.Version+2 || second.CreateTime != time.UnixMilli(602123) || second.UpdateTime != second.CreateTime {
+	if second.PlacementID == first.PlacementID || second.Version != 1 || second.CreateTime != time.UnixMilli(602123) || second.UpdateTime != second.CreateTime {
 		t.Fatalf("reallocated placement = %+v, first = %+v", second, first)
+	}
+	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: first.GrainKey, PlacementID: first.PlacementID, NodeIdentity: first.NodeIdentity, NodeSessionID: first.OwnerNodeSessionID, PlacementVersion: first.Version}); !errors.Is(err, sp.ErrVersionConflict) {
+		t.Fatalf("stale Release err = %v, want ErrVersionConflict", err)
 	}
 }
 
-func TestRedisDirectoryRecoverReleasedReturnsNotRecoverableV2(t *testing.T) {
+func TestRedisDirectoryRecoverReleasedReturnsNotFoundV2(t *testing.T) {
 	ctx := context.Background()
-	dir, client, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
+	dir, _, server := newTestDirectory(t, sp.NodeLeaseConfig{TTL: time.Second})
 	server.SetTime(time.Unix(550, 0))
 	a, b := testNode("game-1", "session-a"), testNode("game-2", "session-b")
 	for _, node := range []sp.Node{a, b} {
@@ -245,31 +237,17 @@ func TestRedisDirectoryRecoverReleasedReturnsNotRecoverableV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version}); err != nil {
+	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version}); err != nil {
 		t.Fatal(err)
 	}
 	target := a
 	if placement.NodeIdentity == a.NodeIdentity {
 		target = b
 	}
-	released := *placement
-	released.Version++
-	want := captureRouteMutationSnapshot(t, ctx, client, released, a.NodeIdentity, b.NodeIdentity)
-
-	t.Run("current version", func(t *testing.T) {
-		_, err := dir.Recover(ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: released.Version})
-		if !errors.Is(err, sp.ErrPlacementNotRecoverable) {
-			t.Fatalf("Recover released placement err = %v, want ErrPlacementNotRecoverable", err)
-		}
-		requireRouteMutationSnapshot(t, ctx, client, released, want, a.NodeIdentity, b.NodeIdentity)
-	})
-	t.Run("stale version", func(t *testing.T) {
-		_, err := dir.Recover(ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
-		if !errors.Is(err, sp.ErrVersionConflict) {
-			t.Fatalf("Recover released placement with stale version err = %v, want ErrVersionConflict", err)
-		}
-		requireRouteMutationSnapshot(t, ctx, client, released, want, a.NodeIdentity, b.NodeIdentity)
-	})
+	_, err = dir.Recover(ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NewNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
+	if !errors.Is(err, sp.ErrPlacementNotFound) {
+		t.Fatalf("Recover released placement err = %v, want ErrPlacementNotFound", err)
+	}
 }
 
 type delayedEvalClient struct {
@@ -352,11 +330,11 @@ func TestRedisDirectoryTransferAndRecoverUseCurrentTargetSession(t *testing.T) {
 	if p.NodeIdentity == b.NodeIdentity {
 		target = a
 	}
-	moved, err := dir.Transfer(ctx, sp.TransferCommand{GrainKey: p.GrainKey, FromNodeIdentity: p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: p.Version})
+	moved, err := dir.Transfer(ctx, sp.TransferCommand{GrainKey: p.GrainKey, PlacementID: p.PlacementID, FromNodeIdentity: p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: p.Version})
 	if err != nil || moved.OwnerNodeSessionID != target.NodeSessionID {
 		t.Fatalf("transfer = %+v, %v", moved, err)
 	}
-	if _, err := dir.Recover(ctx, sp.RecoverCommand{GrainKey: moved.GrainKey, NewNodeIdentity: p.NodeIdentity, PlacementVersion: moved.Version}); !errors.Is(err, sp.ErrPlacementNotRecoverable) {
+	if _, err := dir.Recover(ctx, sp.RecoverCommand{GrainKey: moved.GrainKey, PlacementID: moved.PlacementID, NewNodeIdentity: p.NodeIdentity, PlacementVersion: moved.Version}); !errors.Is(err, sp.ErrPlacementNotRecoverable) {
 		t.Fatalf("healthy recover = %v", err)
 	}
 	server.SetTime(time.UnixMilli(700500))
@@ -364,7 +342,7 @@ func TestRedisDirectoryTransferAndRecoverUseCurrentTargetSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.SetTime(time.Unix(701, 0))
-	recovered, err := dir.Recover(ctx, sp.RecoverCommand{GrainKey: moved.GrainKey, NewNodeIdentity: p.NodeIdentity, PlacementVersion: moved.Version})
+	recovered, err := dir.Recover(ctx, sp.RecoverCommand{GrainKey: moved.GrainKey, PlacementID: moved.PlacementID, NewNodeIdentity: p.NodeIdentity, PlacementVersion: moved.Version})
 	if err != nil || recovered.OwnerNodeSessionID == "" || recovered.Version != moved.Version+1 {
 		t.Fatalf("recover = %+v, %v", recovered, err)
 	}
@@ -386,7 +364,7 @@ func TestRedisDirectoryRenewAuditWrongTypeDoesNotChangeBusinessState(t *testing.
 	nraw := client.Get(ctx, NodeKey(node.NodeIdentity)).Val()
 	score := client.ZScore(ctx, NodeLeaseKey("game", "default"), NodeKey(node.NodeIdentity)).Val()
 	client.Set(ctx, AuditStreamKey(), "wrongtype", 0)
-	_, err = dir.Renew(ctx, sp.RenewCommand{GrainKey: p.GrainKey, NodeIdentity: p.NodeIdentity, NodeSessionID: p.OwnerNodeSessionID, PlacementVersion: p.Version})
+	_, err = dir.Renew(ctx, sp.RenewCommand{GrainKey: p.GrainKey, PlacementID: p.PlacementID, NodeIdentity: p.NodeIdentity, NodeSessionID: p.OwnerNodeSessionID, PlacementVersion: p.Version})
 	if err == nil {
 		t.Fatal("expected audit WRONGTYPE")
 	}
@@ -417,7 +395,7 @@ func TestRedisDirectoryTransferSequenceBoundaryIsAtomic(t *testing.T) {
 	oldScore := client.ZScore(ctx, PlacementNodeKey(p.NodeIdentity), p.GrainKey.String()).Val()
 	events := client.XLen(ctx, EventsStreamKey()).Val()
 	client.Set(ctx, SequenceKey(), "9007199254740991", 0)
-	if _, err := dir.Transfer(ctx, sp.TransferCommand{GrainKey: p.GrainKey, FromNodeIdentity: p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: p.Version}); err == nil {
+	if _, err := dir.Transfer(ctx, sp.TransferCommand{GrainKey: p.GrainKey, PlacementID: p.PlacementID, FromNodeIdentity: p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: p.Version}); err == nil {
 		t.Fatal("expected sequence boundary error")
 	}
 	if client.Get(ctx, PlacementKey(p.GrainKey)).Val() != praw || client.ZScore(ctx, PlacementNodeKey(p.NodeIdentity), p.GrainKey.String()).Val() != oldScore || client.ZCard(ctx, PlacementNodeKey(target.NodeIdentity)).Val() != 0 || client.XLen(ctx, EventsStreamKey()).Val() != events {
@@ -445,7 +423,7 @@ func TestRedisDirectoryReleaseRejectsOwnerNodeKeyMismatchWithoutMutation(t *test
 	changed, _ := json.Marshal(stored)
 	client.Set(ctx, NodeKey(node.NodeIdentity), changed, 0)
 	before := captureRouteMutationSnapshot(t, ctx, client, *p, node.NodeIdentity)
-	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: p.GrainKey, NodeIdentity: p.NodeIdentity, NodeSessionID: p.OwnerNodeSessionID, PlacementVersion: p.Version}); err == nil {
+	if err := dir.Release(ctx, sp.ReleaseCommand{GrainKey: p.GrainKey, PlacementID: p.PlacementID, NodeIdentity: p.NodeIdentity, NodeSessionID: p.OwnerNodeSessionID, PlacementVersion: p.Version}); err == nil {
 		t.Fatal("expected owner NodeKey mismatch")
 	}
 	requireRouteMutationSnapshot(t, ctx, client, *p, before, node.NodeIdentity)
@@ -498,9 +476,9 @@ func TestRedisDirectoryTransferRecoverRejectTargetMetadataChangedBeforeEval(t *t
 			}
 			before := captureRouteMutationSnapshot(t, ctx, client, *p, p.NodeIdentity, target.NodeIdentity)
 			if mode == "transfer" {
-				_, err = hooked.Transfer(ctx, sp.TransferCommand{GrainKey: p.GrainKey, FromNodeIdentity: p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: p.Version})
+				_, err = hooked.Transfer(ctx, sp.TransferCommand{GrainKey: p.GrainKey, PlacementID: p.PlacementID, FromNodeIdentity: p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: p.Version})
 			} else {
-				_, err = hooked.Recover(ctx, sp.RecoverCommand{GrainKey: p.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: p.Version})
+				_, err = hooked.Recover(ctx, sp.RecoverCommand{GrainKey: p.GrainKey, PlacementID: p.PlacementID, NewNodeIdentity: target.NodeIdentity, PlacementVersion: p.Version})
 			}
 			if err == nil {
 				t.Fatal("expected target metadata error")

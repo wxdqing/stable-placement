@@ -32,6 +32,7 @@ type redisPlacement struct {
 	GrainID             string
 	Kind                string
 	GrainKey            sp.GrainKey
+	PlacementID         string
 	NodeIdentity        string
 	OwnerNodeSessionID  string
 	Version             int64
@@ -42,7 +43,7 @@ type redisPlacement struct {
 
 func redisPlacementFromPlacement(placement sp.Placement) redisPlacement {
 	return redisPlacement{
-		GrainID: placement.GrainID, Kind: placement.Kind, GrainKey: placement.GrainKey,
+		GrainID: placement.GrainID, Kind: placement.Kind, GrainKey: placement.GrainKey, PlacementID: placement.PlacementID,
 		NodeIdentity: placement.NodeIdentity, OwnerNodeSessionID: placement.OwnerNodeSessionID,
 		Version: placement.Version, Status: placement.Status,
 		CreateTimeUnixMilli: placement.CreateTime.UnixMilli(), UpdateTimeUnixMilli: placement.UpdateTime.UnixMilli(),
@@ -51,7 +52,7 @@ func redisPlacementFromPlacement(placement sp.Placement) redisPlacement {
 
 func (placement redisPlacement) placement() sp.Placement {
 	return sp.Placement{
-		GrainID: placement.GrainID, Kind: placement.Kind, GrainKey: placement.GrainKey,
+		GrainID: placement.GrainID, Kind: placement.Kind, GrainKey: placement.GrainKey, PlacementID: placement.PlacementID,
 		NodeIdentity: placement.NodeIdentity, OwnerNodeSessionID: placement.OwnerNodeSessionID,
 		Version: placement.Version, Status: placement.Status,
 		CreateTime: time.UnixMilli(placement.CreateTimeUnixMilli), UpdateTime: time.UnixMilli(placement.UpdateTimeUnixMilli),
@@ -299,7 +300,7 @@ func (d *Directory) Lookup(ctx context.Context, key sp.GrainKey) (*sp.PlacementR
 	if !time.Now().Before(validUntil) {
 		return nil, sp.ErrPlacementNotFound
 	}
-	return &sp.PlacementRoute{GrainKey: current.GrainKey, NodeIdentity: current.NodeIdentity, OwnerNodeSessionID: current.OwnerNodeSessionID, Version: current.Version, Status: current.Status, NodeLeaseVersion: leaseVersion, ValidUntil: validUntil}, nil
+	return &sp.PlacementRoute{GrainKey: current.GrainKey, PlacementID: current.PlacementID, NodeIdentity: current.NodeIdentity, OwnerNodeSessionID: current.OwnerNodeSessionID, Version: current.Version, Status: current.Status, NodeLeaseVersion: leaseVersion, ValidUntil: validUntil}, nil
 }
 
 func (d *Directory) ResolveRoute(ctx context.Context, cmd sp.ResolveRouteCommand) (*sp.PlacementRoute, error) {
@@ -320,6 +321,10 @@ func (d *Directory) ResolveRoute(ctx context.Context, cmd sp.ResolveRouteCommand
 }
 
 func (d *Directory) resolveRouteOnce(ctx context.Context, key sp.GrainKey, cmd sp.ResolveRouteCommand) (*sp.PlacementRoute, error) {
+	placementID, err := sp.NewPlacementID()
+	if err != nil {
+		return nil, err
+	}
 	oldRaw := ""
 	oldIndex := PlacementNodeKey("")
 	oldNode := NodeKey("")
@@ -345,6 +350,7 @@ func (d *Directory) resolveRouteOnce(ctx context.Context, key sp.GrainKey, cmd s
 		ownerType, ownerGroup, ownerName,
 	}
 	args = append(args, d.resourceStrategyArgs()...)
+	args = append(args, placementID)
 	result, err := d.client.Eval(ctx, resolveRouteLua, []string{
 		PlacementKey(key), NodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup),
 		InvalidNodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup), StrategyRoundRobinKey(cmd.TargetNodeType, cmd.TargetNodeGroup),
@@ -390,7 +396,7 @@ func (d *Directory) resolveRouteOnce(ctx context.Context, key sp.GrainKey, cmd s
 	}
 	placement := wire.placement()
 	return &sp.PlacementRoute{
-		GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity,
+		GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity,
 		OwnerNodeSessionID: placement.OwnerNodeSessionID, Version: placement.Version,
 		Status: placement.Status, NodeLeaseVersion: leaseVersion, ValidUntil: validUntil,
 	}, nil
@@ -403,6 +409,10 @@ func NodeLeaseKeyForNode(p sp.Placement) string {
 
 func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.Placement, error) {
 	key, err := sp.NewGrainKey(cmd.Kind, cmd.GrainID)
+	if err != nil {
+		return nil, err
+	}
+	placementID, err := sp.NewPlacementID()
 	if err != nil {
 		return nil, err
 	}
@@ -423,6 +433,7 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 	}
 	args := []interface{}{cmd.GrainID, cmd.Kind, key.String(), oldRaw, string(sp.EventPlacementCreated), cmd.TargetNodeType, cmd.TargetNodeGroup}
 	args = append(args, d.resourceStrategyArgs()...)
+	args = append(args, placementID)
 	result, err := d.client.Eval(ctx, allocateLua, []string{PlacementKey(key), NodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup), InvalidNodesKey(cmd.TargetNodeType, cmd.TargetNodeGroup), StrategyRoundRobinKey(cmd.TargetNodeType, cmd.TargetNodeGroup), NodeLeaseKey(cmd.TargetNodeType, cmd.TargetNodeGroup), SequenceKey(), EventsStreamKey(), oldIndex, oldNode, ownerLease}, args...).Result()
 	if err != nil {
 		return nil, err
@@ -455,7 +466,7 @@ func (d *Directory) Renew(ctx context.Context, cmd sp.RenewCommand) (*sp.Placeme
 	if err != nil {
 		return nil, err
 	}
-	result, err := d.client.Eval(ctx, renewPlacementLua, []string{PlacementKey(cmd.GrainKey), NodeKey(p.NodeIdentity), NodeLeaseKeyForNode(*p), AuditStreamKey()}, string(raw), cmd.NodeIdentity, cmd.NodeSessionID, strconv.FormatInt(cmd.PlacementVersion, 10), string(sp.EventPlacementRenewed), cmd.GrainKey.String()).Result()
+	result, err := d.client.Eval(ctx, renewPlacementLua, []string{PlacementKey(cmd.GrainKey), NodeKey(p.NodeIdentity), NodeLeaseKeyForNode(*p), AuditStreamKey()}, string(raw), cmd.NodeIdentity, cmd.NodeSessionID, strconv.FormatInt(cmd.PlacementVersion, 10), string(sp.EventPlacementRenewed), cmd.GrainKey.String(), cmd.PlacementID).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -468,16 +479,16 @@ func (d *Directory) Renew(ctx context.Context, cmd sp.RenewCommand) (*sp.Placeme
 }
 
 func (d *Directory) Release(ctx context.Context, cmd sp.ReleaseCommand) error {
-	_, err := d.mutate(ctx, "release", cmd.GrainKey, cmd.NodeIdentity, "", cmd.NodeSessionID, cmd.PlacementVersion, sp.EventPlacementReleased)
+	_, err := d.mutate(ctx, "release", cmd.GrainKey, cmd.PlacementID, cmd.NodeIdentity, "", cmd.NodeSessionID, cmd.PlacementVersion, sp.EventPlacementReleased)
 	return err
 }
 func (d *Directory) Transfer(ctx context.Context, cmd sp.TransferCommand) (*sp.Placement, error) {
-	return d.mutate(ctx, "transfer", cmd.GrainKey, cmd.FromNodeIdentity, cmd.ToNodeIdentity, "", cmd.PlacementVersion, sp.EventPlacementTransferred)
+	return d.mutate(ctx, "transfer", cmd.GrainKey, cmd.PlacementID, cmd.FromNodeIdentity, cmd.ToNodeIdentity, "", cmd.PlacementVersion, sp.EventPlacementTransferred)
 }
 func (d *Directory) Recover(ctx context.Context, cmd sp.RecoverCommand) (*sp.Placement, error) {
-	return d.mutate(ctx, "recover", cmd.GrainKey, "", cmd.NewNodeIdentity, "", cmd.PlacementVersion, sp.EventPlacementRecovered)
+	return d.mutate(ctx, "recover", cmd.GrainKey, cmd.PlacementID, "", cmd.NewNodeIdentity, "", cmd.PlacementVersion, sp.EventPlacementRecovered)
 }
-func (d *Directory) mutate(ctx context.Context, mode string, key sp.GrainKey, from, target, session string, version int64, event sp.EventType) (*sp.Placement, error) {
+func (d *Directory) mutate(ctx context.Context, mode string, key sp.GrainKey, placementID, from, target, session string, version int64, event sp.EventType) (*sp.Placement, error) {
 	raw, p, err := d.getPlacementRaw(ctx, key)
 	if err != nil {
 		return nil, err
@@ -496,7 +507,7 @@ func (d *Directory) mutate(ctx context.Context, mode string, key sp.GrainKey, fr
 	ownerLeaseKey := NodeLeaseKey(ownerID.NodeType(), ownerID.NodeGroup())
 	targetID := sp.NodeIdentity(target)
 	targetInvalidKey := InvalidNodesKey(targetID.NodeType(), targetID.NodeGroup())
-	result, err := d.client.Eval(ctx, mutationLua, []string{PlacementKey(key), NodeKey(p.NodeIdentity), targetKey, PlacementNodeKey(p.NodeIdentity), newIndex, leaseKey, EventsStreamKey(), ownerLeaseKey, targetInvalidKey, SequenceKey()}, mode, string(raw), from, target, session, strconv.FormatInt(version, 10), string(event), key.String(), ownerID.NodeType(), ownerID.NodeGroup(), ownerID.NodeName(), targetID.NodeType(), targetID.NodeGroup(), targetID.NodeName()).Result()
+	result, err := d.client.Eval(ctx, mutationLua, []string{PlacementKey(key), NodeKey(p.NodeIdentity), targetKey, PlacementNodeKey(p.NodeIdentity), newIndex, leaseKey, EventsStreamKey(), ownerLeaseKey, targetInvalidKey, SequenceKey()}, mode, string(raw), from, target, session, strconv.FormatInt(version, 10), string(event), key.String(), ownerID.NodeType(), ownerID.NodeGroup(), ownerID.NodeName(), targetID.NodeType(), targetID.NodeGroup(), targetID.NodeName(), placementID).Result()
 	if err != nil {
 		return nil, err
 	}

@@ -20,12 +20,7 @@ func TestSession_E1_OldSessionRenewFailsAfterReplace(t *testing.T) {
 
 	h.replaceSession("game-1", "session-b")
 
-	_, err := h.dir.Renew(h.ctx, sp.RenewCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node.NodeIdentity,
-		NodeSessionID:    "session-a",
-		PlacementVersion: placement.Version,
-	})
+	_, err := h.dir.Renew(h.ctx, sp.RenewCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: node.NodeIdentity, NodeSessionID: "session-a", PlacementVersion: placement.Version})
 	h.mustErrIs(err, sp.ErrInvalidNodeSession, "Renew old session")
 }
 
@@ -39,12 +34,7 @@ func TestSession_E2_NewSessionDoesNotInheritOldPlacement(t *testing.T) {
 
 	h.replaceSession("game-1", "session-b")
 
-	err := h.dir.Release(h.ctx, sp.ReleaseCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node.NodeIdentity,
-		NodeSessionID:    "session-a",
-		PlacementVersion: placement.Version,
-	})
+	err := h.dir.Release(h.ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: node.NodeIdentity, NodeSessionID: "session-a", PlacementVersion: placement.Version})
 	h.mustErrIs(err, sp.ErrInvalidNodeSession, "Release old session")
 
 	_, err = h.dir.Lookup(h.ctx, placement.GrainKey)

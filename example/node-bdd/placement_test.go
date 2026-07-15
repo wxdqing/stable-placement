@@ -49,12 +49,7 @@ func TestPlacement_D3_RenewValidatesWithoutChangingPlacementOrNodeLease(t *testi
 	placement := h.allocate(h.grainID("d3"))
 	leaseBefore := h.listGameNodes()[0].Lease
 
-	renewed, err := h.dir.Renew(h.ctx, sp.RenewCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     placement.NodeIdentity,
-		NodeSessionID:    placement.OwnerNodeSessionID,
-		PlacementVersion: placement.Version,
-	})
+	renewed, err := h.dir.Renew(h.ctx, sp.RenewCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version})
 	h.must(err, "Renew")
 	if renewed.Version != placement.Version || renewed.NodeIdentity != placement.NodeIdentity || renewed.OwnerNodeSessionID != placement.OwnerNodeSessionID {
 		t.Fatalf("renewed placement = %+v, want unchanged %+v", renewed, placement)
@@ -81,20 +76,10 @@ func TestPlacement_D4_RenewRejectsWrongOwnerAndSession(t *testing.T) {
 	node2 := h.registerGame("game-2", "session-b")
 	placement := h.allocate(h.grainID("d4"))
 
-	_, err := h.dir.Renew(h.ctx, sp.RenewCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node2.NodeIdentity,
-		NodeSessionID:    node2.NodeSessionID,
-		PlacementVersion: placement.Version,
-	})
+	_, err := h.dir.Renew(h.ctx, sp.RenewCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: node2.NodeIdentity, NodeSessionID: node2.NodeSessionID, PlacementVersion: placement.Version})
 	h.mustErrIs(err, sp.ErrInvalidOwner, "Renew wrong owner")
 
-	_, err = h.dir.Renew(h.ctx, sp.RenewCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     node1.NodeIdentity,
-		NodeSessionID:    "stale-session",
-		PlacementVersion: placement.Version,
-	})
+	_, err = h.dir.Renew(h.ctx, sp.RenewCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: node1.NodeIdentity, NodeSessionID: "stale-session", PlacementVersion: placement.Version})
 	h.mustErrIs(err, sp.ErrInvalidNodeSession, "Renew stale session")
 }
 
@@ -107,12 +92,7 @@ func TestPlacement_D5_ReleaseThenReallocate(t *testing.T) {
 	grainID := h.grainID("d5")
 	placement := h.allocate(grainID)
 
-	h.must(h.dir.Release(h.ctx, sp.ReleaseCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     placement.NodeIdentity,
-		NodeSessionID:    placement.OwnerNodeSessionID,
-		PlacementVersion: placement.Version,
-	}), "Release")
+	h.must(h.dir.Release(h.ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version}), "Release")
 
 	_, err := h.dir.Lookup(h.ctx, placement.GrainKey)
 	h.mustErrIs(err, sp.ErrPlacementNotFound, "Lookup after release")
@@ -136,11 +116,7 @@ func TestPlacement_D6_RecoverRejectsHealthyOwner(t *testing.T) {
 		target = node1
 	}
 
-	_, err := h.dir.Recover(h.ctx, sp.RecoverCommand{
-		GrainKey:         placement.GrainKey,
-		NewNodeIdentity:  target.NodeIdentity,
-		PlacementVersion: placement.Version,
-	})
+	_, err := h.dir.Recover(h.ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NewNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
 	h.mustErrIs(err, sp.ErrPlacementNotRecoverable, "Recover healthy owner")
 	retained := h.placementsOn(sp.Node{NodeIdentity: placement.NodeIdentity})
 	if len(retained) != 1 || retained[0].Version != placement.Version || retained[0].NodeIdentity != placement.NodeIdentity {
@@ -161,12 +137,7 @@ func TestPlacement_D7_TransferChangesOwner(t *testing.T) {
 		owner, target = node2, node1
 	}
 
-	transferred, err := h.dir.Transfer(h.ctx, sp.TransferCommand{
-		GrainKey:         placement.GrainKey,
-		FromNodeIdentity: placement.NodeIdentity,
-		ToNodeIdentity:   target.NodeIdentity,
-		PlacementVersion: placement.Version,
-	})
+	transferred, err := h.dir.Transfer(h.ctx, sp.TransferCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, FromNodeIdentity: placement.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
 	h.must(err, "Transfer")
 	if transferred.NodeIdentity != target.NodeIdentity || transferred.OwnerNodeSessionID != target.NodeSessionID || transferred.Version != placement.Version+1 {
 		t.Fatalf("transferred = %+v", transferred)
@@ -228,12 +199,7 @@ func TestPlacement_D9_ExpiredSameSessionCanRelease(t *testing.T) {
 	if len(retained) != 1 {
 		t.Fatalf("FindByNode placements = %+v", retained)
 	}
-	h.must(h.dir.Release(h.ctx, sp.ReleaseCommand{
-		GrainKey:         retained[0].GrainKey,
-		NodeIdentity:     retained[0].NodeIdentity,
-		NodeSessionID:    retained[0].OwnerNodeSessionID,
-		PlacementVersion: retained[0].Version,
-	}), "Release expired same-session placement")
+	h.must(h.dir.Release(h.ctx, sp.ReleaseCommand{GrainKey: retained[0].GrainKey, PlacementID: retained[0].PlacementID, NodeIdentity: retained[0].NodeIdentity, NodeSessionID: retained[0].OwnerNodeSessionID, PlacementVersion: retained[0].Version}), "Release expired same-session placement")
 	if got := h.placementsOn(node); len(got) != 0 {
 		t.Fatalf("placements after Release = %+v", got)
 	}
@@ -253,12 +219,7 @@ func TestPlacement_D10_ExistsOnlyForActive(t *testing.T) {
 		t.Fatal("Exists = false for active placement")
 	}
 
-	h.must(h.dir.Release(h.ctx, sp.ReleaseCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     placement.NodeIdentity,
-		NodeSessionID:    placement.OwnerNodeSessionID,
-		PlacementVersion: placement.Version,
-	}), "Release")
+	h.must(h.dir.Release(h.ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version}), "Release")
 
 	ok, err = h.dir.Exists(h.ctx, placement.GrainKey)
 	h.must(err, "Exists released")

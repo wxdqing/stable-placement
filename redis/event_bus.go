@@ -22,110 +22,6 @@ type EventBus struct {
 	degraded bool
 }
 
-const trimStreamLua = `
-if redis.call("EXISTS", KEYS[1]) == 0 then
-	return 0
-end
-
-local groups = redis.call("XINFO", "GROUPS", KEYS[1])
-for _, group in ipairs(groups) do
-	local pending = nil
-	local lag = nil
-	for index = 1, #group, 2 do
-		if group[index] == "pending" then
-			pending = group[index + 1]
-		elseif group[index] == "lag" then
-			lag = group[index + 1]
-		end
-	end
-	if type(pending) ~= "number" or pending > 0 then
-		return 0
-	end
-	if type(lag) ~= "number" or lag ~= 0 then
-		return 0
-	end
-end
-
-return redis.call("XTRIM", KEYS[1], "MAXLEN", "=", ARGV[1])
-`
-
-const replaceConsumerLua = `
-local groups = redis.call("XINFO", "GROUPS", KEYS[1])
-local old_found = false
-local new_found = false
-
-for _, group in ipairs(groups) do
-	local name = nil
-	local pending = nil
-	local lag = nil
-	for index = 1, #group, 2 do
-		if group[index] == "name" then
-			name = group[index + 1]
-		elseif group[index] == "pending" then
-			pending = group[index + 1]
-		elseif group[index] == "lag" then
-			lag = group[index + 1]
-		end
-	end
-	if name == ARGV[1] then
-		old_found = true
-		if type(pending) ~= "number" or pending ~= 0 then
-			return 1
-		end
-		if type(lag) ~= "number" or lag ~= 0 then
-			return 1
-		end
-	elseif name == ARGV[2] then
-		new_found = true
-	end
-end
-
-if not old_found then
-	if new_found then
-		return 0
-	end
-	return redis.error_reply("NOGROUP old consumer group does not exist")
-end
-
-if not new_found then
-	redis.call("XGROUP", "CREATE", KEYS[1], ARGV[2], "$")
-end
-redis.call("XGROUP", "DESTROY", KEYS[1], ARGV[1])
-return 0
-`
-
-const closeConsumerGroupIfIdleLua = `
-if redis.call("EXISTS", KEYS[1]) == 0 then
-	return 0
-end
-local groups = redis.call("XINFO", "GROUPS", KEYS[1])
-for _, group in ipairs(groups) do
-	local name = nil
-	local pending = nil
-	local lag = nil
-	for index = 1, #group, 2 do
-		if group[index] == "name" then
-			name = group[index + 1]
-		elseif group[index] == "pending" then
-			pending = group[index + 1]
-		elseif group[index] == "lag" then
-			lag = group[index + 1]
-		end
-	end
-	if name == ARGV[1] then
-		if type(pending) ~= "number" or pending ~= 0 then
-			return 1
-		end
-		if type(lag) ~= "number" or lag ~= 0 then
-			return 1
-		end
-		redis.call("XGROUP", "DESTROY", KEYS[1], ARGV[1])
-		return 0
-	end
-end
-return 0
-`
-
 func NewEventBus(client goredis.UniversalClient, consumer StreamConsumer) *EventBus {
 	return &EventBus{
 		client:   client,
@@ -601,6 +497,7 @@ func eventValues(event sp.PlacementEvent) map[string]any {
 	return map[string]any{
 		"type":               string(event.Type),
 		"grain_key":          event.GrainKey.String(),
+		"placement_id":       event.PlacementID,
 		"node_identity":      event.NodeIdentity,
 		"node_session_id":    event.NodeSessionID,
 		"node_type":          event.NodeType,
@@ -619,6 +516,7 @@ func parseEvent(values map[string]any) (sp.PlacementEvent, error) {
 	event := sp.PlacementEvent{
 		Type:          sp.EventType(eventType),
 		GrainKey:      sp.GrainKey(stringValue(values["grain_key"])),
+		PlacementID:   stringValue(values["placement_id"]),
 		NodeIdentity:  stringValue(values["node_identity"]),
 		NodeSessionID: stringValue(values["node_session_id"]),
 		NodeType:      stringValue(values["node_type"]),

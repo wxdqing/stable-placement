@@ -24,8 +24,12 @@ func TestRedisEventBusRejectsIncompleteNodeLeaseExpired(t *testing.T) {
 }
 
 func TestRedisEventBusPlacementPayloadHasNoGrainLeaseVersion(t *testing.T) {
-	values := eventValues(sp.PlacementEvent{Type: sp.EventPlacementReleased, GrainKey: "Player/1", PlacementVersion: 2})
+	values := eventValues(sp.PlacementEvent{Type: sp.EventPlacementReleased, GrainKey: "Player/1", PlacementID: "placement-1", PlacementVersion: 2})
 	if _, ok := values["lease_version"]; ok {
 		t.Fatal("placement payload retained grain lease version")
+	}
+	parsed, err := parseEvent(values)
+	if err != nil || parsed.PlacementID != "placement-1" {
+		t.Fatalf("parsed event = %+v, err=%v", parsed, err)
 	}
 }

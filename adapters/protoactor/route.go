@@ -12,6 +12,7 @@ import (
 type PIDRoute struct {
 	PID              *actor.PID
 	GrainKey         sp.GrainKey
+	PlacementID      string
 	NodeIdentity     string
 	NodeSessionID    string
 	PlacementVersion int64
@@ -29,6 +30,7 @@ type PIDActivator interface {
 }
 
 type ExpectedRoute struct {
+	PlacementID        string
 	NodeIdentity       string
 	OwnerNodeSessionID string
 	PlacementVersion   int64

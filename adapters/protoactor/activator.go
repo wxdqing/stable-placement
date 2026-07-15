@@ -52,7 +52,7 @@ func (a *SerialActivator) Activate(ctx context.Context, identity *cluster.Cluste
 	if err != nil {
 		return nil, err
 	}
-	if current.NodeIdentity != expected.NodeIdentity || current.OwnerNodeSessionID != expected.OwnerNodeSessionID || current.Version != expected.Version || !time.Now().Before(current.ValidUntil) {
+	if current.PlacementID != expected.PlacementID || current.NodeIdentity != expected.NodeIdentity || current.OwnerNodeSessionID != expected.OwnerNodeSessionID || current.Version != expected.Version || !time.Now().Before(current.ValidUntil) {
 		return nil, sp.ErrVersionConflict
 	}
 	if route, ok := a.active[key]; ok && sameAuthorization(route, current) && route.PID != nil {

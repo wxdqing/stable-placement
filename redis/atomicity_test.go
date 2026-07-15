@@ -148,11 +148,11 @@ func TestRedisDirectoryMutationWrongTypeV2IsAtomic(t *testing.T) {
 			case "allocate":
 				_, err = f.dir.Allocate(ctx, sp.AllocateCommand{GrainID: "new-" + tc.corrupt, Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
 			case "release":
-				err = f.dir.Release(ctx, sp.ReleaseCommand{GrainKey: f.p.GrainKey, NodeIdentity: f.p.NodeIdentity, NodeSessionID: f.p.OwnerNodeSessionID, PlacementVersion: f.p.Version})
+				err = f.dir.Release(ctx, sp.ReleaseCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, NodeIdentity: f.p.NodeIdentity, NodeSessionID: f.p.OwnerNodeSessionID, PlacementVersion: f.p.Version})
 			case "transfer":
-				_, err = f.dir.Transfer(ctx, sp.TransferCommand{GrainKey: f.p.GrainKey, FromNodeIdentity: f.p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
+				_, err = f.dir.Transfer(ctx, sp.TransferCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, FromNodeIdentity: f.p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
 			case "recover":
-				_, err = f.dir.Recover(ctx, sp.RecoverCommand{GrainKey: f.p.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
+				_, err = f.dir.Recover(ctx, sp.RecoverCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, NewNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
 			}
 			if err == nil || !strings.Contains(err.Error(), "WRONGTYPE") {
 				t.Fatalf("err=%v", err)
@@ -263,11 +263,11 @@ func TestRedisDirectoryPlacementMutationWrongTypeKeyMatrixV2(t *testing.T) {
 			before := snapshotRedisKeysV2(t, f.client, f.keys...)
 			var err error
 			if tc.operation == "release" {
-				err = f.dir.Release(ctx, sp.ReleaseCommand{GrainKey: f.p.GrainKey, NodeIdentity: f.p.NodeIdentity, NodeSessionID: f.p.OwnerNodeSessionID, PlacementVersion: f.p.Version})
+				err = f.dir.Release(ctx, sp.ReleaseCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, NodeIdentity: f.p.NodeIdentity, NodeSessionID: f.p.OwnerNodeSessionID, PlacementVersion: f.p.Version})
 			} else if tc.operation == "transfer" {
-				_, err = f.dir.Transfer(ctx, sp.TransferCommand{GrainKey: f.p.GrainKey, FromNodeIdentity: f.p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
+				_, err = f.dir.Transfer(ctx, sp.TransferCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, FromNodeIdentity: f.p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
 			} else {
-				_, err = f.dir.Recover(ctx, sp.RecoverCommand{GrainKey: f.p.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
+				_, err = f.dir.Recover(ctx, sp.RecoverCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, NewNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
 			}
 			if err == nil || !strings.Contains(err.Error(), "WRONGTYPE") {
 				t.Fatalf("err=%v", err)
@@ -302,11 +302,11 @@ func TestRedisDirectoryMalformedJSONV2IsAtomic(t *testing.T) {
 			case "allocate":
 				_, err = f.dir.Allocate(ctx, sp.AllocateCommand{GrainID: "new-malformed", Kind: "Player", TargetNodeType: "game", TargetNodeGroup: "default"})
 			case "release":
-				err = f.dir.Release(ctx, sp.ReleaseCommand{GrainKey: f.p.GrainKey, NodeIdentity: f.p.NodeIdentity, NodeSessionID: f.p.OwnerNodeSessionID, PlacementVersion: f.p.Version})
+				err = f.dir.Release(ctx, sp.ReleaseCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, NodeIdentity: f.p.NodeIdentity, NodeSessionID: f.p.OwnerNodeSessionID, PlacementVersion: f.p.Version})
 			case "transfer":
-				_, err = f.dir.Transfer(ctx, sp.TransferCommand{GrainKey: f.p.GrainKey, FromNodeIdentity: f.p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
+				_, err = f.dir.Transfer(ctx, sp.TransferCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, FromNodeIdentity: f.p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
 			case "recover":
-				_, err = f.dir.Recover(ctx, sp.RecoverCommand{GrainKey: f.p.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
+				_, err = f.dir.Recover(ctx, sp.RecoverCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, NewNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
 			}
 			if err == nil {
 				t.Fatal("expected malformed JSON error")
@@ -347,9 +347,9 @@ func TestRedisDirectoryRenewReleaseEscapedSessionExactV2(t *testing.T) {
 				t.Fatal(err)
 			}
 			if operation == "renew" {
-				_, err = dir.Renew(ctx, sp.RenewCommand{GrainKey: p.GrainKey, NodeIdentity: p.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: p.Version})
+				_, err = dir.Renew(ctx, sp.RenewCommand{GrainKey: p.GrainKey, PlacementID: p.PlacementID, NodeIdentity: p.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: p.Version})
 			} else {
-				err = dir.Release(ctx, sp.ReleaseCommand{GrainKey: p.GrainKey, NodeIdentity: p.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: p.Version})
+				err = dir.Release(ctx, sp.ReleaseCommand{GrainKey: p.GrainKey, PlacementID: p.PlacementID, NodeIdentity: p.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: p.Version})
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -417,7 +417,7 @@ func TestRedisDirectoryReleaseRejectsSessionReplacedBeforeEvalV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = hooked.Release(ctx, sp.ReleaseCommand{GrainKey: p.GrainKey, NodeIdentity: p.NodeIdentity, NodeSessionID: p.OwnerNodeSessionID, PlacementVersion: p.Version})
+	err = hooked.Release(ctx, sp.ReleaseCommand{GrainKey: p.GrainKey, PlacementID: p.PlacementID, NodeIdentity: p.NodeIdentity, NodeSessionID: p.OwnerNodeSessionID, PlacementVersion: p.Version})
 	if !errors.Is(err, sp.ErrInvalidNodeSession) {
 		t.Fatalf("err=%v", err)
 	}
@@ -445,7 +445,7 @@ func TestRedisDirectoryTransferTargetInvalidatedBeforeEvalV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = hooked.Transfer(ctx, sp.TransferCommand{GrainKey: f.p.GrainKey, FromNodeIdentity: f.p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
+	_, err = hooked.Transfer(ctx, sp.TransferCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, FromNodeIdentity: f.p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
 	if !errors.Is(err, sp.ErrNoAvailableNode) {
 		t.Fatalf("err=%v", err)
 	}
@@ -474,7 +474,7 @@ func TestRedisDirectoryRecoverTargetUnregisteredBeforeEvalV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = hooked.Recover(ctx, sp.RecoverCommand{GrainKey: f.p.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
+	_, err = hooked.Recover(ctx, sp.RecoverCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, NewNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
 	if !errors.Is(err, sp.ErrNoAvailableNode) {
 		t.Fatalf("err=%v", err)
 	}
@@ -508,9 +508,9 @@ func TestRedisDirectoryTransferRecoverUsesTargetSessionAtEvalV2(t *testing.T) {
 			}
 			var updated *sp.Placement
 			if operation == "transfer" {
-				updated, err = hooked.Transfer(ctx, sp.TransferCommand{GrainKey: f.p.GrainKey, FromNodeIdentity: f.p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
+				updated, err = hooked.Transfer(ctx, sp.TransferCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, FromNodeIdentity: f.p.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
 			} else {
-				updated, err = hooked.Recover(ctx, sp.RecoverCommand{GrainKey: f.p.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
+				updated, err = hooked.Recover(ctx, sp.RecoverCommand{GrainKey: f.p.GrainKey, PlacementID: f.p.PlacementID, NewNodeIdentity: target.NodeIdentity, PlacementVersion: f.p.Version})
 			}
 			if err != nil {
 				t.Fatal(err)

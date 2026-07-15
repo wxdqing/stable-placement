@@ -302,6 +302,7 @@ func TestRedisEventBusBroadcastsToUniqueConsumerGroups(t *testing.T) {
 	event := sp.PlacementEvent{
 		Type:             sp.EventPlacementTransferred,
 		GrainKey:         sp.GrainKey("Player/10001"),
+		PlacementID:      "placement-1",
 		NodeIdentity:     "game/default/game-2",
 		PlacementVersion: 2,
 		NodeSessionID:    "session-a",

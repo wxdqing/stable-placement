@@ -1,0 +1,6 @@
+
+local e=expect_type(KEYS[1],"string","node") or expect_type(KEYS[2],"set","invalid") or expect_type(KEYS[3],"zset","leases") or expect_type(KEYS[4],"stream","events");if e then return e end
+local raw=redis.call("GET",KEYS[1]);if not raw then return "node_not_found" end;local node,de=decode(raw,"node");if de then return de end;if redis.call("SISMEMBER",KEYS[2],ARGV[1])==0 then return "node_not_invalid" end
+if node["NodeKey"]~=ARGV[3] then return redis.error_reply("IDENTITY_MISMATCH") end;local score=redis.call("ZSCORE",KEYS[3],ARGV[3]);if node["Status"]=="offline" then if score and tonumber(score)~=tonumber(node["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end;return "node_not_found" end;if node["Status"]~="active" and node["Status"]~="draining" then return redis.error_reply("INVALID_NODE_STATUS") end;if not score or tonumber(score)~=tonumber(node["Lease"]["ExpireAtUnixMilli"] or -1) then return redis.error_reply("LEASE_SCORE_MISMATCH") end
+node["Status"]="draining";redis.call("SET",KEYS[1],cjson.encode(node));node_event(KEYS[4],ARGV[2],node["NodeIdentity"],node["NodeSessionID"],node["NodeType"],node["NodeGroup"],node["NodeName"],tostring(node["Lease"]["Version"]));return "ok"
+

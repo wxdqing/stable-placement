@@ -119,7 +119,7 @@ func TestDirectoryLookupRejectsReleasedPlacement(t *testing.T) {
 	directory, _, _ := newTestDirectory(t)
 	node := registerTestNode(t, directory, "game-1", "session-a")
 	placement := allocateTestPlacement(t, directory, "10001", node)
-	if err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version}); err != nil {
+	if err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := directory.Lookup(context.Background(), placement.GrainKey); !errors.Is(err, sp.ErrPlacementNotFound) {
@@ -186,7 +186,7 @@ func TestDirectoryAllocateExistingPlacementRules(t *testing.T) {
 	}
 }
 
-func TestDirectoryAllocateReleasedPlacementAdvancesHistory(t *testing.T) {
+func TestDirectoryReleaseDeletesPlacementAndReallocateUsesNewID(t *testing.T) {
 	directory, clock, _ := newTestDirectory(t)
 	node := registerTestNode(t, directory, "game-1", "session-a")
 	first := allocateTestPlacement(t, directory, "10001", node)
@@ -194,17 +194,19 @@ func TestDirectoryAllocateReleasedPlacementAdvancesHistory(t *testing.T) {
 		t.Fatalf("allocated timestamps = %v / %v", first.CreateTime, first.UpdateTime)
 	}
 	clock.Advance(time.Second)
-	if err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: first.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: first.Version}); err != nil {
+	if err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: first.GrainKey, PlacementID: first.PlacementID, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: first.Version}); err != nil {
 		t.Fatal(err)
 	}
-	released := directory.placements[first.GrainKey]
-	if released.CreateTime != first.CreateTime || !released.UpdateTime.After(first.UpdateTime) {
-		t.Fatalf("released timestamps = %v / %v, first = %v / %v", released.CreateTime, released.UpdateTime, first.CreateTime, first.UpdateTime)
+	if _, exists := directory.placements[first.GrainKey]; exists {
+		t.Fatal("released placement was retained")
 	}
 	clock.Advance(time.Second)
 	second := allocateTestPlacement(t, directory, "10001", node)
-	if second.Version != first.Version+2 || second.Status != sp.PlacementStatusActive || second.CreateTime != second.UpdateTime || !second.CreateTime.After(released.UpdateTime) {
+	if second.PlacementID == first.PlacementID || second.Version != 1 || second.Status != sp.PlacementStatusActive || second.CreateTime != second.UpdateTime || !second.CreateTime.After(first.UpdateTime) {
 		t.Fatalf("reallocated placement = %+v, first = %+v", second, first)
+	}
+	if err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: first.GrainKey, PlacementID: first.PlacementID, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: first.Version}); !errors.Is(err, sp.ErrVersionConflict) {
+		t.Fatalf("stale Release err = %v, want ErrVersionConflict", err)
 	}
 }
 
@@ -218,7 +220,7 @@ func TestDirectoryPlacementMutationTimestampContract(t *testing.T) {
 	}
 
 	clock.Advance(time.Second)
-	renewed, err := directory.Renew(context.Background(), sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version})
+	renewed, err := directory.Renew(context.Background(), sp.RenewCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +229,7 @@ func TestDirectoryPlacementMutationTimestampContract(t *testing.T) {
 	}
 
 	clock.Advance(time.Second)
-	transferred, err := directory.Transfer(context.Background(), sp.TransferCommand{GrainKey: placement.GrainKey, FromNodeIdentity: owner.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
+	transferred, err := directory.Transfer(context.Background(), sp.TransferCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, FromNodeIdentity: owner.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +239,7 @@ func TestDirectoryPlacementMutationTimestampContract(t *testing.T) {
 
 	setNodeSession(directory.registry, target.NodeIdentity, "replacement")
 	clock.Advance(time.Second)
-	recovered, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: transferred.GrainKey, NewNodeIdentity: owner.NodeIdentity, PlacementVersion: transferred.Version})
+	recovered, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: transferred.GrainKey, PlacementID: transferred.PlacementID, NewNodeIdentity: owner.NodeIdentity, PlacementVersion: transferred.Version})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +268,7 @@ func TestDirectoryRenewValidatesOwnerLeaseAndOnlyAudits(t *testing.T) {
 		}, wantErr: sp.ErrNodeLeaseExpired},
 		{name: "session mismatch", mutate: func(d *Directory, n sp.Node, _ *fakeClock) { setNodeSession(d.registry, n.NodeIdentity, "new") }, wantErr: sp.ErrInvalidNodeSession},
 		{name: "version", command: func(p *sp.Placement, n sp.Node) sp.RenewCommand {
-			return sp.RenewCommand{GrainKey: p.GrainKey, NodeIdentity: n.NodeIdentity, NodeSessionID: n.NodeSessionID, PlacementVersion: p.Version + 1}
+			return sp.RenewCommand{GrainKey: p.GrainKey, PlacementID: p.PlacementID, NodeIdentity: n.NodeIdentity, NodeSessionID: n.NodeSessionID, PlacementVersion: p.Version + 1}
 		}, wantErr: sp.ErrVersionConflict},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -279,7 +281,7 @@ func TestDirectoryRenewValidatesOwnerLeaseAndOnlyAudits(t *testing.T) {
 				test.mutate(directory, node, clock)
 				beforeNode, _ = directory.registry.Node(node.NodeIdentity)
 			}
-			cmd := sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version}
+			cmd := sp.RenewCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version}
 			if test.command != nil {
 				cmd = test.command(placement, node)
 			}
@@ -312,7 +314,7 @@ func TestDirectoryRenewReturnsAuditFailureWithoutStateChange(t *testing.T) {
 	beforeNode, _ := directory.registry.Node(node.NodeIdentity)
 	wantErr := errors.New("audit failed")
 	publisher.err = wantErr
-	_, err := directory.Renew(context.Background(), sp.RenewCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version})
+	_, err := directory.Renew(context.Background(), sp.RenewCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version})
 	if !errors.Is(err, wantErr) || directory.placements[placement.GrainKey] != beforePlacement {
 		t.Fatalf("Renew err=%v placement=%+v", err, directory.placements[placement.GrainKey])
 	}
@@ -345,13 +347,13 @@ func TestDirectoryReleaseOwnerRules(t *testing.T) {
 			if test.mutate != nil {
 				test.mutate(directory, node, clock)
 			}
-			err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version})
+			err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version})
 			if !errors.Is(err, test.wantErr) {
 				t.Fatalf("Release err = %v, want %v", err, test.wantErr)
 			}
-			got := directory.placements[placement.GrainKey]
-			if test.wantErr == nil && (got.Status != sp.PlacementStatusReleased || got.Version != placement.Version+1 || len(directory.byNode[node.NodeIdentity]) != 0) {
-				t.Fatalf("released placement/index = %+v / %+v", got, directory.byNode)
+			got, exists := directory.placements[placement.GrainKey]
+			if test.wantErr == nil && (exists || len(directory.byNode[node.NodeIdentity]) != 0) {
+				t.Fatalf("released placement/index retained = %+v / %+v", got, directory.byNode)
 			}
 			if test.wantErr != nil && got != *placement {
 				t.Fatal("failed Release changed placement")
@@ -368,21 +370,21 @@ func TestDirectoryTransferAndRecoverUseHealthyTargetSession(t *testing.T) {
 	setNodeExpiry(directory.registry, badTarget.NodeIdentity, clock.Now().UnixMilli())
 	placement := allocateTestPlacement(t, directory, "10001", owner)
 
-	if _, err := directory.Transfer(context.Background(), sp.TransferCommand{GrainKey: placement.GrainKey, ToNodeIdentity: badTarget.NodeIdentity, PlacementVersion: placement.Version}); !errors.Is(err, sp.ErrNoAvailableNode) {
+	if _, err := directory.Transfer(context.Background(), sp.TransferCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, ToNodeIdentity: badTarget.NodeIdentity, PlacementVersion: placement.Version}); !errors.Is(err, sp.ErrNoAvailableNode) {
 		t.Fatalf("Transfer unhealthy target err = %v", err)
 	}
-	transferred, err := directory.Transfer(context.Background(), sp.TransferCommand{GrainKey: placement.GrainKey, FromNodeIdentity: owner.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
+	transferred, err := directory.Transfer(context.Background(), sp.TransferCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, FromNodeIdentity: owner.NodeIdentity, ToNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version})
 	if err != nil {
 		t.Fatalf("Transfer error: %v", err)
 	}
 	if transferred.NodeIdentity != target.NodeIdentity || transferred.OwnerNodeSessionID != target.NodeSessionID || transferred.Version != placement.Version+1 {
 		t.Fatalf("transferred = %+v", transferred)
 	}
-	if _, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: transferred.GrainKey, NewNodeIdentity: owner.NodeIdentity, PlacementVersion: transferred.Version}); !errors.Is(err, sp.ErrPlacementNotRecoverable) {
+	if _, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: transferred.GrainKey, PlacementID: transferred.PlacementID, NewNodeIdentity: owner.NodeIdentity, PlacementVersion: transferred.Version}); !errors.Is(err, sp.ErrPlacementNotRecoverable) {
 		t.Fatalf("Recover healthy owner err = %v", err)
 	}
 	setNodeSession(directory.registry, target.NodeIdentity, "replacement")
-	recovered, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: transferred.GrainKey, NewNodeIdentity: owner.NodeIdentity, PlacementVersion: transferred.Version})
+	recovered, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: transferred.GrainKey, PlacementID: transferred.PlacementID, NewNodeIdentity: owner.NodeIdentity, PlacementVersion: transferred.Version})
 	if err != nil {
 		t.Fatalf("Recover unavailable owner error: %v", err)
 	}
@@ -411,7 +413,7 @@ func TestDirectoryRecoverAllowsEveryUnavailableOwnerKind(t *testing.T) {
 			target := registerTestNode(t, directory, "target", "target")
 			placement := allocateTestPlacement(t, directory, "10001", owner)
 			test.mutate(directory, owner, clock)
-			if _, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: placement.GrainKey, NewNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version}); err != nil {
+			if _, err := directory.Recover(context.Background(), sp.RecoverCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NewNodeIdentity: target.NodeIdentity, PlacementVersion: placement.Version}); err != nil {
 				t.Fatalf("Recover error: %v", err)
 			}
 		})
@@ -444,7 +446,7 @@ func TestDirectoryCompleteDrainRejectsNodeWithPlacements(t *testing.T) {
 	if err := directory.registry.CompleteDrain(context.Background(), node.NodeIdentity, node.NodeSessionID); !errors.Is(err, sp.ErrNodeHasPlacements) {
 		t.Fatalf("CompleteDrain err = %v", err)
 	}
-	if err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: placement.GrainKey, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version}); err != nil {
+	if err := directory.Release(context.Background(), sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: node.NodeIdentity, NodeSessionID: node.NodeSessionID, PlacementVersion: placement.Version}); err != nil {
 		t.Fatal(err)
 	}
 	if err := directory.registry.CompleteDrain(context.Background(), node.NodeIdentity, node.NodeSessionID); err != nil {

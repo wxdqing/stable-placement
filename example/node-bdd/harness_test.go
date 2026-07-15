@@ -94,30 +94,16 @@ func (h *harness) cleanup() {
 }
 
 func (h *harness) releasePlacement(placement sp.Placement) error {
-	err := h.dir.Release(h.ctx, sp.ReleaseCommand{
-		GrainKey:         placement.GrainKey,
-		NodeIdentity:     placement.NodeIdentity,
-		NodeSessionID:    placement.OwnerNodeSessionID,
-		PlacementVersion: placement.Version,
-	})
+	err := h.dir.Release(h.ctx, sp.ReleaseCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity, NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version})
 	if err == nil {
 		return nil
 	}
 	for _, node := range h.nodes {
-		recovered, recoverErr := h.dir.Recover(h.ctx, sp.RecoverCommand{
-			GrainKey:         placement.GrainKey,
-			NewNodeIdentity:  node.NodeIdentity,
-			PlacementVersion: placement.Version,
-		})
+		recovered, recoverErr := h.dir.Recover(h.ctx, sp.RecoverCommand{GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NewNodeIdentity: node.NodeIdentity, PlacementVersion: placement.Version})
 		if recoverErr != nil {
 			continue
 		}
-		return h.dir.Release(h.ctx, sp.ReleaseCommand{
-			GrainKey:         recovered.GrainKey,
-			NodeIdentity:     recovered.NodeIdentity,
-			NodeSessionID:    recovered.OwnerNodeSessionID,
-			PlacementVersion: recovered.Version,
-		})
+		return h.dir.Release(h.ctx, sp.ReleaseCommand{GrainKey: recovered.GrainKey, PlacementID: recovered.PlacementID, NodeIdentity: recovered.NodeIdentity, NodeSessionID: recovered.OwnerNodeSessionID, PlacementVersion: recovered.Version})
 	}
 	return err
 }
@@ -283,12 +269,7 @@ func (h *harness) transferAll(from sp.Node, to sp.Node) {
 			return
 		}
 		for _, p := range page.Placements {
-			_, err := h.dir.Transfer(h.ctx, sp.TransferCommand{
-				GrainKey:         p.GrainKey,
-				FromNodeIdentity: from.NodeIdentity,
-				ToNodeIdentity:   to.NodeIdentity,
-				PlacementVersion: p.Version,
-			})
+			_, err := h.dir.Transfer(h.ctx, sp.TransferCommand{GrainKey: p.GrainKey, PlacementID: p.PlacementID, FromNodeIdentity: from.NodeIdentity, ToNodeIdentity: to.NodeIdentity, PlacementVersion: p.Version})
 			h.must(err, "Transfer "+p.GrainKey.String())
 		}
 	}

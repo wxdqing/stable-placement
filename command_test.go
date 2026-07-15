@@ -20,21 +20,23 @@ func TestCommandTypesCarryOwnerSessionAndVersions(t *testing.T) {
 	key, _ := NewGrainKey("Player", "10001")
 	renew := RenewCommand{
 		GrainKey:         key,
+		PlacementID:      "placement-1",
 		NodeIdentity:     "game/default/game-1",
 		NodeSessionID:    "session-a",
 		PlacementVersion: 2,
 	}
-	if renew.NodeIdentity == "" || renew.NodeSessionID == "" || renew.PlacementVersion == 0 {
+	if renew.PlacementID == "" || renew.NodeIdentity == "" || renew.NodeSessionID == "" || renew.PlacementVersion == 0 {
 		t.Fatalf("renew command lost owner or version fields: %+v", renew)
 	}
 
 	release := ReleaseCommand{
 		GrainKey:         key,
+		PlacementID:      renew.PlacementID,
 		NodeIdentity:     renew.NodeIdentity,
 		NodeSessionID:    renew.NodeSessionID,
 		PlacementVersion: renew.PlacementVersion,
 	}
-	if release.NodeIdentity != renew.NodeIdentity || release.NodeSessionID != renew.NodeSessionID {
+	if release.PlacementID != renew.PlacementID || release.NodeIdentity != renew.NodeIdentity || release.NodeSessionID != renew.NodeSessionID {
 		t.Fatalf("release command owner mismatch: %+v", release)
 	}
 }

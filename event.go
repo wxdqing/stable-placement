@@ -29,6 +29,8 @@ type PlacementEvent struct {
 	Type EventType
 	// GrainKey 是事件影响的 Grain；节点事件可以为空。
 	GrainKey GrainKey
+	// PlacementID identifies the allocation lifetime affected by the event.
+	PlacementID string
 	// NodeIdentity 是事件影响的完整节点身份。
 	NodeIdentity string
 	// NodeSessionID 是事件影响的节点运行实例 ID。

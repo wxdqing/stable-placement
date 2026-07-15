@@ -25,6 +25,20 @@ func TestDefaultNodeLeaseConfig(t *testing.T) {
 	}
 }
 
+func TestNewPlacementIDIsUniqueAndNonEmpty(t *testing.T) {
+	first, err := NewPlacementID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewPlacementID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 32 || len(second) != 32 || first == second {
+		t.Fatalf("placement IDs = %q / %q", first, second)
+	}
+}
+
 func TestNodeLeaseAndPlacementRouteContracts(t *testing.T) {
 	grant := NodeLeaseGrant{Version: 3, ValidUntil: time.Unix(100, 0)}
 	if grant.Version != 3 || grant.ValidUntil.IsZero() {
@@ -44,7 +58,7 @@ func TestNodeLeaseAndPlacementRouteContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewGrainKey error: %v", err)
 	}
-	placement := Placement{GrainKey: key, OwnerNodeSessionID: "session-a"}
+	placement := Placement{GrainKey: key, PlacementID: "placement-1", OwnerNodeSessionID: "session-a"}
 	if placement.OwnerNodeSessionID != "session-a" {
 		t.Fatalf("placement owner session = %q", placement.OwnerNodeSessionID)
 	}
@@ -52,11 +66,12 @@ func TestNodeLeaseAndPlacementRouteContracts(t *testing.T) {
 	validUntil := time.Date(2026, time.July, 12, 12, 0, 0, 0, time.UTC)
 	route := PlacementRoute{
 		GrainKey:           key,
+		PlacementID:        placement.PlacementID,
 		OwnerNodeSessionID: "session-a",
 		NodeLeaseVersion:   lease.Version,
 		ValidUntil:         validUntil,
 	}
-	if route.OwnerNodeSessionID != placement.OwnerNodeSessionID || route.NodeLeaseVersion != lease.Version || route.ValidUntil != validUntil {
+	if route.PlacementID != placement.PlacementID || route.OwnerNodeSessionID != placement.OwnerNodeSessionID || route.NodeLeaseVersion != lease.Version || route.ValidUntil != validUntil {
 		t.Fatalf("unexpected placement route: %+v", route)
 	}
 }
