@@ -3,7 +3,7 @@ package strategies
 import (
 	"context"
 	"sort"
-	"sync"
+	"sync/atomic"
 
 	sp "github.com/wxdqing/stable-placement"
 )
@@ -11,8 +11,7 @@ import (
 type ResourceAwareConfig = sp.ResourceAwareConfig
 
 type ResourceAware struct {
-	mu     sync.Mutex
-	next   int
+	next   atomic.Uint64
 	config ResourceAwareConfig
 }
 
@@ -62,10 +61,8 @@ func (r *ResourceAware) Choose(_ context.Context, input sp.StrategyInput) (sp.No
 	for tied < len(candidates) && compareResourceCandidates(candidates[0], candidates[tied]) == 0 {
 		tied++
 	}
-	r.mu.Lock()
-	chosen := candidates[r.next%tied].node
-	r.next++
-	r.mu.Unlock()
+	next := r.next.Add(1) - 1
+	chosen := candidates[next%uint64(tied)].node
 	return chosen, nil
 }
 

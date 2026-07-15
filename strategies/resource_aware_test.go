@@ -3,6 +3,7 @@ package strategies
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -82,6 +83,47 @@ func TestResourceAwareGoroutineLimitAndRoundRobinTieBreak(t *testing.T) {
 		if chooseErr != nil || chosen.NodeIdentity != want {
 			t.Fatalf("Choose %d = %+v, %v; want %q", index, chosen, chooseErr, want)
 		}
+	}
+}
+
+func TestResourceAwareConcurrentRoundRobinTieBreak(t *testing.T) {
+	now := time.Unix(100, 0)
+	strategy, err := NewResourceAware(ResourceAwareConfig{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := sp.NodeMetrics{MemoryAvailableBytes: 512 << 20, CPUAvailableMilliCores: 200, UpdatedAtUnixMilli: now.UnixMilli()}
+	input := sp.StrategyInput{EffectiveNodes: []sp.Node{{NodeIdentity: "a", Metrics: metrics}, {NodeIdentity: "b", Metrics: metrics}}}
+
+	const calls = 100
+	results := make(chan string, calls)
+	errors := make(chan error, calls)
+	var wg sync.WaitGroup
+	for range calls {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			chosen, chooseErr := strategy.Choose(context.Background(), input)
+			if chooseErr != nil {
+				errors <- chooseErr
+				return
+			}
+			results <- chosen.NodeIdentity
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errors)
+
+	for chooseErr := range errors {
+		t.Errorf("Choose error = %v", chooseErr)
+	}
+	counts := make(map[string]int, len(input.EffectiveNodes))
+	for identity := range results {
+		counts[identity]++
+	}
+	if counts["a"] != calls/2 || counts["b"] != calls/2 {
+		t.Fatalf("counts = %v, want equal distribution", counts)
 	}
 }
 
