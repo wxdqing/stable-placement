@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -18,9 +19,22 @@ type Directory struct {
 	registry   *NodeRegistry
 	strategy   sp.PlacementStrategy
 	publisher  sp.EventPublisher
+	logger     sp.Logger
 }
 
-func NewDirectory(registry *NodeRegistry, mode sp.StrategyMode, strategy sp.PlacementStrategy, publisher sp.EventPublisher) (*Directory, error) {
+// DirectoryOption 配置内存目录。
+type DirectoryOption func(*Directory)
+
+// WithLogger 设置内存目录使用的日志实例。
+func WithLogger(logger sp.Logger) DirectoryOption {
+	return func(directory *Directory) {
+		if logger != nil {
+			directory.logger = logger
+		}
+	}
+}
+
+func NewDirectory(registry *NodeRegistry, mode sp.StrategyMode, strategy sp.PlacementStrategy, publisher sp.EventPublisher, opts ...DirectoryOption) (*Directory, error) {
 	if mode != sp.StrategyModeGo {
 		return nil, sp.ErrUnsupportedStrategyMode
 	}
@@ -30,6 +44,12 @@ func NewDirectory(registry *NodeRegistry, mode sp.StrategyMode, strategy sp.Plac
 		registry:   registry,
 		strategy:   strategy,
 		publisher:  publisher,
+		logger:     sp.DefaultLogger(),
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(d)
+		}
 	}
 	registry.completeDrain = func(nodeIdentity string, nodeSessionID string) (sp.PlacementEvent, error) {
 		d.mu.Lock()
@@ -142,7 +162,7 @@ func (d *Directory) ResolveRoute(ctx context.Context, cmd sp.ResolveRouteCommand
 	route := d.routeLocked(placement, node, now)
 	d.registry.mu.Unlock()
 	d.mu.Unlock()
-	_ = d.publish(ctx, placement, eventType)
+	d.publishBestEffort(ctx, placement, eventType)
 	return route, nil
 }
 
@@ -242,7 +262,7 @@ func (d *Directory) Allocate(ctx context.Context, cmd sp.AllocateCommand) (*sp.P
 	d.registry.mu.RUnlock()
 	d.mu.Unlock()
 
-	_ = d.publish(ctx, placement, sp.EventPlacementCreated)
+	d.publishBestEffort(ctx, placement, sp.EventPlacementCreated)
 	return copyPlacement(placement), nil
 }
 
@@ -374,7 +394,7 @@ func (d *Directory) Transfer(ctx context.Context, cmd sp.TransferCommand) (*sp.P
 	d.movePlacementLocked(&placement, target, now)
 	d.registry.mu.RUnlock()
 	d.mu.Unlock()
-	_ = d.publish(ctx, placement, sp.EventPlacementTransferred)
+	d.publishBestEffort(ctx, placement, sp.EventPlacementTransferred)
 	return copyPlacement(placement), nil
 }
 
@@ -412,7 +432,7 @@ func (d *Directory) Recover(ctx context.Context, cmd sp.RecoverCommand) (*sp.Pla
 	d.movePlacementLocked(&placement, target, now)
 	d.registry.mu.RUnlock()
 	d.mu.Unlock()
-	_ = d.publish(ctx, placement, sp.EventPlacementRecovered)
+	d.publishBestEffort(ctx, placement, sp.EventPlacementRecovered)
 	return copyPlacement(placement), nil
 }
 
@@ -558,6 +578,20 @@ func (d *Directory) publish(ctx context.Context, placement sp.Placement, eventTy
 		Type: eventType, GrainKey: placement.GrainKey, PlacementID: placement.PlacementID, NodeIdentity: placement.NodeIdentity,
 		NodeSessionID: placement.OwnerNodeSessionID, PlacementVersion: placement.Version, Time: d.registry.now(),
 	})
+}
+
+func (d *Directory) publishBestEffort(ctx context.Context, placement sp.Placement, eventType sp.EventType) {
+	if err := d.publish(ctx, placement, eventType); err != nil &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) {
+		d.logger.Warnf(
+			"stable-placement/memory: publish event failed type=%q grain_key=%q placement_id=%q: %v",
+			eventType,
+			placement.GrainKey,
+			placement.PlacementID,
+			err,
+		)
+	}
 }
 
 func copyPlacement(placement sp.Placement) *sp.Placement {

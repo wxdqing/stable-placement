@@ -17,9 +17,22 @@ type EventBus struct {
 	client   goredis.UniversalClient
 	stream   string
 	consumer StreamConsumer
+	logger   sp.Logger
 
 	mu       sync.RWMutex
 	degraded bool
+}
+
+// EventBusOption 配置 Redis EventBus。
+type EventBusOption func(*EventBus)
+
+// WithLogger 设置 Redis EventBus 使用的日志实例。
+func WithLogger(logger sp.Logger) EventBusOption {
+	return func(bus *EventBus) {
+		if logger != nil {
+			bus.logger = logger
+		}
+	}
 }
 
 const (
@@ -37,12 +50,19 @@ const (
 	redisStreamNoDeletionID = "0-0"
 )
 
-func NewEventBus(client goredis.UniversalClient, consumer StreamConsumer) *EventBus {
-	return &EventBus{
+func NewEventBus(client goredis.UniversalClient, consumer StreamConsumer, opts ...EventBusOption) *EventBus {
+	bus := &EventBus{
 		client:   client,
 		stream:   EventsStreamKey(),
 		consumer: consumer,
+		logger:   sp.DefaultLogger(),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(bus)
+		}
+	}
+	return bus
 }
 
 func (b *EventBus) StreamKey() string {
@@ -79,7 +99,7 @@ func (b *EventBus) SubscribeHint(ctx context.Context, handler func(sp.PlacementE
 		if ctx.Err() != nil {
 			return nil
 		}
-		b.setDegraded()
+		b.setDegraded("subscribe hint", err)
 		return err
 	}
 	for {
@@ -88,16 +108,16 @@ func (b *EventBus) SubscribeHint(ctx context.Context, handler func(sp.PlacementE
 			if ctx.Err() != nil {
 				return nil
 			}
-			b.setDegraded()
+			b.setDegraded("receive hint", err)
 			return err
 		}
 		var event sp.PlacementEvent
 		if err := json.Unmarshal([]byte(message.Payload), &event); err != nil {
-			b.setDegraded()
+			b.setDegraded("decode hint", err)
 			return err
 		}
 		if err := handler(event); err != nil {
-			b.setDegraded()
+			b.setDegraded("handle hint", err)
 			return err
 		}
 		if ctx.Err() != nil {
@@ -108,7 +128,7 @@ func (b *EventBus) SubscribeHint(ctx context.Context, handler func(sp.PlacementE
 
 func (b *EventBus) EnsureConsumerGroup(ctx context.Context) error {
 	if !validStreamConsumer(b.consumer) {
-		b.setDegraded()
+		b.setDegraded("ensure consumer group", ErrSharedConsumerGroup)
 		return ErrSharedConsumerGroup
 	}
 	err := b.client.XGroupCreateMkStream(ctx, b.stream, b.consumer.Group, "$").Err()
@@ -120,7 +140,7 @@ func (b *EventBus) EnsureConsumerGroup(ctx context.Context) error {
 
 func (b *EventBus) DeleteConsumerGroup(ctx context.Context) error {
 	if !validStreamConsumer(b.consumer) {
-		b.setDegraded()
+		b.setDegraded("delete consumer group", ErrSharedConsumerGroup)
 		return ErrSharedConsumerGroup
 	}
 	err := b.client.XGroupDestroy(ctx, b.stream, b.consumer.Group).Err()
@@ -132,7 +152,7 @@ func (b *EventBus) DeleteConsumerGroup(ctx context.Context) error {
 
 func (b *EventBus) CloseConsumerGroupIfIdle(ctx context.Context) error {
 	if !validStreamConsumer(b.consumer) {
-		b.setDegraded()
+		b.setDegraded("close consumer group", ErrSharedConsumerGroup)
 		return ErrSharedConsumerGroup
 	}
 	result, err := b.client.Eval(ctx, closeConsumerGroupIfIdleLua, []string{b.stream}, b.consumer.Group).Int64()
@@ -151,7 +171,7 @@ func (b *EventBus) CloseConsumerGroupIfIdle(ctx context.Context) error {
 // CleanupConsumerGroup removes a previously valid node-session consumer group.
 func (b *EventBus) CleanupConsumerGroup(ctx context.Context, consumer StreamConsumer) error {
 	if !validStreamConsumer(consumer) {
-		b.setDegraded()
+		b.setDegraded("cleanup consumer group", ErrSharedConsumerGroup)
 		return ErrSharedConsumerGroup
 	}
 	err := b.client.XGroupDestroy(ctx, b.stream, consumer.Group).Err()
@@ -166,23 +186,24 @@ func (b *EventBus) ReplaceConsumer(ctx context.Context, old StreamConsumer) erro
 	if !validStreamConsumer(old) || !validStreamConsumer(b.consumer) ||
 		old.NodeIdentity != b.consumer.NodeIdentity ||
 		old.NodeSessionID == b.consumer.NodeSessionID || old.Group == b.consumer.Group {
-		b.setDegraded()
+		b.setDegraded("replace consumer", ErrSharedConsumerGroup)
 		return ErrSharedConsumerGroup
 	}
 	result, err := b.client.Eval(ctx, replaceConsumerLua, []string{b.stream}, old.Group, b.consumer.Group).Int64()
 	if err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			b.setDegraded()
+			b.setDegraded("replace consumer", err)
 		}
 		return err
 	}
 	if result == redisScriptResultPending {
-		b.setDegraded()
+		b.setDegraded("replace consumer", ErrPendingMessages)
 		return ErrPendingMessages
 	}
 	if result != redisScriptResultOK {
-		b.setDegraded()
-		return errors.New("redis consumer replacement returned an invalid result")
+		err := errors.New("redis consumer replacement returned an invalid result")
+		b.setDegraded("replace consumer", err)
+		return err
 	}
 	return nil
 }
@@ -191,7 +212,7 @@ func (b *EventBus) ReplaceConsumer(ctx context.Context, old StreamConsumer) erro
 func (b *EventBus) Close(ctx context.Context) error {
 	err := b.CloseConsumerGroupIfIdle(ctx)
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		b.setDegraded()
+		b.setDegraded("close event bus", err)
 	}
 	return err
 }
@@ -208,12 +229,12 @@ func (b *EventBus) CheckPending(ctx context.Context, threshold time.Duration) er
 	}).Result()
 	if err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			b.setDegraded()
+			b.setDegraded("check pending", err)
 		}
 		return err
 	}
 	if len(pending) > 0 {
-		b.setDegraded()
+		b.setDegraded("check pending", ErrPendingMessages)
 		return ErrPendingMessages
 	}
 	return nil
@@ -243,7 +264,7 @@ func (b *EventBus) RunTrimLoop(ctx context.Context, interval time.Duration, maxL
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return nil
 				}
-				b.setDegraded()
+				b.setDegraded("trim stream", err)
 				return err
 			}
 		}
@@ -259,14 +280,14 @@ func (b *EventBus) CheckContinuity(ctx context.Context) error {
 				return nil
 			}
 			if ctx.Err() == nil {
-				b.setDegraded()
+				b.setDegraded("check continuity stream", err)
 			}
 			return err
 		}
 		gap, err := b.checkContinuitySnapshot(ctx, info)
 		if err != nil {
 			if ctx.Err() == nil {
-				b.setDegraded()
+				b.setDegraded("check continuity snapshot", err)
 			}
 			return err
 		}
@@ -276,7 +297,7 @@ func (b *EventBus) CheckContinuity(ctx context.Context) error {
 				return nil
 			}
 			if ctx.Err() == nil {
-				b.setDegraded()
+				b.setDegraded("confirm continuity stream", err)
 			}
 			return err
 		}
@@ -284,7 +305,7 @@ func (b *EventBus) CheckContinuity(ctx context.Context) error {
 			continue
 		}
 		if gap {
-			b.setDegraded()
+			b.setDegraded("check continuity", ErrStreamGap)
 			return ErrStreamGap
 		}
 		return nil
@@ -421,7 +442,7 @@ func sameContinuityStreamInfo(first, second *goredis.XInfoStream) bool {
 func (b *EventBus) Subscribe(ctx context.Context, handler func(sp.PlacementEvent) error) error {
 	if err := b.EnsureConsumerGroup(ctx); err != nil {
 		if ctx.Err() == nil {
-			b.setDegraded()
+			b.setDegraded("subscribe ensure consumer group", err)
 		}
 		return err
 	}
@@ -459,7 +480,7 @@ func (b *EventBus) consume(ctx context.Context, id string, handler func(sp.Place
 			if ctx.Err() != nil {
 				return nil
 			}
-			b.setDegraded()
+			b.setDegraded("consume stream", err)
 			return err
 		}
 		if len(streams) == 0 || len(streams[0].Messages) == 0 {
@@ -471,14 +492,14 @@ func (b *EventBus) consume(ctx context.Context, id string, handler func(sp.Place
 		for _, message := range streams[0].Messages {
 			event, err := parseEvent(message.Values)
 			if err != nil {
-				b.setDegraded()
+				b.setDegraded("decode stream event", err)
 				return err
 			}
 			if err := handler(event); err != nil {
 				if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 					return nil
 				}
-				b.setDegraded()
+				b.setDegraded("handle stream event", err)
 				return err
 			}
 			if ctx.Err() != nil {
@@ -488,17 +509,32 @@ func (b *EventBus) consume(ctx context.Context, id string, handler func(sp.Place
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return nil
 				}
-				b.setDegraded()
+				b.setDegraded("ack stream event", err)
 				return err
 			}
 		}
 	}
 }
 
-func (b *EventBus) setDegraded() {
+func (b *EventBus) setDegraded(operation string, err error) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	if b.degraded {
+		b.mu.Unlock()
+		return
+	}
 	b.degraded = true
+	b.mu.Unlock()
+	b.logger.Errorf(
+		"stable-placement/redis: event bus degraded operation=%q consumer_group=%q node_identity=%q node_session_id=%q: %v",
+		operation,
+		b.consumer.Group,
+		b.consumer.NodeIdentity,
+		b.consumer.NodeSessionID,
+		err,
+	)
 }
 
 func validStreamConsumer(consumer StreamConsumer) bool {
